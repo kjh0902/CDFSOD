@@ -1,0 +1,17 @@
+.git/
+weights/
+work_dirs/
+*.pth
+*.pt
+*.bin
+*.model
+*.onnx
+*.npy
+data/*/images
+data/*/train*
+data/*/val*
+data/*/test*
+**/__pycache__/
+*.pyc
+outputs/
+cat_dataset.zip

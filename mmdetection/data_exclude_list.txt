@@ -1,0 +1,9 @@
+**/images/
+**/*.jpg
+**/*.png
+**/*.jpeg
+**/*.bmp
+**/*.tif
+**/*.tiff
+**/__pycache__/
+*.pyc
