@@ -1,39 +1,19 @@
 # Datasets Folder Structure
 
+This baseline expects NEU-DET in COCO format:
+
 ```text
 datasets/
-├─ coco/
-│  ├─ annotations/            
-│  ├─ train/                  
-│  └─ test2017/              
-├─ DIOR/
-│  ├─ clip_annotations.json   
-│  └─ clip_annotations_paths.json
-├─ ArTaxOr/
-│  ├─ annotations/            
-│  ├─ train/                  
-│  └─ test/                   
-├─ Camouflage/
-│  ├─ annotations/
-│  ├─ train/
-│  └─ test/
-├─ NEU-DET/
-│  ├─ annotations/            
-│  ├─ split.py                
-│  └─ ...
-├─ clipart1k/
-│  ├─ annotations/
-│  ├─ JPEGImages/
-│  ├─ train/
-│  └─ test/
-├─ UODD/
-│  ├─ clip_annotations.json
-│  └─ clip_annotations_paths.json
-└─ FISH/
-   ├─ clip_annotations.json
-   └─ clip_annotations_paths.json
+  NEU-DET/
+    annotations/
+      train.json
+      test.json
+    train/
+    test/
+  split.py
+  kshot_split.py
 ```
 
-
-
-
+`split.py` creates `train.json` and `test.json`.
+`kshot_split.py` creates files such as `1_shot.json`, `5_shot.json`, and
+`10_shot.json` from `train.json`.

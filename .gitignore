@@ -1,1 +1,13 @@
 src/
+__pycache__/
+*.pyc
+
+work_dirs/
+mmdetection/work_dirs/
+
+datasets/NEU-DET/train/*
+datasets/NEU-DET/test/*
+datasets/NEU-DET/annotations/*.json
+!datasets/NEU-DET/train/.gitkeep
+!datasets/NEU-DET/test/.gitkeep
+!datasets/NEU-DET/annotations/.gitkeep

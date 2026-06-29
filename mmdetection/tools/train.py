@@ -3,6 +3,7 @@ import argparse
 import os
 import os.path as osp
 
+import torch
 from mmengine.config import Config, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
@@ -46,6 +47,10 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
+    parser.add_argument(
+        '--device',
+        default='cuda:0',
+        help='device used for single-GPU training. Defaults to cuda:0.')
     # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
     # will pass the `--local-rank` parameter to `tools/train.py` instead
     # of `--local_rank`.
@@ -59,6 +64,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.launcher == 'none' and args.device.startswith('cuda'):
+        cuda_id = args.device.split(':', 1)[1] if ':' in args.device else '0'
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', cuda_id)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
 
     # Reduce the number of repeated compilations and improve
     # training speed.
