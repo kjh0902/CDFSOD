@@ -1,16 +1,17 @@
---extra-index-url https://download.pytorch.org/whl/cu128
+# Python/runtime dependencies for the GroundingDINO baseline.
+#
+# Install order matters for this project:
+#   1. Install torch/torchvision with the CUDA wheel that matches the GPU.
+#   2. Install this file.
+#   3. Install MMCV with the matching OpenMMLab/CUDA/PyTorch build path.
+#   4. Install ./mmdetection in editable mode with --no-build-isolation.
+#
+# Do not put torch, torchvision, mmcv, or -e ./mmdetection here. MMCV contains
+# C++/CUDA ops and must be installed after torch is already importable.
 
-# RTX 5090 / CUDA 13 driver friendly PyTorch build. The CUDA 12.8 wheels run on
-# newer NVIDIA drivers and avoid the Domain-RAG generation stack.
-torch==2.7.0
-torchvision==0.22.0
-
-# OpenMMLab / GroundingDINO baseline
-mmcv==2.1.0
+openmim==0.3.9
 mmengine==0.10.7
--e ./mmdetection
 
-# Runtime dependencies used by MMDetection and MM-GroundingDINO
 numpy==1.26.4
 opencv-python==4.11.0.86
 pycocotools==2.0.8
@@ -22,6 +23,7 @@ terminaltables==3.1.10
 tqdm==4.67.1
 PyYAML==6.0.2
 packaging==25.0
+
 transformers==4.46.3
 tokenizers==0.20.3
 huggingface-hub==0.30.2
@@ -30,4 +32,5 @@ regex==2024.11.6
 requests==2.32.3
 ftfy==6.3.1
 nltk==3.9.1
+
 yapf==0.40.2

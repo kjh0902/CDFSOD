@@ -29,17 +29,60 @@ The default config reads:
 
 ## Environment
 
-Recommended on the remote server:
+Recommended on the remote server. This separates PyTorch, MMCV, and editable
+MMDetection installation because MMCV builds/loads CUDA ops against the installed
+PyTorch ABI.
 
 ```bash
 conda create -n cdfsod python=3.10 -y
 conda activate cdfsod
-pip install -U pip
+
+conda install -c nvidia cuda-toolkit=12.8 -y
+conda install -c conda-forge "gcc_linux-64=13.*" "gxx_linux-64=13.*" -y
+
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc"
+export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
+
+python -m pip install -U pip setuptools wheel
+pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
 pip install -r requirements.txt
+
+mim install "mmcv>=2.1.0,<2.2.0"
+pip install -e ./mmdetection --no-build-isolation
 ```
 
-The root `requirements.txt` uses PyTorch CUDA 12.8 wheels, which are suitable
-for the RTX 5090 with the installed CUDA 13-capable NVIDIA driver.
+If `mim install` cannot find a compatible MMCV wheel and falls back to source
+build, keep the `CUDA_HOME`, `CC`, and `CXX` exports above in the same shell.
+If the verification below fails with an `mmcv._ext` symbol/import error, rebuild
+MMCV in the active environment:
+
+```bash
+pip uninstall -y mmcv mmcv-full
+MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install \
+  --no-build-isolation \
+  --no-cache-dir \
+  "mmcv>=2.1.0,<2.2.0"
+```
+
+After installation, verify the CUDA ops, not just `mmcv.__version__`:
+
+```bash
+python - <<'PY'
+import torch
+import mmcv
+from mmcv.ops import roi_align
+
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("gpu:", torch.cuda.get_device_name(0))
+print("mmcv:", mmcv.__version__)
+print("mmcv.ops roi_align:", roi_align)
+PY
+```
 
 ## Prepare Splits
 
