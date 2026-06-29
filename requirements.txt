@@ -1,15 +1,14 @@
-# Python/runtime dependencies for the GroundingDINO baseline.
+# Python dependencies that are safe to install before building MMCV.
 #
-# Install order matters for this project:
-#   1. Install torch/torchvision with the CUDA wheel that matches the GPU.
-#   2. Install this file.
-#   3. Install MMCV with the matching OpenMMLab/CUDA/PyTorch build path.
-#   4. Install ./mmdetection in editable mode with --no-build-isolation.
-#
-# Do not put torch, torchvision, mmcv, or -e ./mmdetection here. MMCV contains
-# C++/CUDA ops and must be installed after torch is already importable.
+# Do not put torch, torchvision, mmcv, or -e ./mmdetection here.
+# Install order:
+#   1. torch/torchvision CUDA wheel
+#   2. this file
+#   3. mmcv source build against the installed torch
+#   4. ./mmdetection editable install with --no-build-isolation
 
-openmim==0.3.9
+setuptools==80.9.0
+wheel==0.45.1
 mmengine==0.10.7
 
 numpy==1.26.4

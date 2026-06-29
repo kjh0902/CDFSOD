@@ -29,11 +29,12 @@ The default config reads:
 
 ## Environment
 
-Recommended on the remote server. This separates PyTorch, MMCV, and editable
-MMDetection installation because MMCV builds/loads CUDA ops against the installed
-PyTorch ABI.
+Recommended on the remote server. If the old `cdfsod` environment already has a
+broken `mmcv._ext`, remove it and start from a clean environment.
 
 ```bash
+conda deactivate || true
+conda env remove -n cdfsod -y || true
 conda create -n cdfsod python=3.10 -y
 conda activate cdfsod
 
@@ -45,30 +46,28 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc"
 export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
 
-python -m pip install -U pip setuptools wheel
+python -m pip install -U pip
+python -m pip install "setuptools==80.9.0" "wheel==0.45.1"
 pip install torch==2.7.0 torchvision==0.22.0 \
   --index-url https://download.pytorch.org/whl/cu128
 
 pip install -r requirements.txt
 
-mim install "mmcv>=2.1.0,<2.2.0"
+pip uninstall -y mmcv mmcv-full || true
+rm -rf "$CONDA_PREFIX/lib/python3.10/site-packages/mmcv"
+rm -rf "$CONDA_PREFIX/lib/python3.10/site-packages/mmcv-"*.dist-info
+
+MMCV_WITH_OPS=1 FORCE_CUDA=1 MAX_JOBS=8 pip install -v \
+  --no-build-isolation \
+  --no-cache-dir \
+  --no-binary mmcv \
+  "mmcv>=2.1.0,<2.2.0"
+
 pip install -e ./mmdetection --no-build-isolation
 ```
 
-If `mim install` cannot find a compatible MMCV wheel and falls back to source
-build, keep the `CUDA_HOME`, `CC`, and `CXX` exports above in the same shell.
-If the verification below fails with an `mmcv._ext` symbol/import error, rebuild
-MMCV in the active environment:
-
-```bash
-pip uninstall -y mmcv mmcv-full
-MMCV_WITH_OPS=1 FORCE_CUDA=1 pip install \
-  --no-build-isolation \
-  --no-cache-dir \
-  "mmcv>=2.1.0,<2.2.0"
-```
-
-After installation, verify the CUDA ops, not just `mmcv.__version__`:
+Keep the `CUDA_HOME`, `CC`, and `CXX` exports in the same shell while building
+MMCV. After installation, verify the CUDA ops, not just `mmcv.__version__`:
 
 ```bash
 python - <<'PY'
@@ -82,6 +81,17 @@ print("gpu:", torch.cuda.get_device_name(0))
 print("mmcv:", mmcv.__version__)
 print("mmcv.ops roi_align:", roi_align)
 PY
+```
+
+If `from mmcv.ops import roi_align` fails, do not train yet. Remove `mmcv` again
+and rebuild it in the same active conda environment after confirming:
+
+```bash
+which nvcc
+nvcc --version
+ls -l "$CC" "$CXX"
+"$CXX" --version
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
 ```
 
 ## Prepare Splits
