@@ -23,6 +23,8 @@ class BaseDetDataset(BaseDataset):
             for open vocabulary-based algorithms. Defaults to False.
         caption_prompt (dict, optional): Prompt for captioning.
             Defaults to None.
+        enriched_text_cfg (dict, optional): Config for support crop caption
+            based enriched class prompts. Defaults to None.
     """
 
     def __init__(self,
@@ -33,15 +35,21 @@ class BaseDetDataset(BaseDataset):
                  backend_args: dict = None,
                  return_classes: bool = False,
                  caption_prompt: Optional[dict] = None,
+                 enriched_text_cfg: Optional[dict] = None,
                  **kwargs) -> None:
         self.seg_map_suffix = seg_map_suffix
         self.proposal_file = proposal_file
         self.backend_args = backend_args
         self.return_classes = return_classes
         self.caption_prompt = caption_prompt
+        self.enriched_text_cfg = enriched_text_cfg
+        self.enriched_text_prompts = None
         if self.caption_prompt is not None:
             assert self.return_classes, \
                 'return_classes must be True when using caption_prompt'
+        if self.enriched_text_cfg is not None:
+            assert self.return_classes, \
+                'return_classes must be True when using enriched_text_cfg'
         if file_client_args is not None:
             raise RuntimeError(
                 'The `file_client_args` is deprecated, '

@@ -8,6 +8,7 @@ from mmengine.fileio import get_local_path
 from mmdet.registry import DATASETS
 from .api_wrappers import COCO
 from .base_det_dataset import BaseDetDataset
+from .enriched_text import build_enriched_class_prompts
 
 
 @DATASETS.register_module()
@@ -99,6 +100,28 @@ class CocoDataset(BaseDetDataset):
 
         return data_list
 
+    def get_class_text_prompts(self) -> List[str]:
+        """Return class-name prompts or support-caption enriched prompts."""
+        if self.enriched_text_cfg is None:
+            return self.metainfo['classes']
+
+        if self.enriched_text_prompts is None:
+            enriched_text_cfg = self.enriched_text_cfg.copy()
+            support_ann_file = enriched_text_cfg.pop('support_ann_file',
+                                                     self.ann_file)
+            support_img_prefix = enriched_text_cfg.pop(
+                'support_img_prefix', self.data_prefix.get('img', ''))
+
+            self.enriched_text_prompts = build_enriched_class_prompts(
+                data_root=self.data_root,
+                ann_file=support_ann_file,
+                image_prefix=support_img_prefix,
+                class_names=self.metainfo['classes'],
+                cat_ids=self.cat_ids,
+                **enriched_text_cfg)
+
+        return self.enriched_text_prompts
+
     def parse_data_info(self, raw_data_info: dict) -> Union[dict, List[dict]]:
         """Parse raw annotation to target format.
 
@@ -128,7 +151,7 @@ class CocoDataset(BaseDetDataset):
         data_info['width'] = img_info['width']
 
         if self.return_classes:
-            data_info['text'] = self.metainfo['classes']
+            data_info['text'] = self.get_class_text_prompts()
             data_info['caption_prompt'] = self.caption_prompt
             data_info['custom_entities'] = True
 
