@@ -43,7 +43,7 @@ class BaseDetDataset(BaseDataset):
         self.return_classes = return_classes
         self.caption_prompt = caption_prompt
         self.enriched_text_cfg = enriched_text_cfg
-        self.enriched_caption_lists = None
+        self.enriched_text_prompts = None
         if self.caption_prompt is not None:
             assert self.return_classes, \
                 'return_classes must be True when using caption_prompt'
