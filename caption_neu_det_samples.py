@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
 
@@ -17,6 +17,7 @@ DEFAULT_ANN_FILE = (
     'CDFSOD/datasets/NEU-DET/annotations/train.json'
 )
 DEFAULT_MODEL_ID = 'Salesforce/blip-image-captioning-base'
+DEFAULT_OUTPUT_DIR = 'caption_outputs/neu_det_blip_objects'
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         help='Maximum number of caption tokens to generate.')
+    parser.add_argument(
+        '--output-dir',
+        default=DEFAULT_OUTPUT_DIR,
+        help='Directory where annotated images and captions are saved.')
+    parser.add_argument(
+        '--bbox-width',
+        type=int,
+        default=4,
+        help='Line width for the red ground-truth bbox.')
     return parser.parse_args()
 
 
@@ -100,8 +110,7 @@ def sample_annotations(annotations: list[dict], num_samples: int,
     return rng.sample(annotations, num_samples)
 
 
-def crop_object(image_path: Path, bbox: list[float]) -> Image.Image:
-    image = Image.open(image_path).convert('RGB')
+def clamp_bbox(image: Image.Image, bbox: list[float]) -> tuple[int, int, int, int]:
     image_width, image_height = image.size
     x, y, width, height = bbox
 
@@ -113,7 +122,70 @@ def crop_object(image_path: Path, bbox: list[float]) -> Image.Image:
     if right <= left or bottom <= top:
         raise ValueError(f'Invalid crop after clamping: {bbox}')
 
-    return image.crop((left, top, right, bottom))
+    return left, top, right, bottom
+
+
+def crop_object(image: Image.Image, bbox: list[float]) -> Image.Image:
+    return image.crop(clamp_bbox(image, bbox))
+
+
+def draw_gt_bbox(
+    image: Image.Image,
+    bbox: list[float],
+    category_name: str,
+    bbox_width: int,
+) -> Image.Image:
+    annotated_image = image.copy()
+    draw = ImageDraw.Draw(annotated_image)
+    left, top, right, bottom = clamp_bbox(annotated_image, bbox)
+    draw.rectangle(
+        (left, top, right, bottom),
+        outline='red',
+        width=max(1, bbox_width),
+    )
+
+    label = f'GT: {category_name}'
+    text_bbox = draw.textbbox((left, top), label)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    label_top = max(0, top - text_height - 4)
+    draw.rectangle(
+        (left, label_top, left + text_width + 6, label_top + text_height + 4),
+        fill='red',
+    )
+    draw.text((left + 3, label_top + 2), label, fill='white')
+    return annotated_image
+
+
+def make_sample_dir(output_dir: Path, index: int, annotation: dict) -> Path:
+    annotation_id = annotation.get('id', 'unknown')
+    sample_dir = output_dir / f'sample_{index:03d}_ann_{annotation_id}'
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    return sample_dir
+
+
+def save_sample_outputs(
+    sample_dir: Path,
+    image: Image.Image,
+    crop: Image.Image,
+    bbox: list[float],
+    caption: str,
+    image_path: Path,
+    annotation: dict,
+    category_name: str,
+    bbox_width: int,
+) -> None:
+    annotated_image = draw_gt_bbox(image, bbox, category_name, bbox_width)
+    annotated_image.save(sample_dir / 'image_with_gt_bbox.jpg', quality=95)
+    crop.save(sample_dir / 'object_crop.jpg', quality=95)
+
+    with (sample_dir / 'caption.txt').open('w', encoding='utf-8') as f:
+        f.write(f'image_path: {image_path}\n')
+        f.write(f'annotation_id: {annotation.get("id", "unknown")}\n')
+        f.write(f'image_id: {annotation.get("image_id", "unknown")}\n')
+        f.write(f'category: {category_name}\n')
+        f.write(f'bbox_xywh: {bbox}\n')
+        f.write(f'caption: {caption}\n')
 
 
 def caption_crop(
@@ -138,6 +210,7 @@ def main() -> None:
     args = parse_args()
     image_dir = Path(args.image_dir)
     ann_file = Path(args.ann_file)
+    output_dir = Path(args.output_dir)
     if not image_dir.is_dir():
         raise FileNotFoundError(f'Image directory not found: {image_dir}')
     if not ann_file.is_file():
@@ -162,6 +235,7 @@ def main() -> None:
     print(f'Device: {device}')
     print(f'Image directory: {image_dir}')
     print(f'Annotation file: {ann_file}')
+    print(f'Output directory: {output_dir}')
     print(f'Captioning {len(selected_annotations)} object crop(s)')
     print()
 
@@ -171,7 +245,8 @@ def main() -> None:
         if not image_path.is_file():
             raise FileNotFoundError(f'Image not found: {image_path}')
 
-        crop = crop_object(image_path, annotation['bbox'])
+        image = Image.open(image_path).convert('RGB')
+        crop = crop_object(image, annotation['bbox'])
         caption = caption_crop(
             crop=crop,
             processor=processor,
@@ -180,12 +255,25 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
         category_name = categories_by_id.get(annotation.get('category_id'), 'unknown')
+        sample_dir = make_sample_dir(output_dir, index, annotation)
+        save_sample_outputs(
+            sample_dir=sample_dir,
+            image=image,
+            crop=crop,
+            bbox=annotation['bbox'],
+            caption=caption,
+            image_path=image_path,
+            annotation=annotation,
+            category_name=category_name,
+            bbox_width=args.bbox_width,
+        )
 
         print(f'[{index}] {image_path}')
         print(f'annotation_id: {annotation.get("id", "unknown")}')
         print(f'category: {category_name}')
         print(f'bbox_xywh: {annotation["bbox"]}')
         print(f'caption: {caption}')
+        print(f'saved_dir: {sample_dir}')
         print()
 
 

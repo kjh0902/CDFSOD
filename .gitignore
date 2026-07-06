@@ -4,6 +4,7 @@ __pycache__/
 
 work_dirs/
 mmdetection/work_dirs/
+caption_outputs/
 
 datasets/NEU-DET/train/*
 datasets/NEU-DET/test/*
