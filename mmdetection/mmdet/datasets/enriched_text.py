@@ -123,11 +123,20 @@ class BlipObjectCaptioner:
         from transformers import BlipForConditionalGeneration, BlipProcessor
 
         self.torch = torch
+        print(
+            f'[EnrichedText] Loading BLIP processor from {model_id}...',
+            flush=True)
         self.processor = BlipProcessor.from_pretrained(model_id)
+        print(
+            f'[EnrichedText] Loading BLIP model from {model_id}...',
+            flush=True)
         self.model = BlipForConditionalGeneration.from_pretrained(model_id)
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
+        print(
+            f'[EnrichedText] Moving BLIP model to {self.device}...',
+            flush=True)
         self.model.to(self.device)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
@@ -292,6 +301,13 @@ def build_enriched_class_caption_lists(
         max_new_tokens,
         fallback_caption)
 
+    if log_progress:
+        print(
+            f'[EnrichedText] Support annotation: {resolved_ann_file}',
+            flush=True)
+        print(f'[EnrichedText] Support image root: {image_root}', flush=True)
+        print(f'[EnrichedText] Caption cache: {caption_cache_file}', flush=True)
+
     cache_key = (resolved_ann_file, image_root, tuple(class_names),
                  tuple(cat_ids or []), domain_attribute, model_id, device,
                  max_new_tokens, fallback_caption, caption_cache_file)
@@ -310,11 +326,23 @@ def build_enriched_class_caption_lists(
         }
         return cached_captions
 
+    if log_progress:
+        print('[EnrichedText] Caption cache miss. Extracting support crops...',
+              flush=True)
     crops = extract_support_object_crops(
         resolved_ann_file,
         image_root,
         class_names=class_names,
         cat_ids=cat_ids)
+    if log_progress:
+        total_crops = sum(len(class_crops) for class_crops in crops.values())
+        per_class = ', '.join(
+            f'{class_name}: {len(crops.get(class_name, []))}'
+            for class_name in class_names)
+        print(
+            f'[EnrichedText] Extracted {total_crops} support crops '
+            f'({per_class}).',
+            flush=True)
     captions = generate_object_captions(
         crops,
         class_names,
