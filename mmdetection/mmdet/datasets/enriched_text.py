@@ -2,6 +2,7 @@
 import json
 import math
 import os.path as osp
+import random
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image
@@ -12,7 +13,7 @@ DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE = (
     'variation, and subtle industrial defect patterns')
 
 _BLIP_CAPTIONERS = {}
-_PROMPT_CACHE = {}
+_CAPTION_LIST_CACHE = {}
 
 
 def build_enriched_prompt(class_name: str, object_caption: str,
@@ -58,8 +59,9 @@ def extract_support_object_crops(
         ann_file: str,
         image_root: str,
         class_names: Sequence[str],
-        cat_ids: Optional[Sequence[int]] = None) -> Dict[str, Image.Image]:
-    """Extract one GT object crop per class from a COCO support annotation."""
+        cat_ids: Optional[Sequence[int]] = None
+) -> Dict[str, List[Image.Image]]:
+    """Extract all GT object crops per class from a COCO support annotation."""
     with open(ann_file, 'r', encoding='utf-8') as f:
         coco = json.load(f)
 
@@ -76,12 +78,15 @@ def extract_support_object_crops(
         target_cat_ids = list(cat_ids)
 
     cat_id_to_class_name = dict(zip(target_cat_ids, class_names))
-    crops: Dict[str, Image.Image] = {}
+    crops: Dict[str, List[Image.Image]] = {
+        class_name: []
+        for class_name in class_names
+    }
 
     for ann in coco.get('annotations', []):
         cat_id = ann.get('category_id')
         class_name = cat_id_to_class_name.get(cat_id)
-        if class_name is None or class_name in crops:
+        if class_name is None:
             continue
 
         image_info = images_by_id.get(ann.get('image_id'))
@@ -97,12 +102,12 @@ def extract_support_object_crops(
             crop_box = _clamp_coco_bbox(ann['bbox'], image.size)
             if crop_box is None:
                 continue
-            crops[class_name] = image.crop(crop_box).copy()
+            crops[class_name].append(image.crop(crop_box).copy())
 
-        if len(crops) == len(class_names):
-            break
-
-    return crops
+    return {
+        class_name: class_crops
+        for class_name, class_crops in crops.items() if class_crops
+    }
 
 
 class BlipObjectCaptioner:
@@ -142,23 +147,28 @@ def _get_blip_captioner(model_id: str, device: str,
 
 
 def generate_object_captions(
-        crops: Dict[str, Image.Image],
+        crops: Dict[str, List[Image.Image]],
         class_names: Iterable[str],
         model_id: str = DEFAULT_BLIP_MODEL_ID,
         device: str = 'cpu',
         max_new_tokens: int = 30,
-        fallback_caption: str = 'a close-up object crop') -> Dict[str, str]:
+        fallback_caption: str = 'a close-up object crop') -> Dict[str,
+                                                                  List[str]]:
     """Generate BLIP captions for support object crops."""
     captioner = _get_blip_captioner(model_id, device, max_new_tokens)
     captions = {}
     for class_name in class_names:
-        crop = crops.get(class_name)
-        captions[class_name] = (
-            captioner.caption(crop) if crop is not None else fallback_caption)
+        class_crops = crops.get(class_name, [])
+        if class_crops:
+            captions[class_name] = [
+                captioner.caption(crop) for crop in class_crops
+            ]
+        else:
+            captions[class_name] = [fallback_caption]
     return captions
 
 
-def build_enriched_class_prompts(
+def build_enriched_class_caption_lists(
         data_root: Optional[str],
         ann_file: str,
         image_prefix: str,
@@ -169,18 +179,21 @@ def build_enriched_class_prompts(
         device: str = 'cpu',
         max_new_tokens: int = 30,
         fallback_caption: str = 'a close-up object crop',
-        enabled: bool = True) -> List[str]:
-    """Build class-ordered enriched prompts from support annotations."""
+        enabled: bool = True) -> Dict[str, List[str]]:
+    """Build class-wise support object caption lists."""
     if not enabled:
-        return list(class_names)
+        return {class_name: [class_name] for class_name in class_names}
 
     resolved_ann_file = _join_path(data_root, ann_file)
     image_root = _join_path(data_root, image_prefix)
     cache_key = (resolved_ann_file, image_root, tuple(class_names),
                  tuple(cat_ids or []), domain_attribute, model_id, device,
                  max_new_tokens, fallback_caption)
-    if cache_key in _PROMPT_CACHE:
-        return list(_PROMPT_CACHE[cache_key])
+    if cache_key in _CAPTION_LIST_CACHE:
+        return {
+            class_name: list(captions)
+            for class_name, captions in _CAPTION_LIST_CACHE[cache_key].items()
+        }
 
     crops = extract_support_object_crops(
         resolved_ann_file,
@@ -195,10 +208,65 @@ def build_enriched_class_prompts(
         max_new_tokens=max_new_tokens,
         fallback_caption=fallback_caption)
 
-    prompts = [
-        build_enriched_prompt(class_name, captions[class_name],
-                              domain_attribute)
-        for class_name in class_names
-    ]
-    _PROMPT_CACHE[cache_key] = tuple(prompts)
+    _CAPTION_LIST_CACHE[cache_key] = {
+        class_name: tuple(caption_list)
+        for class_name, caption_list in captions.items()
+    }
+    return captions
+
+
+def select_enriched_class_prompts(
+        class_names: Sequence[str],
+        caption_lists: Dict[str, List[str]],
+        domain_attribute: str = DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE,
+        selection: str = 'first') -> List[str]:
+    """Select one caption per class and build class-ordered prompts."""
+    if selection not in ('first', 'random'):
+        raise ValueError(
+            "selection must be either 'first' or 'random', "
+            f'but got {selection!r}')
+
+    prompts = []
+    for class_name in class_names:
+        captions = caption_lists.get(class_name) or ['a close-up object crop']
+        caption = (
+            random.choice(captions) if selection == 'random' else captions[0])
+        prompts.append(
+            build_enriched_prompt(class_name, caption, domain_attribute))
     return prompts
+
+
+def build_enriched_class_prompts(
+        data_root: Optional[str],
+        ann_file: str,
+        image_prefix: str,
+        class_names: Sequence[str],
+        cat_ids: Optional[Sequence[int]] = None,
+        domain_attribute: str = DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE,
+        model_id: str = DEFAULT_BLIP_MODEL_ID,
+        device: str = 'cpu',
+        max_new_tokens: int = 30,
+        fallback_caption: str = 'a close-up object crop',
+        enabled: bool = True,
+        selection: str = 'first') -> List[str]:
+    """Build active class prompts from cached class-wise caption lists."""
+    if not enabled:
+        return list(class_names)
+
+    caption_lists = build_enriched_class_caption_lists(
+        data_root=data_root,
+        ann_file=ann_file,
+        image_prefix=image_prefix,
+        class_names=class_names,
+        cat_ids=cat_ids,
+        domain_attribute=domain_attribute,
+        model_id=model_id,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        fallback_caption=fallback_caption,
+        enabled=enabled)
+    return select_enriched_class_prompts(
+        class_names=class_names,
+        caption_lists=caption_lists,
+        domain_attribute=domain_attribute,
+        selection=selection)

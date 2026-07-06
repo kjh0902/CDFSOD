@@ -37,6 +37,7 @@ enriched_text_cfg = dict(
     model_id='Salesforce/blip-image-captioning-base',
     support_ann_file=train_ann_file,
     support_img_prefix='train/',
+    caption_selection='random',
     device='cpu')
 
 train_pipeline = [
