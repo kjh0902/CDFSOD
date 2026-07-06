@@ -21,7 +21,8 @@ enriched_text_cfg = dict(
     support_ann_file=train_ann_file,
     support_img_prefix='train/',
     caption_selection='random',
-    device='cpu')
+    device='auto',
+    log_progress=True)
 
 backend_args = None
 

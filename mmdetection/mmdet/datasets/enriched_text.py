@@ -1,8 +1,10 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import json
 import math
+import os
 import os.path as osp
 import random
+import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image
@@ -115,7 +117,7 @@ class BlipObjectCaptioner:
 
     def __init__(self,
                  model_id: str = DEFAULT_BLIP_MODEL_ID,
-                 device: str = 'cpu',
+                 device: str = 'auto',
                  max_new_tokens: int = 30) -> None:
         import torch
         from transformers import BlipForConditionalGeneration, BlipProcessor
@@ -123,10 +125,16 @@ class BlipObjectCaptioner:
         self.torch = torch
         self.processor = BlipProcessor.from_pretrained(model_id)
         self.model = BlipForConditionalGeneration.from_pretrained(model_id)
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
         self.model.to(self.device)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
+        print(
+            f'[EnrichedText] Loaded BLIP captioner ({model_id}) on '
+            f'{self.device}.',
+            flush=True)
 
     def caption(self, crop: Image.Image) -> str:
         inputs = self.processor(
@@ -139,6 +147,9 @@ class BlipObjectCaptioner:
 
 def _get_blip_captioner(model_id: str, device: str,
                         max_new_tokens: int) -> BlipObjectCaptioner:
+    if device == 'auto':
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
     key = (model_id, device, max_new_tokens)
     if key not in _BLIP_CAPTIONERS:
         _BLIP_CAPTIONERS[key] = BlipObjectCaptioner(
@@ -146,23 +157,102 @@ def _get_blip_captioner(model_id: str, device: str,
     return _BLIP_CAPTIONERS[key]
 
 
+def _safe_cache_name(value: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', value).strip('_')
+
+
+def _default_caption_cache_file(ann_file: str, model_id: str,
+                                max_new_tokens: int) -> str:
+    ann_dir = osp.dirname(ann_file)
+    ann_name = osp.splitext(osp.basename(ann_file))[0]
+    model_name = _safe_cache_name(model_id)
+    cache_name = f'{ann_name}_{model_name}_max{max_new_tokens}.json'
+    return osp.join(ann_dir, 'caption_cache', cache_name)
+
+
+def _caption_cache_metadata(ann_file: str, image_root: str,
+                            class_names: Sequence[str], model_id: str,
+                            max_new_tokens: int,
+                            fallback_caption: str) -> dict:
+    return dict(
+        ann_file=osp.abspath(ann_file),
+        ann_mtime=osp.getmtime(ann_file),
+        image_root=osp.abspath(image_root),
+        class_names=list(class_names),
+        model_id=model_id,
+        max_new_tokens=max_new_tokens,
+        fallback_caption=fallback_caption)
+
+
+def _load_caption_cache(cache_file: str, metadata: dict,
+                        class_names: Sequence[str]) -> Optional[Dict[str,
+                                                                     List[str]]]:
+    if not osp.exists(cache_file):
+        return None
+
+    with open(cache_file, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+
+    if payload.get('version') != 1 or payload.get('metadata') != metadata:
+        return None
+
+    captions = payload.get('captions', {})
+    if not all(isinstance(captions.get(name), list) for name in class_names):
+        return None
+
+    print(f'[EnrichedText] Loaded caption cache: {cache_file}', flush=True)
+    return {name: list(captions[name]) for name in class_names}
+
+
+def _save_caption_cache(cache_file: str, metadata: dict,
+                        captions: Dict[str, List[str]]) -> None:
+    cache_dir = osp.dirname(cache_file)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump(
+            dict(version=1, metadata=metadata, captions=captions),
+            f,
+            ensure_ascii=False,
+            indent=2)
+    print(f'[EnrichedText] Saved caption cache: {cache_file}', flush=True)
+
+
 def generate_object_captions(
         crops: Dict[str, List[Image.Image]],
         class_names: Iterable[str],
         model_id: str = DEFAULT_BLIP_MODEL_ID,
-        device: str = 'cpu',
+        device: str = 'auto',
         max_new_tokens: int = 30,
-        fallback_caption: str = 'a close-up object crop') -> Dict[str,
-                                                                  List[str]]:
+        fallback_caption: str = 'a close-up object crop',
+        log_progress: bool = True) -> Dict[str, List[str]]:
     """Generate BLIP captions for support object crops."""
     captioner = _get_blip_captioner(model_id, device, max_new_tokens)
     captions = {}
+    class_names = list(class_names)
+    total_crops = sum(
+        len(crops.get(class_name, [])) for class_name in class_names)
+    processed_crops = 0
+    if log_progress:
+        print(
+            f'[EnrichedText] Generating BLIP captions for {total_crops} '
+            'support object crops.',
+            flush=True)
+
     for class_name in class_names:
         class_crops = crops.get(class_name, [])
         if class_crops:
-            captions[class_name] = [
-                captioner.caption(crop) for crop in class_crops
-            ]
+            captions[class_name] = []
+            for crop in class_crops:
+                processed_crops += 1
+                if log_progress:
+                    print(
+                        f'[EnrichedText] Captioning crop '
+                        f'{processed_crops}/{total_crops} '
+                        f'({class_name}).',
+                        flush=True)
+                captions[class_name].append(captioner.caption(crop))
         else:
             captions[class_name] = [fallback_caption]
     return captions
@@ -176,9 +266,11 @@ def build_enriched_class_caption_lists(
         cat_ids: Optional[Sequence[int]] = None,
         domain_attribute: str = DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE,
         model_id: str = DEFAULT_BLIP_MODEL_ID,
-        device: str = 'cpu',
+        device: str = 'auto',
         max_new_tokens: int = 30,
         fallback_caption: str = 'a close-up object crop',
+        caption_cache_file: Optional[str] = None,
+        log_progress: bool = True,
         enabled: bool = True) -> Dict[str, List[str]]:
     """Build class-wise support object caption lists."""
     if not enabled:
@@ -186,14 +278,37 @@ def build_enriched_class_caption_lists(
 
     resolved_ann_file = _join_path(data_root, ann_file)
     image_root = _join_path(data_root, image_prefix)
+    if caption_cache_file is None:
+        caption_cache_file = _default_caption_cache_file(
+            resolved_ann_file, model_id, max_new_tokens)
+    else:
+        caption_cache_file = _join_path(data_root, caption_cache_file)
+
+    metadata = _caption_cache_metadata(
+        resolved_ann_file,
+        image_root,
+        class_names,
+        model_id,
+        max_new_tokens,
+        fallback_caption)
+
     cache_key = (resolved_ann_file, image_root, tuple(class_names),
                  tuple(cat_ids or []), domain_attribute, model_id, device,
-                 max_new_tokens, fallback_caption)
+                 max_new_tokens, fallback_caption, caption_cache_file)
     if cache_key in _CAPTION_LIST_CACHE:
         return {
             class_name: list(captions)
             for class_name, captions in _CAPTION_LIST_CACHE[cache_key].items()
         }
+
+    cached_captions = _load_caption_cache(caption_cache_file, metadata,
+                                          class_names)
+    if cached_captions is not None:
+        _CAPTION_LIST_CACHE[cache_key] = {
+            class_name: tuple(caption_list)
+            for class_name, caption_list in cached_captions.items()
+        }
+        return cached_captions
 
     crops = extract_support_object_crops(
         resolved_ann_file,
@@ -206,12 +321,14 @@ def build_enriched_class_caption_lists(
         model_id=model_id,
         device=device,
         max_new_tokens=max_new_tokens,
-        fallback_caption=fallback_caption)
+        fallback_caption=fallback_caption,
+        log_progress=log_progress)
 
     _CAPTION_LIST_CACHE[cache_key] = {
         class_name: tuple(caption_list)
         for class_name, caption_list in captions.items()
     }
+    _save_caption_cache(caption_cache_file, metadata, captions)
     return captions
 
 
@@ -244,9 +361,11 @@ def build_enriched_class_prompts(
         cat_ids: Optional[Sequence[int]] = None,
         domain_attribute: str = DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE,
         model_id: str = DEFAULT_BLIP_MODEL_ID,
-        device: str = 'cpu',
+        device: str = 'auto',
         max_new_tokens: int = 30,
         fallback_caption: str = 'a close-up object crop',
+        caption_cache_file: Optional[str] = None,
+        log_progress: bool = True,
         enabled: bool = True,
         selection: str = 'first') -> List[str]:
     """Build active class prompts from cached class-wise caption lists."""
@@ -264,6 +383,8 @@ def build_enriched_class_prompts(
         device=device,
         max_new_tokens=max_new_tokens,
         fallback_caption=fallback_caption,
+        caption_cache_file=caption_cache_file,
+        log_progress=log_progress,
         enabled=enabled)
     return select_enriched_class_prompts(
         class_names=class_names,

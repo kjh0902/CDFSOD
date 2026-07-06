@@ -35,10 +35,11 @@ enriched_text_cfg = dict(
     enabled=True,
     domain_attribute=neu_det_domain_attribute,
     model_id='Salesforce/blip-image-captioning-base',
-    support_ann_file=train_ann_file,
+    support_ann_file='auto',
     support_img_prefix='train/',
     caption_selection='random',
-    device='cpu')
+    device='auto',
+    log_progress=True)
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),

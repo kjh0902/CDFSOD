@@ -17,6 +17,9 @@ from .enriched_text import (DEFAULT_NEU_DET_DOMAIN_ATTRIBUTE,
 class CocoDataset(BaseDetDataset):
     """Dataset for COCO."""
 
+    _last_enriched_support_ann_file = None
+    _last_enriched_support_img_prefix = None
+
     METAINFO = {
         'classes':
         ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
@@ -102,6 +105,23 @@ class CocoDataset(BaseDetDataset):
 
         return data_list
 
+    def resolve_enriched_support_source(self, support_ann_file,
+                                        support_img_prefix):
+        """Resolve auto support source to the current few-shot train split."""
+        auto_support = support_ann_file in (None, 'auto')
+        if auto_support:
+            if self.test_mode and self._last_enriched_support_ann_file:
+                support_ann_file = self._last_enriched_support_ann_file
+                support_img_prefix = self._last_enriched_support_img_prefix
+            else:
+                support_ann_file = self.ann_file
+
+        if not self.test_mode:
+            self.__class__._last_enriched_support_ann_file = support_ann_file
+            self.__class__._last_enriched_support_img_prefix = support_img_prefix
+
+        return support_ann_file, support_img_prefix
+
     def get_class_text_prompts(self, selection: str = 'first') -> List[str]:
         """Return class-name prompts or support-caption enriched prompts."""
         if self.enriched_text_cfg is None:
@@ -119,6 +139,9 @@ class CocoDataset(BaseDetDataset):
                                                      self.ann_file)
             support_img_prefix = enriched_text_cfg.pop(
                 'support_img_prefix', self.data_prefix.get('img', ''))
+            support_ann_file, support_img_prefix = \
+                self.resolve_enriched_support_source(
+                    support_ann_file, support_img_prefix)
             enriched_text_cfg.pop('caption_selection', None)
 
             self.enriched_caption_lists = build_enriched_class_caption_lists(

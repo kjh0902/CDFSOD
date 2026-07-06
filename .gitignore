@@ -9,6 +9,7 @@ caption_outputs/
 datasets/NEU-DET/train/*
 datasets/NEU-DET/test/*
 datasets/NEU-DET/annotations/*.json
+datasets/NEU-DET/annotations/caption_cache/
 !datasets/NEU-DET/train/.gitkeep
 !datasets/NEU-DET/test/.gitkeep
 !datasets/NEU-DET/annotations/.gitkeep
