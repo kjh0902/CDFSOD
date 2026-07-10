@@ -1,36 +1,59 @@
-# GroundingDINO Baseline for NEU-DET
+# CDFSOD GroundingDINO Baseline
 
-This repository is trimmed for GroundingDINO baseline training on the NEU-DET
-dataset. Domain-RAG retrieval, background generation, outpainting, and inpainting
-code has been removed.
+This repository is a compact GroundingDINO baseline for CDFSOD few-shot
+detection. The extra Domain-RAG, generation, inpainting, and broad MMDetection
+experiment files are intentionally kept out of the main workflow.
 
-## Expected Dataset Layout
+## Server Paths
 
-Place the dataset at the repository root:
+Clone this repository on the remote server here:
+
+```bash
+cd /home/aislab5090/CDFSOD/junhyung/grounding_dino_idea
+git clone https://github.com/kjh0902/CDFSOD.git
+cd CDFSOD
+```
+
+Datasets are expected here:
 
 ```text
-datasets/
+/home/aislab5090/CDFSOD/junhyung/datasets/
+  clipart1k/
+  NEU-DET/
+  UODD/
+```
+
+Each dataset should follow this COCO-style layout:
+
+```text
+DATASET_NAME/
+  annotations/
+    train.json
+    test.json
+    1_shot.json
+    5_shot.json
+    10_shot.json
+  train/
+  test/
+```
+
+For example:
+
+```text
+/home/aislab5090/CDFSOD/junhyung/datasets/
   NEU-DET/
     annotations/
       train.json
       test.json
+      1_shot.json
     train/
     test/
-  split.py
-  kshot_split.py
 ```
-
-The default config reads:
-
-- train images from `datasets/NEU-DET/train/`
-- test images from `datasets/NEU-DET/test/`
-- train annotations from `datasets/NEU-DET/annotations/train.json`
-- test annotations from `datasets/NEU-DET/annotations/test.json`
 
 ## Environment
 
-Recommended on the remote server. If the old `cdfsod` environment already has a
-broken `mmcv._ext`, remove it and start from a clean environment.
+Use a clean environment. Keep the compiler/CUDA exports in the same shell while
+building MMCV.
 
 ```bash
 conda deactivate || true
@@ -48,6 +71,7 @@ export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
 
 python -m pip install -U pip
 python -m pip install "setuptools==80.9.0" "wheel==0.45.1"
+
 pip install torch==2.7.0 torchvision==0.22.0 \
   --index-url https://download.pytorch.org/whl/cu128
 
@@ -66,8 +90,7 @@ MMCV_WITH_OPS=1 FORCE_CUDA=1 MAX_JOBS=8 pip install -v \
 pip install -e ./mmdetection --no-build-isolation
 ```
 
-Keep the `CUDA_HOME`, `CC`, and `CXX` exports in the same shell while building
-MMCV. After installation, verify the CUDA ops, not just `mmcv.__version__`:
+Verify the install:
 
 ```bash
 python - <<'PY'
@@ -83,47 +106,34 @@ print("mmcv.ops roi_align:", roi_align)
 PY
 ```
 
-If `from mmcv.ops import roi_align` fails, do not train yet. Remove `mmcv` again
-and rebuild it in the same active conda environment after confirming:
+## Train
 
 ```bash
-which nvcc
-nvcc --version
-ls -l "$CC" "$CXX"
-"$CXX" --version
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
+bash mmdetection/run_all_training.sh NEU-DET 1
 ```
 
-## Prepare Splits
-
-If you have one COCO JSON and already split images into `train/` and `test/`,
-run:
+The script arguments are:
 
 ```bash
-python datasets/split.py --input datasets/NEU-DET/annotations/data.json
+bash mmdetection/run_all_training.sh DATASET SHOT GPU_COUNT
 ```
 
-To make few-shot annotation files from `train.json`:
+Examples:
 
 ```bash
-python datasets/kshot_split.py --shots 1 5 10
+bash mmdetection/run_all_training.sh NEU-DET 1 1
+bash mmdetection/run_all_training.sh clipart1k 5 4
+bash mmdetection/run_all_training.sh UODD 10 4
 ```
 
-Then train with the full train split:
+The default data root is:
 
 ```bash
-python mmdetection/tools/train.py \
-  mmdetection/configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  --amp \
-  --device cuda:0
+/home/aislab5090/CDFSOD/junhyung/datasets
 ```
 
-For a 1-shot run:
+Override it only if needed:
 
 ```bash
-python mmdetection/tools/train.py \
-  mmdetection/configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  --amp \
-  --device cuda:0 \
-  --cfg-options train_dataloader.dataset.ann_file=annotations/1_shot.json
+CDFSOD_DATA_ROOT=/other/datasets bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```

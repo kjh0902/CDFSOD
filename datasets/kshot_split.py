@@ -69,7 +69,9 @@ def write_kshot_files(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Create k-shot COCO annotation files from NEU-DET train.json.')
-    parser.add_argument('--dataset-root', default='datasets/NEU-DET')
+    parser.add_argument(
+        '--dataset-root',
+        default='/home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET')
     parser.add_argument('--input', default=None)
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--shots', type=int, nargs='+', default=[1, 5, 10])

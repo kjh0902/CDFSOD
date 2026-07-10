@@ -5,6 +5,7 @@ _base_ = [
 ]
 
 lang_model_name = 'bert-base-uncased'
+num_classes = len(_base_.metainfo['classes'])
 
 model = dict(
     type='GroundingDINO',
@@ -85,7 +86,7 @@ model = dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
         type='GroundingDINOHead',
-        num_classes=6,
+        num_classes=num_classes,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale=0.0, bias=False),
         loss_cls=dict(

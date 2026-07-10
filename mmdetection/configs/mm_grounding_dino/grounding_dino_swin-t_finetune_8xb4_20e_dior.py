@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/DIOR/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/DIOR/'
 class_name = ('Expressway-Service-area','Expressway-toll-station','airplane','airport','baseballfield','basketballcourt','bridge','chimney','dam', 'golffield', 'groundtrackfield', 'harbor', 'overpass', 'ship', 'stadium', 'storagetank', 'tenniscourt', 'trainstation', 'vehicle', 'windmill',)
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])

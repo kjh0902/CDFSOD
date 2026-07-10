@@ -1,44 +1,62 @@
-# Dataset settings for the NEU-DET GroundingDINO baseline.
-#
-# Expected layout from the repository root:
-# datasets/
-#   NEU-DET/
-#     annotations/
-#       train.json
-#       test.json
-#     train/
-#     test/
+import os
+
+# Dataset settings for the compact CDFSOD GroundingDINO baseline.
+# Override with:
+#   CDFSOD_DATA_ROOT=/path/to/datasets
+#   CDFSOD_DATASET=NEU-DET
+#   CDFSOD_TRAIN_ANN=annotations/1_shot.json
 
 dataset_type = 'CocoDataset'
-data_root = 'datasets/NEU-DET/'
+datasets_root = os.getenv(
+    'CDFSOD_DATA_ROOT',
+    '/home/aislab5090/CDFSOD/junhyung/datasets')
+dataset_name = os.getenv('CDFSOD_DATASET', 'NEU-DET')
+data_root = os.path.join(datasets_root, dataset_name) + '/'
 backend_args = None
 
-metainfo = dict(
-    classes=(
+classes_by_dataset = {
+    'NEU-DET': (
         'crazing',
         'inclusion',
         'patches',
         'pitted_surface',
         'rolled-in_scale',
         'scratches',
-    ))
+    ),
+    'clipart1k': (
+        'sheep',
+        'chair',
+        'boat',
+        'bottle',
+        'diningtable',
+        'sofa',
+        'cow',
+        'motorbike',
+        'car',
+        'aeroplane',
+        'cat',
+        'train',
+        'person',
+        'bicycle',
+        'pottedplant',
+        'bird',
+        'dog',
+        'bus',
+        'tvmonitor',
+        'horse',
+    ),
+    'UODD': (
+        'seacucumber',
+        'seaurchin',
+        'scallop',
+    ),
+}
 
-train_ann_file = 'annotations/train.json'
+metainfo = dict(classes=classes_by_dataset[dataset_name])
+
+train_ann_file = os.getenv('CDFSOD_TRAIN_ANN', 'annotations/train.json')
 val_ann_file = 'annotations/test.json'
 test_ann_file = 'annotations/test.json'
-
-neu_det_domain_attribute = (
-    'gray-scale hot-rolled steel surface with metallic texture, low color '
-    'variation, and subtle industrial defect patterns')
-
-enriched_text_cfg = dict(
-    enabled=True,
-    domain_attribute=neu_det_domain_attribute,
-    model_id='Salesforce/blip-image-captioning-base',
-    support_ann_file='auto',
-    support_img_prefix='train/',
-    device='auto',
-    log_progress=True)
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),
@@ -106,7 +124,6 @@ train_dataloader = dict(
         metainfo=metainfo,
         pipeline=train_pipeline,
         filter_cfg=dict(filter_empty_gt=False),
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 val_dataloader = dict(
@@ -123,7 +140,6 @@ val_dataloader = dict(
         test_mode=True,
         metainfo=metainfo,
         pipeline=test_pipeline,
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 test_dataloader = dict(
@@ -140,7 +156,6 @@ test_dataloader = dict(
         test_mode=True,
         metainfo=metainfo,
         pipeline=test_pipeline,
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 val_evaluator = dict(

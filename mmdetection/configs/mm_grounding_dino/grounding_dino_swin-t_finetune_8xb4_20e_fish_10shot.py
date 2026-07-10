@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/FISH/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/FISH/'
 class_name = ('fish',)
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])

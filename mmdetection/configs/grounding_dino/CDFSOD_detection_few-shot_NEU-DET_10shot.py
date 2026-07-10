@@ -10,19 +10,6 @@ metainfo = dict(
 
 train_ann_file = 'annotations/10_shot.json'
 
-neu_det_domain_attribute = (
-    'gray-scale hot-rolled steel surface with metallic texture, low color '
-    'variation, and subtle industrial defect patterns')
-
-enriched_text_cfg = dict(
-    enabled=True,
-    domain_attribute=neu_det_domain_attribute,
-    model_id='Salesforce/blip-image-captioning-base',
-    support_ann_file=train_ann_file,
-    support_img_prefix='train/',
-    device='auto',
-    log_progress=True)
-
 backend_args = None
 
 train_pipeline = [
@@ -98,7 +85,6 @@ train_dataloader = dict(
         data_prefix=dict(img='train/'),
         pipeline=train_pipeline,
         filter_cfg=dict(filter_empty_gt=False),
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 val_dataloader = dict(
@@ -115,7 +101,6 @@ val_dataloader = dict(
         test_mode=True,
         metainfo=metainfo,
         pipeline=test_pipeline,
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 test_dataloader = dict(
@@ -132,7 +117,6 @@ test_dataloader = dict(
         test_mode=True,
         metainfo=metainfo,
         pipeline=test_pipeline,
-        enriched_text_cfg=enriched_text_cfg,
         return_classes=True))
 
 val_evaluator = dict(

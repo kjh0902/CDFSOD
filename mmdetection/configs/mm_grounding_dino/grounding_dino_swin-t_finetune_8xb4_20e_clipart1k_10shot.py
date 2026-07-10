@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/'
 class_name = ('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse',)
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])

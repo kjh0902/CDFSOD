@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-b_pretrain_obj365_goldg_v3det/grounding_dino_swin-b_pretrain_obj365_goldg_v3de-f83eef00.pth' 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/'
 class_name = ('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')
 num_classes = len(class_name)
 # metainfo = dict(classes=class_name, palette=[(220, 20, 60)])
@@ -8,7 +8,7 @@ num_classes = len(class_name)
 metainfo = dict(
     classes=('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')
 )
-# 修改模型配置，确保正确处理类别数量和label_embedding
+# �?��模型?�置，确保�?�?��?�类?�数?�和label_embedding
 model = dict(
     type='GroundingDINO',
     num_queries=900,
@@ -94,12 +94,11 @@ model = dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     language_model=dict(
         type='BertModel',
-        name='/home/add_disk2/qiuxingyu/mmdetection/weights/bert-base-uncased',
+        name='bert-base-uncased',
         pad_to_max=False,
         use_sub_sentence_represent=True,
         special_tokens_list=['[CLS]', '[SEP]', '.', '?'],
-        add_pooling_layer=False),  # 确保与clipart1k_1shot_train.py一致
-    dn_cfg=dict(
+        add_pooling_layer=False),  # �?��与clipart1k_1shot_train.py一??    dn_cfg=dict(
         label_noise_scale=0.5,
         box_noise_scale=1.0,
         group_cfg=dict(dynamic=True, num_groups=None,
@@ -158,7 +157,7 @@ train_dataloader = dict(
             dict(
                 ann_file='annotations/1_shot.json',
                 data_prefix=dict(img='train/'),
-                data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+                data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
                 filter_cfg=dict(filter_empty_gt=False),
                 metainfo=dict(
                     classes=(
@@ -471,7 +470,7 @@ train_pipeline = [
 train_real_dataset = dict(
     ann_file='annotations/1_shot.json',
     data_prefix=dict(img='train/'),
-    data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+    data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
     filter_cfg=dict(filter_empty_gt=False),
     metainfo=dict(
         classes=(
@@ -634,7 +633,7 @@ val_dataloader = dict(
     dataset=dict(
         ann_file='annotations/test.json',
         data_prefix=dict(img='test/'),
-        data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+        data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
         metainfo=dict(
             classes=(
                         'sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')),
@@ -665,7 +664,7 @@ val_dataloader = dict(
     persistent_workers=True,
     sampler=dict(shuffle=False, type='DefaultSampler'))
 val_evaluator = dict(
-    ann_file='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/annotations/test.json',
+    ann_file='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/annotations/test.json',
     backend_args=None,
     classwise=True,
     format_only=False,

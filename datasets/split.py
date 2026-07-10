@@ -116,7 +116,9 @@ def split_dataset(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Create NEU-DET train/test COCO annotation files.')
-    parser.add_argument('--dataset-root', default='datasets/NEU-DET')
+    parser.add_argument(
+        '--dataset-root',
+        default='/home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET')
     parser.add_argument('--input', default=None)
     parser.add_argument('--train-output', default=None)
     parser.add_argument('--test-output', default=None)

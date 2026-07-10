@@ -1,6 +1,6 @@
 auto_scale_lr = dict(base_batch_size=32, enable=False)
 backend_args = None
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k'
 dataset_type = 'CocoDataset'
 default_hooks = dict(
     checkpoint=dict(by_epoch=True, interval=1, type='CheckpointHook'),
@@ -114,7 +114,7 @@ model = dict(
             self_attn_cfg=dict(dropout=0.0, embed_dims=256, num_heads=4))),
     language_model=dict(
         add_pooling_layer=False,
-        name='/home/add_disk2/qiuxingyu/mmdetection/weights/bert-base-uncased',
+        name='bert-base-uncased',
         pad_to_max=False,
         special_tokens_list=[
             '[CLS]',
@@ -177,7 +177,7 @@ test_dataloader = dict(
     dataset=dict(
         ann_file='annotations/test.json',
         data_prefix=dict(img='test/'),
-        data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k',
+        data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k',
         metainfo=dict(classes=('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')),
         pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),
@@ -206,7 +206,7 @@ test_dataloader = dict(
     persistent_workers=True,
     sampler=dict(shuffle=False, type='DefaultSampler'))
 test_evaluator = dict(
-    ann_file='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/annotations/test.json',
+    ann_file='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/annotations/test.json',
     backend_args=None,
     classwise=True,
     format_only=False,
@@ -239,7 +239,7 @@ train_dataloader = dict(
     dataset=dict(
         ann_file='annotations/10_shot.json',
         data_prefix=dict(img='train/'),
-        data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+        data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
         filter_cfg=dict(filter_empty_gt=False),
         metainfo=dict(classes=('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')),
         pipeline=[
@@ -550,7 +550,7 @@ train_pipeline = [
 train_real_dataset = dict(
     ann_file='annotations/10_shot.json',
     data_prefix=dict(img='train/'),
-    data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+    data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
     filter_cfg=dict(filter_empty_gt=False),
     metainfo=dict(classes=('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')),
     pipeline=[
@@ -711,7 +711,7 @@ val_dataloader = dict(
     dataset=dict(
         ann_file='annotations/test.json',
         data_prefix=dict(img='test/'),
-        data_root='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/',
+        data_root='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/',
         metainfo=dict(classes=('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')),
         pipeline=[
             dict(backend_args=None, type='LoadImageFromFile'),
@@ -740,7 +740,7 @@ val_dataloader = dict(
     persistent_workers=True,
     sampler=dict(shuffle=False, type='DefaultSampler'))
 val_evaluator = dict(
-    ann_file='/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/annotations/test.json',
+    ann_file='/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/annotations/test.json',
     backend_args=None,
     classwise=True,
     format_only=False,

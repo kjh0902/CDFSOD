@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/NEU-DET/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET/'
 class_name = ('crazing', 'inclusion', 'patches', 'pitted_surface', 'rolled-in_scale', 'scratches',)
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])

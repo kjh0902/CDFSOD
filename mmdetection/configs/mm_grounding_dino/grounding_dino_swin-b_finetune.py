@@ -2,29 +2,29 @@
 
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-# 使用预训练的Grounding DINO模型作为起点
+# 使用预�?练的Grounding DINO模型作为起点
 load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-b_pretrain_obj365_goldg_v3det/grounding_dino_swin-b_pretrain_obj365_goldg_v3de-f83eef00.pth'  # noqa
 
-data_root = '/home/add_disk/qiuxingyu/NTIRE2025_CDFSOD/datasets/clipart1k/'
+data_root = '/home/aislab5090/CDFSOD/junhyung/datasets/clipart1k/'
 class_name = ('sheep', 'chair', 'boat', 'bottle', 'diningtable', 'sofa', 'cow', 'motorbike', 'car', 'aeroplane', 'cat', 'train', 'person', 'bicycle', 'pottedplant', 'bird', 'dog', 'bus', 'tvmonitor', 'horse')
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])
 
-# 添加 launcher 和分布式训练配置
+# 添加 launcher ?�分布式�?��?�置
 launcher = 'pytorch'
 
-# 配置 find_unused_parameters=True 解决未使用参数的问题
+# ?�置 find_unused_parameters=True 解决?�使?�参?�的??��
 env_cfg = dict(
     cudnn_benchmark=False,
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
     dist_cfg=dict(backend='nccl'),
 )
 
-# 添加静态图设置
+# 添加?�态图设置
 _use_static_graph = True
 _set_static_graph = True
 
-# 修改模型配置，确保正确处理类别数量和label_embedding
+# �?��模型?�置，确保�?�?��?�类?�数?�和label_embedding
 model = dict(
     type='GroundingDINO',
     num_queries=900,
@@ -110,12 +110,11 @@ model = dict(
         loss_iou=dict(type='GIoULoss', loss_weight=2.0)),
     language_model=dict(
         type='BertModel',
-        name='/home/add_disk2/qiuxingyu/mmdetection/weights/bert-base-uncased',
+        name='bert-base-uncased',
         pad_to_max=False,
         use_sub_sentence_represent=True,
         special_tokens_list=['[CLS]', '[SEP]', '.', '?'],
-        add_pooling_layer=False),  # 确保与clipart1k_1shot_train.py一致
-    dn_cfg=dict(
+        add_pooling_layer=False),  # �?��与clipart1k_1shot_train.py一??    dn_cfg=dict(
         label_noise_scale=0.5,
         box_noise_scale=1.0,
         group_cfg=dict(dynamic=True, num_groups=None,
@@ -124,7 +123,7 @@ model = dict(
     use_autocast=False,
 )
 
-# 自定义针对clipart1k检测的数据增强管道
+# ?�定义针对clipart1k检测的?�据增强管道
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=None),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -166,7 +165,7 @@ train_pipeline = [
                    'custom_entities'))
 ]
 
-# 测试和验证的管道
+# 测试?�验证的管道
 test_pipeline = [
     dict(type='LoadImageFromFile', backend_args=None),
     dict(
@@ -181,8 +180,7 @@ test_pipeline = [
                    'scale_factor', 'text', 'custom_entities'))
 ]
 
-# 定义Clipart1k数据集
-train_dataloader = dict(
+# 定义Clipart1k?�据??train_dataloader = dict(
     batch_sampler=dict(type='AspectRatioBatchSampler'),
     batch_size=2,
     num_workers=8,
@@ -225,19 +223,17 @@ val_dataloader = dict(
 
 test_dataloader = val_dataloader
 
-# 调整优化器和学习率
-optim_wrapper = dict(
+# 调整优化?�和学习??optim_wrapper = dict(
     clip_grad=dict(max_norm=0.1, norm_type=2),
     optimizer=dict(lr=0.0001, type='AdamW', weight_decay=0.0001),
     paramwise_cfg=dict(
         custom_keys=dict(
             absolute_pos_embed=dict(decay_mult=0.0),
             backbone=dict(lr_mult=0.1),
-            language_model=dict(lr_mult=0.0))),  # 冻结BERT
+            language_model=dict(lr_mult=0.0))),  # ?�结BERT
     type='OptimWrapper')
 
-# 学习率调度
-param_scheduler = [
+# 学习?�调�?param_scheduler = [
     dict(
         begin=0,
         by_epoch=True,
@@ -258,27 +254,25 @@ val_evaluator = dict(
 
 test_evaluator = val_evaluator
 
-# 训练配置
+# �?��?�置
 max_epoch = 20
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=max_epoch, val_interval=1)
 val_cfg = dict(type='ValLoop')
 
-# 默认钩子
+# 默�??�子
 default_hooks = dict(
     checkpoint=dict(interval=1, max_keep_ckpts=1, save_best='auto'),
     logger=dict(type='LoggerHook', interval=5))
 
-# 日志设置
+# ?�志设置
 log_processor = dict(by_epoch=True)
 log_level = 'INFO'
 resume = False
 
-# 可视化设置
-vis_backends = [dict(type='LocalVisBackend')]
+# ??��?��?�?vis_backends = [dict(type='LocalVisBackend')]
 visualizer = dict(
     type='DetLocalVisualizer',
     vis_backends=vis_backends,
     name='visualizer')
 
-# 修改分布式训练设置
-find_unused_parameters = True
+# �?��?�布式�?练�?�?find_unused_parameters = True
