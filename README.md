@@ -108,6 +108,19 @@ PY
 
 ## Train
 
+First generate BLIP captions for the support-set object crops. This uses each
+GT bounding box crop, not the full image.
+
+```bash
+python mmdetection/tools/generate_instance_captions.py \
+  --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
+  --ann-file annotations/1_shot.json \
+  --img-prefix train \
+  --output annotations/1_shot_captions.json
+```
+
+Then train with instance-level text enrichment:
+
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1
 ```
@@ -124,6 +137,18 @@ Examples:
 bash mmdetection/run_all_training.sh NEU-DET 1 1
 bash mmdetection/run_all_training.sh clipart1k 5 4
 bash mmdetection/run_all_training.sh UODD 10 4
+```
+
+The enriched training prompt for each GT object is:
+
+```text
+{class name}, {BLIP object crop caption}, {dataset domain attribute}
+```
+
+For a class-name-only baseline, disable enrichment:
+
+```bash
+CDFSOD_USE_INSTANCE_TEXT=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
 The default data root is:

@@ -933,6 +933,9 @@ class RandomCrop(BaseTransform):
                 results['gt_bboxes_labels'] = \
                     results['gt_bboxes_labels'][valid_inds]
 
+            if results.get('gt_ann_ids', None) is not None:
+                results['gt_ann_ids'] = results['gt_ann_ids'][valid_inds]
+
             if results.get('gt_masks', None) is not None:
                 results['gt_masks'] = results['gt_masks'][
                     valid_inds.nonzero()[0]].crop(

@@ -192,6 +192,40 @@ class GroundingDINO(DINO):
             positive_map, plus=1)
         return positive_map_label_to_token, positive_map
 
+    def get_instance_text_prompts(self, batch_data_samples: SampleList):
+        """Return per-GT enriched prompts when annotation captions exist."""
+        instance_text_prompts = []
+        has_instance_text = False
+        for data_sample in batch_data_samples:
+            gt_instances = data_sample.gt_instances
+            labels = gt_instances.labels
+            ann_ids = getattr(gt_instances, 'ann_ids', None)
+            caption_by_ann_id = data_sample.get('caption_by_ann_id', None)
+
+            if ann_ids is None or caption_by_ann_id is None:
+                instance_text_prompts.append(None)
+                continue
+
+            has_instance_text = True
+            sample_prompts = []
+            ann_ids = ann_ids.detach().cpu().tolist()
+            for label, ann_id in zip(labels.detach().cpu().tolist(), ann_ids):
+                text = caption_by_ann_id.get(str(ann_id), None)
+                if text is None:
+                    class_name = data_sample.text[label]
+                    domain_attribute = data_sample.get(
+                        'domain_attribute', None)
+                    parts = [class_name]
+                    if domain_attribute:
+                        parts.append(domain_attribute)
+                    text = ', '.join(parts)
+                sample_prompts.append(text)
+            instance_text_prompts.append(sample_prompts)
+
+        if not has_instance_text:
+            return None
+        return instance_text_prompts
+
     def get_tokens_positive_and_prompts(
         self,
         original_caption: Union[str, list, tuple],
@@ -426,8 +460,34 @@ class GroundingDINO(DINO):
             data_samples.gt_instances.labels
             for data_samples in batch_data_samples
         ]
+        instance_text_prompts = self.get_instance_text_prompts(
+            batch_data_samples)
 
-        if 'tokens_positive' in batch_data_samples[0]:
+        if instance_text_prompts is not None:
+            new_text_prompts = []
+            positive_maps = []
+            for instance_prompts, text_prompt, gt_label in zip(
+                    instance_text_prompts, text_prompts, gt_labels):
+                if instance_prompts is None:
+                    instance_prompts = [
+                        text_prompt[label] for label in
+                        gt_label.detach().cpu().tolist()
+                    ]
+                if len(instance_prompts) == 0:
+                    tokenized, caption_string, tokens_positive, _ = \
+                        self.get_tokens_and_prompts(text_prompt, True)
+                    new_tokens_positive = []
+                else:
+                    tokenized, caption_string, tokens_positive, _ = \
+                        self.get_tokens_and_prompts(instance_prompts, True)
+                    new_tokens_positive = [
+                        tokens_positive[i] for i in range(len(gt_label))
+                    ]
+                _, positive_map = self.get_positive_map(
+                    tokenized, new_tokens_positive)
+                positive_maps.append(positive_map)
+                new_text_prompts.append(caption_string)
+        elif 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
                 data_samples.tokens_positive
                 for data_samples in batch_data_samples
