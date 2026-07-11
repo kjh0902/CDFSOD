@@ -119,7 +119,7 @@ python mmdetection/tools/generate_instance_captions.py \
   --output annotations/1_shot_captions.json
 ```
 
-Then train with instance-level text enrichment:
+Then train with support-set class text prototypes:
 
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1
@@ -139,16 +139,33 @@ bash mmdetection/run_all_training.sh clipart1k 5 4
 bash mmdetection/run_all_training.sh UODD 10 4
 ```
 
-The enriched training prompt for each GT object is:
+Each support object caption is converted to an enriched support prompt:
 
 ```text
 {class name}, {BLIP object crop caption}, {dataset domain attribute}
 ```
 
-For a class-name-only baseline, disable enrichment:
+At every training iteration, all support prompts are re-encoded with the
+current BERT, averaged per class, and used as class text prototypes. For a
+class-name-only baseline, disable prototypes:
 
 ```bash
-CDFSOD_USE_INSTANCE_TEXT=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
+CDFSOD_USE_CLASS_PROTOTYPES=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
+```
+
+To print prototype debugging information on the first training iteration:
+
+```bash
+CDFSOD_DEBUG_TEXT_PROTOTYPE=1 bash mmdetection/run_all_training.sh NEU-DET 1 1
+```
+
+Test the best validation checkpoint after training:
+
+```bash
+cd mmdetection
+python tools/test.py \
+  configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
+  work_dirs/NEU-DET_1shot_class_prototype/best_coco_bbox_mAP_epoch_*.pth
 ```
 
 The default data root is:

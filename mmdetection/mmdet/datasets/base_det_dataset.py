@@ -33,20 +33,12 @@ class BaseDetDataset(BaseDataset):
                  backend_args: dict = None,
                  return_classes: bool = False,
                  caption_prompt: Optional[dict] = None,
-                 instance_caption_file: Optional[str] = None,
-                 domain_attribute: Optional[str] = None,
-                 use_instance_text: bool = False,
                  **kwargs) -> None:
         self.seg_map_suffix = seg_map_suffix
         self.proposal_file = proposal_file
         self.backend_args = backend_args
         self.return_classes = return_classes
         self.caption_prompt = caption_prompt
-        self.instance_caption_file = instance_caption_file
-        self.domain_attribute = domain_attribute
-        self.use_instance_text = use_instance_text
-        self.instance_captions = {}
-        self._instance_captions_loaded = False
         if self.caption_prompt is not None:
             assert self.return_classes, \
                 'return_classes must be True when using caption_prompt'
@@ -57,57 +49,6 @@ class BaseDetDataset(BaseDataset):
                 'https://github.com/open-mmlab/mmdetection/blob/main/configs/_base_/datasets/coco_detection.py'  # noqa: E501
             )
         super().__init__(*args, **kwargs)
-
-    def load_instance_captions(self) -> None:
-        """Load precomputed object-level captions keyed by annotation id."""
-        if self._instance_captions_loaded:
-            return
-        self._instance_captions_loaded = True
-
-        if not self.instance_caption_file:
-            return
-
-        caption_file = self.instance_caption_file
-        if not is_abs(caption_file):
-            caption_file = osp.join(self.data_root, caption_file)
-
-        caption_data = load(caption_file, backend_args=self.backend_args)
-        captions = {}
-
-        if isinstance(caption_data, dict):
-            if 'captions' in caption_data:
-                entries = caption_data['captions']
-            elif 'annotations' in caption_data:
-                entries = caption_data['annotations']
-            else:
-                entries = caption_data
-        else:
-            entries = caption_data
-
-        if isinstance(entries, dict):
-            for ann_id, value in entries.items():
-                caption = value.get('caption') if isinstance(value, dict) \
-                    else value
-                if caption:
-                    captions[str(ann_id)] = str(caption).strip()
-        else:
-            for item in entries:
-                ann_id = item.get('ann_id', item.get('annotation_id',
-                                                     item.get('id')))
-                caption = item.get('caption')
-                if ann_id is not None and caption:
-                    captions[str(ann_id)] = str(caption).strip()
-
-        self.instance_captions = captions
-
-    def build_instance_text(self, class_name: str, caption: str = '') -> str:
-        """Build "{class}, {caption}, {domain}" text for one object."""
-        parts = [class_name]
-        if caption:
-            parts.append(caption)
-        if self.domain_attribute:
-            parts.append(self.domain_attribute)
-        return ', '.join(parts)
 
     def full_init(self) -> None:
         """Load annotation file and set ``BaseDataset._fully_initialized`` to

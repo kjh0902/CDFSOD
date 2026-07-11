@@ -6,7 +6,7 @@ import os
 #   CDFSOD_DATASET=NEU-DET
 #   CDFSOD_TRAIN_ANN=annotations/1_shot.json
 #   CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json
-#   CDFSOD_USE_INSTANCE_TEXT=1
+#   CDFSOD_USE_CLASS_PROTOTYPES=1
 
 dataset_type = 'CocoDataset'
 datasets_root = os.getenv(
@@ -68,7 +68,9 @@ test_ann_file = 'annotations/test.json'
 default_caption_file = train_ann_file.rsplit('.', 1)[0] + '_captions.json'
 instance_caption_file = os.getenv('CDFSOD_CAPTION_FILE',
                                   default_caption_file)
-use_instance_text = os.getenv('CDFSOD_USE_INSTANCE_TEXT', '1') != '0'
+use_class_text_prototypes = os.getenv(
+    'CDFSOD_USE_CLASS_PROTOTYPES', '1') != '0'
+debug_text_prototype = os.getenv('CDFSOD_DEBUG_TEXT_PROTOTYPE', '0') == '1'
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
@@ -112,8 +114,7 @@ train_pipeline = [
         type='PackDetInputs',
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
                    'scale_factor', 'flip', 'flip_direction', 'text',
-                   'custom_entities', 'caption_by_ann_id',
-                   'domain_attribute'))
+                   'custom_entities'))
 ]
 
 test_pipeline = [
@@ -140,11 +141,7 @@ train_dataloader = dict(
         metainfo=metainfo,
         pipeline=train_pipeline,
         filter_cfg=dict(filter_empty_gt=False),
-        return_classes=True,
-        use_instance_text=use_instance_text,
-        instance_caption_file=(
-            instance_caption_file if use_instance_text else None),
-        domain_attribute=domain_attribute))
+        return_classes=True))
 
 val_dataloader = dict(
     batch_size=1,

@@ -62,7 +62,6 @@ class CocoDataset(BaseDetDataset):
         Returns:
             List[dict]: A list of annotation.
         """  # noqa: E501
-        self.load_instance_captions()
         with get_local_path(
                 self.ann_file, backend_args=self.backend_args) as local_path:
             self.coco = self.COCOAPI(local_path)
@@ -132,9 +131,6 @@ class CocoDataset(BaseDetDataset):
             data_info['text'] = self.metainfo['classes']
             data_info['caption_prompt'] = self.caption_prompt
             data_info['custom_entities'] = True
-        if self.use_instance_text:
-            data_info['domain_attribute'] = self.domain_attribute
-            data_info['caption_by_ann_id'] = {}
 
         instances = []
         for i, ann in enumerate(ann_info):
@@ -162,15 +158,6 @@ class CocoDataset(BaseDetDataset):
             ann_id = ann.get('id', None)
             if ann_id is not None:
                 instance['ann_id'] = int(ann_id)
-
-            if self.use_instance_text:
-                class_name = self.metainfo['classes'][
-                    self.cat2label[ann['category_id']]]
-                caption = self.instance_captions.get(str(ann_id), '')
-                instance_text = self.build_instance_text(class_name, caption)
-                if ann_id is not None:
-                    data_info['caption_by_ann_id'][str(ann_id)] = \
-                        instance_text
 
             if ann.get('segmentation', None):
                 instance['mask'] = ann['segmentation']

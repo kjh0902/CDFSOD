@@ -4,14 +4,25 @@ _base_ = [
     '../../_base_/default_runtime.py',
 ]
 
+import os
+
 lang_model_name = 'bert-base-uncased'
 num_classes = len(_base_.metainfo['classes'])
+support_caption_file = _base_.instance_caption_file
+if not os.path.isabs(support_caption_file):
+    support_caption_file = os.path.join(_base_.data_root,
+                                        support_caption_file)
 
 model = dict(
     type='GroundingDINO',
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
+    use_class_text_prototypes=_base_.use_class_text_prototypes,
+    support_caption_file=support_caption_file,
+    support_class_names=_base_.metainfo['classes'],
+    support_domain_attribute=_base_.domain_attribute,
+    debug_text_prototype=_base_.debug_text_prototype,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -134,6 +145,11 @@ param_scheduler = [
 
 train_cfg = dict(max_epochs=max_epochs, type='EpochBasedTrainLoop', val_interval=5)
 
-default_hooks = dict(checkpoint=dict(by_epoch=True, interval=1))
+default_hooks = dict(
+    checkpoint=dict(
+        by_epoch=True,
+        interval=1,
+        save_best='coco/bbox_mAP',
+        rule='greater'))
 
 auto_scale_lr = dict(base_batch_size=16)
