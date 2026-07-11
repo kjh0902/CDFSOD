@@ -4,6 +4,8 @@ set -euo pipefail
 DATASET="${1:-NEU-DET}"
 SHOT="${2:-1}"
 GPUS="${3:-1}"
+MMDET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$MMDET_DIR"
 
 export CDFSOD_DATA_ROOT="${CDFSOD_DATA_ROOT:-/home/aislab5090/CDFSOD/junhyung/datasets}"
 export CDFSOD_DATASET="$DATASET"
