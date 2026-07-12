@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
-from mmengine.runner import load_checkpoint
+from mmengine.runner.checkpoint import load_state_dict
 
 
 THIS_FILE = Path(__file__).resolve()
@@ -71,10 +71,23 @@ def build_model(config_path, checkpoint_path, caption_file, device):
     cfg.model.train_cfg = None
 
     model = MODELS.build(cfg.model)
-    load_checkpoint(model, checkpoint_path, map_location='cpu')
+    load_checkpoint_state_dict(model, checkpoint_path)
     model.to(device)
     model.eval()
     return model
+
+
+def load_checkpoint_state_dict(model, checkpoint_path):
+    """Load trusted local MMEngine checkpoints with PyTorch >= 2.6."""
+    checkpoint = torch.load(
+        checkpoint_path, map_location='cpu', weights_only=False)
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif isinstance(checkpoint, dict) and 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+    load_state_dict(model, state_dict, strict=False)
 
 
 def get_raw_and_projected_prototypes(model):
