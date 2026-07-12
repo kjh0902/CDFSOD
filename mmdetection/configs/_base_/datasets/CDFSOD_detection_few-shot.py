@@ -6,7 +6,7 @@ import os
 #   CDFSOD_DATASET=NEU-DET
 #   CDFSOD_TRAIN_ANN=annotations/1_shot.json
 #   CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json
-#   CDFSOD_USE_CLASS_PROTOTYPES=1
+#   CDFSOD_USE_ENRICHED_CLASS_TOKENS=1
 
 dataset_type = 'CocoDataset'
 datasets_root = os.getenv(
@@ -68,9 +68,12 @@ test_ann_file = 'annotations/test.json'
 default_caption_file = train_ann_file.rsplit('.', 1)[0] + '_captions.json'
 instance_caption_file = os.getenv('CDFSOD_CAPTION_FILE',
                                   default_caption_file)
-use_class_text_prototypes = os.getenv(
-    'CDFSOD_USE_CLASS_PROTOTYPES', '1') != '0'
-debug_text_prototype = os.getenv('CDFSOD_DEBUG_TEXT_PROTOTYPE', '0') == '1'
+use_enriched_class_tokens = os.getenv(
+    'CDFSOD_USE_ENRICHED_CLASS_TOKENS',
+    os.getenv('CDFSOD_USE_CLASS_PROTOTYPES', '1')) != '0'
+debug_text_tokens = os.getenv(
+    'CDFSOD_DEBUG_TEXT_TOKENS',
+    os.getenv('CDFSOD_DEBUG_TEXT_PROTOTYPE', '0')) == '1'
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
