@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Evaluate the config pretrained GroundingDINO directly on the query set.
+"""Evaluate pretrained GroundingDINO directly on the query set.
 
 This disposable script does not use the K-shot support set or support
-captions. It uses the config's ``load_from`` pretrained GroundingDINO weight,
+captions. It loads the natural-image pretrained GroundingDINO weight below,
 disables the class-name-token prototype path, and evaluates the dataset
 query/test split with ordinary class-name prompts.
 
@@ -33,6 +33,9 @@ DEFAULT_CONFIG = (
     MMDET_DIR / 'configs/mm_grounding_dino/CDFSOD/'
     'GroundingDINO-few-shot-SwinB.py')
 DEFAULT_DATA_ROOT = '/home/aislab5090/CDFSOD/junhyung/datasets'
+PRETRAINED_GROUNDING_DINO = (
+    'https://download.openmmlab.com/mmdetection/v3.0/grounding_dino/'
+    'groundingdino_swinb_cogcoor_mmdet-55949c9c.pth')
 
 
 def parse_args():
@@ -89,10 +92,7 @@ def main():
 
     cfg = Config.fromfile(args.config)
     cfg.launcher = args.launcher
-    if cfg.get('load_from', None) is None:
-        raise RuntimeError(
-            'The config has no load_from pretrained checkpoint. '
-            'Use GroundingDINO-few-shot-SwinB.py or add load_from to config.')
+    cfg.load_from = PRETRAINED_GROUNDING_DINO
     if args.work_dir is not None:
         cfg.work_dir = args.work_dir
     else:
