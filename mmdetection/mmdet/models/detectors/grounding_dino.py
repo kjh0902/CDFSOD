@@ -60,6 +60,7 @@ class GroundingDINO(DINO):
                  use_autocast=False,
                  use_class_text_prototypes: bool = False,
                  use_enriched_class_tokens: Optional[bool] = None,
+                 use_class_name_token_prototypes: Optional[bool] = None,
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
@@ -70,10 +71,13 @@ class GroundingDINO(DINO):
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        if use_class_name_token_prototypes is not None:
+            use_enriched_class_tokens = use_class_name_token_prototypes
         if use_enriched_class_tokens is None:
             use_enriched_class_tokens = use_class_text_prototypes
         if debug_text_tokens is None:
             debug_text_tokens = debug_text_prototype
+        self.use_class_name_token_prototypes = use_enriched_class_tokens
         self.use_enriched_class_tokens = use_enriched_class_tokens
         self.use_class_text_prototypes = use_enriched_class_tokens
         self.support_caption_file = support_caption_file
@@ -84,13 +88,12 @@ class GroundingDINO(DINO):
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
-        self.support_prompt_token_output_indices = None
         self.support_tokenized = None
-        self._cached_eval_support_token_text_dict = None
+        self._cached_eval_support_prototype_text_dict = None
         self._printed_text_token_debug = False
         self._registered_bert_grad_debug_hook = False
         super().__init__(*args, **kwargs)
-        if self.use_enriched_class_tokens:
+        if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
 
     def _init_layers(self) -> None:
@@ -122,7 +125,7 @@ class GroundingDINO(DINO):
         """Switch train/eval mode and clear stale eval text-token cache."""
         super().train(mode)
         if mode:
-            self._cached_eval_support_token_text_dict = None
+            self._cached_eval_support_prototype_text_dict = None
         return self
 
     def init_weights(self) -> None:
@@ -299,8 +302,7 @@ class GroundingDINO(DINO):
             self._find_class_name_token_positions(
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
-        self.support_class_token_output_indices = \
-            self._build_class_token_output_indices()
+        self.support_class_token_counts = self._build_class_token_counts()
 
     def _format_support_prompt(self, class_name: str,
                                caption: str) -> Tuple[str, Tuple[int, int]]:
@@ -344,21 +346,14 @@ class GroundingDINO(DINO):
             token_positions.append(positions)
         return token_positions
 
-    def _build_class_token_output_indices(self) -> Dict[int, List[int]]:
-        class_token_indices = defaultdict(list)
-        prompt_token_indices = []
-        output_idx = 0
+    def _build_class_token_counts(self) -> Dict[int, int]:
+        class_token_counts = defaultdict(int)
         for prompt_idx, class_idx in enumerate(
                 self.support_prompt_labels.tolist()):
-            current_prompt_indices = []
             for _ in self.support_prompt_class_token_positions[prompt_idx]:
-                class_token_indices[class_idx].append(output_idx)
-                current_prompt_indices.append(output_idx)
-                output_idx += 1
-            prompt_token_indices.append(current_prompt_indices)
-        self.support_prompt_token_output_indices = prompt_token_indices
+                class_token_counts[class_idx] += 1
         return {
-            class_idx: class_token_indices[class_idx]
+            class_idx: class_token_counts[class_idx]
             for class_idx in range(len(self.support_class_names))
         }
 
@@ -407,7 +402,7 @@ class GroundingDINO(DINO):
         if return_debug:
             class_token_counts = {
                 self.support_class_names[class_idx]:
-                len(self.support_class_token_output_indices[class_idx])
+                self.support_class_token_counts[class_idx]
                 for class_idx in range(len(self.support_class_names))
             }
             debug = dict(
@@ -418,40 +413,54 @@ class GroundingDINO(DINO):
             return selected_features, selected_labels, debug
         return selected_features, selected_labels
 
-    def build_support_token_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from selected support class-name token features."""
-        if (not self.training and self._cached_eval_support_token_text_dict
+    def compute_class_text_prototypes(self, return_debug: bool = False):
+        """Average selected class-name token features into class prototypes."""
+        token_features, token_labels, debug = \
+            self.compute_support_class_token_features(return_debug=True)
+        prototypes = []
+        for class_idx in range(len(self.support_class_names)):
+            class_mask = token_labels == class_idx
+            if not class_mask.any():
+                raise RuntimeError(
+                    f'No support class-name tokens for class '
+                    f'{self.support_class_names[class_idx]}')
+            prototypes.append(token_features[class_mask].mean(dim=0))
+        prototypes = torch.stack(prototypes, dim=0)
+
+        if return_debug:
+            debug['prototype_shape'] = tuple(prototypes.shape)
+            return prototypes, debug
+        return prototypes
+
+    def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
+        """Build text_dict from class-name-token averaged prototypes."""
+        if (not self.training and self._cached_eval_support_prototype_text_dict
                 is not None):
-            cached = self._cached_eval_support_token_text_dict
+            cached = self._cached_eval_support_prototype_text_dict
             return {
                 key: value.to(device)
                 for key, value in cached.items()
             }
 
-        token_features, _, debug = self.compute_support_class_token_features(
+        prototypes, debug = self.compute_class_text_prototypes(
             return_debug=True)
         if self.text_feat_map is not None:
-            token_features = self.text_feat_map(token_features)
-        token_features = token_features.to(device)
-        num_tokens = token_features.size(0)
+            prototypes = self.text_feat_map(prototypes)
+        prototypes = prototypes.to(device)
+        num_tokens = prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         if num_tokens > max_text_len:
             raise RuntimeError(
-                f'Selected support class-name tokens ({num_tokens}) exceed '
-                f'max_text_len ({max_text_len}). Increase max_text_len or '
-                'reduce K-shot/support prompts.')
+                f'Class text prototypes ({num_tokens}) exceed max_text_len '
+                f'({max_text_len}).')
 
-        embedded = token_features.unsqueeze(0).expand(batch_size, -1, -1)
+        embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
         text_token_mask = torch.ones(
             batch_size, num_tokens, dtype=torch.bool, device=device)
-        text_self_attention_masks = torch.zeros(
-            num_tokens, num_tokens, dtype=torch.bool, device=device)
-        for token_indices in self.support_prompt_token_output_indices:
-            idx = torch.tensor(token_indices, dtype=torch.long, device=device)
-            text_self_attention_masks[idx[:, None], idx[None, :]] = True
-        text_self_attention_masks = text_self_attention_masks.unsqueeze(
-            0).expand(batch_size, -1, -1)
+        text_self_attention_masks = torch.eye(
+            num_tokens, dtype=torch.bool,
+            device=device).unsqueeze(0).expand(batch_size, -1, -1)
         position_ids = torch.arange(
             num_tokens, dtype=torch.long,
             device=device).unsqueeze(0).expand(batch_size, -1)
@@ -462,21 +471,21 @@ class GroundingDINO(DINO):
             position_ids=position_ids)
 
         if self.debug_text_tokens and not self._printed_text_token_debug:
-            self._print_support_token_debug(debug, token_features, text_dict)
+            self._print_support_token_debug(debug, prototypes, text_dict)
             self._register_bert_grad_debug_hook()
-            self._debug_support_token_isolation()
+            self._debug_support_prototype_isolation()
             self._printed_text_token_debug = True
 
         if not self.training:
-            self._cached_eval_support_token_text_dict = {
+            self._cached_eval_support_prototype_text_dict = {
                 key: value.detach().cpu()
                 for key, value in text_dict.items()
             }
         return text_dict
 
-    def build_support_token_positive_maps(self, gt_labels: List[Tensor],
-                                          device) -> List[Tensor]:
-        """Create positive maps from classes to selected class-name tokens."""
+    def build_prototype_positive_maps(self, gt_labels: List[Tensor],
+                                      device) -> List[Tensor]:
+        """Create positive maps from classes to class prototype positions."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         positive_maps = []
@@ -484,63 +493,49 @@ class GroundingDINO(DINO):
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                token_indices = self.support_class_token_output_indices[label]
-                positive_map[row_idx, token_indices] = 1.0
+                positive_map[row_idx, label] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
-    def build_support_token_positive_map(self) -> dict:
-        """Map 1-based class ids to selected class-name token positions."""
+    def build_prototype_token_positive_map(self) -> dict:
+        """Map 1-based class ids to class prototype positions."""
         return {
-            class_idx + 1: self.support_class_token_output_indices[class_idx]
+            class_idx + 1: [class_idx]
             for class_idx in range(len(self.support_class_names))
         }
 
-    def _print_support_token_debug(self, debug: dict, token_features: Tensor,
+    def _print_support_token_debug(self, debug: dict, prototypes: Tensor,
                                    text_dict: Dict) -> None:
-        print('[SupportClassTokens] support prompt counts:')
+        print('[ClassNameTokenPrototype] support prompt counts:')
         for class_idx, class_name in enumerate(self.support_class_names):
             print(f'  - {class_name}: '
                   f'{len(self.support_prompt_bank[class_idx])}')
-        print('[SupportClassTokens] class-name token counts:',
+        print('[ClassNameTokenPrototype] class-name token counts before mean:',
               debug['class_token_counts'])
-        print('[SupportClassTokens] example prompt:',
+        print('[ClassNameTokenPrototype] example prompt:',
               self.support_prompt_texts[0])
-        print('[SupportClassTokens] example class token ids:',
+        print('[ClassNameTokenPrototype] example class token ids:',
               self.support_prompt_class_token_positions[0])
-        print('[SupportClassTokens] BERT input shape:',
+        print('[ClassNameTokenPrototype] BERT input shape:',
               debug['input_shape'])
-        print('[SupportClassTokens] BERT prompt hidden shape:',
+        print('[ClassNameTokenPrototype] BERT prompt hidden shape:',
               debug['prompt_hidden_shape'])
-        print('[SupportClassTokens] selected class-token feature shape:',
+        print('[ClassNameTokenPrototype] selected class-token feature shape:',
               debug['selected_token_shape'])
-        print('[SupportClassTokens] projected selected-token shape:',
-              tuple(token_features.shape))
-        print('[SupportClassTokens] selected tokens require_grad:',
-              token_features.requires_grad)
+        print('[ClassNameTokenPrototype] final prototype shape:',
+              tuple(prototypes.shape))
+        print('[ClassNameTokenPrototype] prototype requires_grad:',
+              prototypes.requires_grad)
         first_bert_param = next(self.language_model.parameters())
-        print('[SupportClassTokens] BERT parameter requires_grad:',
+        print('[ClassNameTokenPrototype] BERT parameter requires_grad:',
               first_bert_param.requires_grad)
-        prompt_labels = self.support_prompt_labels.tolist()
-        cross_prompt_allowed = False
-        for left_idx, left_tokens in enumerate(
-                self.support_prompt_token_output_indices):
-            for right_idx, right_tokens in enumerate(
-                    self.support_prompt_token_output_indices):
-                if left_idx == right_idx or not left_tokens or \
-                        not right_tokens:
-                    continue
-                if text_dict['masks'][0][left_tokens][:,
-                                                       right_tokens].any(
-                                                       ).item():
-                    cross_prompt_allowed = True
-                if prompt_labels[left_idx] != prompt_labels[right_idx] and \
-                        text_dict['masks'][0][left_tokens][:,
-                                                           right_tokens].any(
-                                                           ).item():
-                    cross_prompt_allowed = True
-        print('[SupportClassTokens] cross-prompt/class self-attention '
-              'blocked:', not cross_prompt_allowed)
+        off_diag = ~torch.eye(
+            text_dict['masks'].size(-1),
+            dtype=torch.bool,
+            device=text_dict['masks'].device)
+        blocked = not text_dict['masks'][0][off_diag].any().item()
+        print('[ClassNameTokenPrototype] cross-class text self-attention '
+              'blocked:', blocked)
 
     def _register_bert_grad_debug_hook(self) -> None:
         if self._registered_bert_grad_debug_hook:
@@ -548,22 +543,22 @@ class GroundingDINO(DINO):
         for name, param in self.language_model.named_parameters():
             if param.requires_grad:
                 def _hook(grad, param_name=name):
-                    print('[SupportClassTokens] backward BERT gradient norm '
-                          f'({param_name}): {grad.norm().item():.6f}')
+                    print('[ClassNameTokenPrototype] backward BERT gradient '
+                          f'norm ({param_name}): {grad.norm().item():.6f}')
                 param.register_hook(_hook)
                 self._registered_bert_grad_debug_hook = True
                 return
 
-    def _debug_support_token_isolation(self) -> None:
+    def _debug_support_prototype_isolation(self) -> None:
         if len(self.support_class_names) < 2:
-            print('[SupportClassTokens] isolation test skipped: '
+            print('[ClassNameTokenPrototype] isolation test skipped: '
                   'num_classes < 2')
             return
 
         with torch.no_grad():
-            original, labels = self.compute_support_class_token_features()
+            original = self.compute_class_text_prototypes()
             modified_prompts = list(self.support_prompt_texts)
-            target_class = int(labels[0].item())
+            target_class = 0
             prompt_labels = self.support_prompt_labels.tolist()
             target_prompt_indices = [
                 idx for idx, label in enumerate(prompt_labels)
@@ -575,17 +570,19 @@ class GroundingDINO(DINO):
             tokenized = self._tokenize_support_prompts(modified_prompts)
             old_tokenized = self.support_tokenized
             self.support_tokenized = tokenized
-            modified, _ = self.compute_support_class_token_features()
+            modified = self.compute_class_text_prototypes()
             self.support_tokenized = old_tokenized
             diffs = (original - modified).abs().sum(dim=1)
-            target_changed = bool((diffs[labels == target_class] > 0).any())
+            target_changed = bool((diffs[target_class] > 0).item())
+            other_mask = torch.arange(
+                len(diffs), device=diffs.device) != target_class
             others_same = torch.allclose(
-                diffs[labels != target_class],
-                diffs.new_zeros((labels != target_class).sum()),
+                diffs[other_mask],
+                diffs.new_zeros(int(other_mask.sum().item())),
                 atol=1e-6)
-        print('[SupportClassTokens] isolation changed class changed:',
+        print('[ClassNameTokenPrototype] isolation changed class changed:',
               target_changed)
-        print('[SupportClassTokens] isolation other classes unchanged:',
+        print('[ClassNameTokenPrototype] isolation other classes unchanged:',
               bool(others_same))
 
     def get_tokens_positive_and_prompts(
@@ -823,10 +820,10 @@ class GroundingDINO(DINO):
             for data_samples in batch_data_samples
         ]
 
-        if self.use_enriched_class_tokens:
-            text_dict = self.build_support_token_text_dict(
+        if self.use_class_name_token_prototypes:
+            text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
-            positive_maps = self.build_support_token_positive_maps(
+            positive_maps = self.build_prototype_positive_maps(
                 gt_labels, batch_inputs.device)
             for i, data_samples in enumerate(batch_data_samples):
                 positive_map = positive_maps[i].bool().float()
@@ -922,11 +919,11 @@ class GroundingDINO(DINO):
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
-        if self.use_enriched_class_tokens:
+        if self.use_class_name_token_prototypes:
             visual_feats = self.extract_feat(batch_inputs)
-            text_dict = self.build_support_token_text_dict(
+            text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
-            token_positive_map = self.build_support_token_positive_map()
+            token_positive_map = self.build_prototype_token_positive_map()
             entities = self.support_class_names
             for data_sample in batch_data_samples:
                 data_sample.token_positive_map = token_positive_map

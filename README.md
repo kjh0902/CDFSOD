@@ -1,7 +1,7 @@
 # CDFSOD GroundingDINO 실험 코드
 
 이 저장소는 CDFSOD few-shot detection 실험을 위한 Grounding DINO 기반 코드입니다.
-현재 기본 실험은 support set의 object caption과 target dataset domain attribute를 함께 BERT에 넣고, BERT 출력 중 class name에 해당하는 token feature만 사용하는 방식입니다.
+현재 기본 실험은 support set의 object caption과 target dataset domain attribute를 함께 BERT에 넣고, BERT 출력 중 class name에 해당하는 token feature만 골라 같은 class끼리 평균한 text prototype을 사용하는 방식입니다.
 
 ## 1. 서버 경로
 
@@ -89,7 +89,7 @@ PY
 
 ## 3. Support Caption 생성
 
-enriched class-token 방식은 support set의 각 GT bbox crop caption을 먼저 생성해야 합니다.
+class-name token prototype 방식은 support set의 각 GT bbox crop caption을 먼저 생성해야 합니다.
 BLIP에는 전체 이미지가 아니라 각 GT bounding box crop이 입력됩니다.
 
 NEU-DET 1-shot 예시:
@@ -112,9 +112,9 @@ python mmdetection/tools/generate_instance_captions.py \
   --output annotations/5_shot_captions.json
 ```
 
-## 4. 기본 실험: enriched class-name token
+## 4. 기본 실험: class-name token prototype
 
-현재 기본값은 enriched class-name token 방식입니다.
+현재 기본값은 class-name token prototype 방식입니다.
 
 각 support object caption은 아래 prompt로 구성됩니다.
 
@@ -126,9 +126,11 @@ python mmdetection/tools/generate_instance_captions.py \
 
 1. 전체 support enriched prompt를 현재 BERT로 encoding
 2. tokenizer `offset_mapping`으로 class name 문자 범위에 해당하는 token 위치 선택
-3. 선택된 class-name token feature들을 그대로 Grounding DINO text token으로 사용
-4. 선택 token은 평균하지 않고, `[CLS]`도 사용하지 않음
+3. 같은 class의 모든 support prompt에서 선택된 class-name token feature를 전부 평균
+4. class당 1개 text prototype 생성
 5. detection loss가 BERT까지 역전파됨
+
+이 prototype은 예전처럼 `[CLS]` token을 평균해서 만드는 것이 아니라, class name에 해당하는 BERT token feature만 평균해서 만듭니다.
 
 실행:
 
@@ -147,10 +149,10 @@ bash mmdetection/run_all_training.sh NEU-DET 1 4
 
 ## 5. Baseline: class name만 사용
 
-enriched class-token을 끄면 기존처럼 class name prompt만 사용합니다.
+class-name token prototype을 끄면 기존처럼 class name prompt만 사용합니다.
 
 ```bash
-CDFSOD_USE_ENRICHED_CLASS_TOKENS=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
+CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
 예전 명령어도 호환됩니다.
@@ -175,12 +177,12 @@ CDFSOD_DEBUG_TEXT_TOKENS=1 bash mmdetection/run_all_training.sh NEU-DET 1 1
 - BERT 입력 shape
 - BERT prompt hidden state shape
 - 선택된 class-token feature shape
-- projection 이후 token feature shape
+- 최종 prototype shape
 - 선택 token의 `requires_grad`
 - BERT parameter의 `requires_grad`
 - backward 이후 BERT gradient norm
-- 서로 다른 support prompt/class 간 text self-attention 차단 여부
-- 한 class caption 변경 시 다른 class token feature가 변하지 않는지 확인
+- 서로 다른 class prototype 간 text self-attention 차단 여부
+- 한 class caption 변경 시 다른 class prototype이 변하지 않는지 확인
 
 ## 7. 자주 바꾸는 설정
 
@@ -227,45 +229,45 @@ checkpoint=dict(
 학습 결과 폴더 예시:
 
 ```text
-mmdetection/work_dirs/NEU-DET_1shot_enriched_class_tokens/
+mmdetection/work_dirs/NEU-DET_1shot_class_name_token_prototype/
 mmdetection/work_dirs/NEU-DET_1shot_class_name/
 ```
 
 ## 9. Best Checkpoint Test
 
-enriched class-token 방식:
+class-name token prototype 방식:
 
 ```bash
 cd mmdetection
 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_enriched_class_tokens/best_coco_bbox_mAP_epoch_*.pth
+  work_dirs/NEU-DET_1shot_class_name_token_prototype/best_coco_bbox_mAP_epoch_*.pth
 ```
 
 baseline 방식:
 
 ```bash
 cd mmdetection
-CDFSOD_USE_ENRICHED_CLASS_TOKENS=0 python tools/test.py \
+CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
   work_dirs/NEU-DET_1shot_class_name/best_coco_bbox_mAP_epoch_*.pth
 ```
 
 ## 10. Cosine Similarity 분석
 
-두 checkpoint의 selected class-name token feature 간 cosine similarity를 비교합니다.
+두 checkpoint의 class-name token prototype 간 cosine similarity를 비교합니다.
 
 ```bash
 python mmdetection/tools/compare_text_prototype_similarity.py \
   --class-name-ckpt /home/aislab5090/CDFSOD/junhyung/grounding_dino_idea/CDFSOD/mmdetection/work_dirs/NEU-DET_1shot_class_name/epoch_30.pth \
-  --enriched-class-token-ckpt /home/aislab5090/CDFSOD/junhyung/grounding_dino_idea/CDFSOD/mmdetection/work_dirs/NEU-DET_1shot_enriched_class_tokens/epoch_30.pth \
+  --class-name-token-prototype-ckpt /home/aislab5090/CDFSOD/junhyung/grounding_dino_idea/CDFSOD/mmdetection/work_dirs/NEU-DET_1shot_class_name_token_prototype/epoch_30.pth \
   --caption-file /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET/annotations/1_shot_captions.json \
   --print-matrix
 ```
 
 ## 11. 실험 흐름 요약
 
-enriched class-token 실험:
+class-name token prototype 실험:
 
 ```bash
 git pull
@@ -285,5 +287,5 @@ class name baseline:
 ```bash
 git pull
 conda activate cdfsod
-CDFSOD_USE_ENRICHED_CLASS_TOKENS=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
+CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
