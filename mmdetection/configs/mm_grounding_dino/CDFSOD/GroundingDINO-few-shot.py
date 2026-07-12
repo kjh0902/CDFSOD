@@ -22,7 +22,6 @@ model = dict(
     support_caption_file=support_caption_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
-    debug_text_tokens=_base_.debug_text_tokens,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],

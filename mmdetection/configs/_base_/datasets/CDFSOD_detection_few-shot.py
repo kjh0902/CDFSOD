@@ -69,13 +69,7 @@ default_caption_file = train_ann_file.rsplit('.', 1)[0] + '_captions.json'
 instance_caption_file = os.getenv('CDFSOD_CAPTION_FILE',
                                   default_caption_file)
 use_class_name_token_prototypes = os.getenv(
-    'CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES',
-    os.getenv('CDFSOD_USE_ENRICHED_CLASS_TOKENS',
-              os.getenv('CDFSOD_USE_CLASS_PROTOTYPES', '1'))) != '0'
-use_enriched_class_tokens = use_class_name_token_prototypes
-debug_text_tokens = os.getenv(
-    'CDFSOD_DEBUG_TEXT_TOKENS',
-    os.getenv('CDFSOD_DEBUG_TEXT_PROTOTYPE', '0')) == '1'
+    'CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES', '1') != '0'
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
