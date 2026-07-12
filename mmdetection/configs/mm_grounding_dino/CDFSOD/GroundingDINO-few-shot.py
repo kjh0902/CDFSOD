@@ -142,13 +142,15 @@ param_scheduler = [
         gamma=0.1)
 ]
 
-train_cfg = dict(max_epochs=max_epochs, type='EpochBasedTrainLoop', val_interval=5)
+train_cfg = dict(
+    max_epochs=max_epochs,
+    type='EpochBasedTrainLoop',
+    val_begin=max_epochs + 1,
+    val_interval=1)
 
 default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
-        interval=1,
-        save_best='coco/bbox_mAP',
-        rule='greater'))
+        interval=max_epochs))
 
 auto_scale_lr = dict(base_batch_size=16)

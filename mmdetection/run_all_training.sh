@@ -31,6 +31,8 @@ echo "work dir: ${WORK_DIR}"
 
 if [ "$GPUS" = "1" ]; then
   python tools/train.py "$CONFIG" --amp --work-dir "$WORK_DIR"
+  python tools/test.py "$CONFIG" "$WORK_DIR/epoch_30.pth" --work-dir "$WORK_DIR"
 else
   bash tools/dist_train.sh "$CONFIG" "$GPUS" --amp --work-dir "$WORK_DIR"
+  bash tools/dist_test.sh "$CONFIG" "$WORK_DIR/epoch_30.pth" "$GPUS" --work-dir "$WORK_DIR"
 fi
