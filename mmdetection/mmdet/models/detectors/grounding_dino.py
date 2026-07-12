@@ -14,8 +14,6 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
-from ..language_models.bert import (
-    generate_masks_with_special_tokens_and_transfer_map)
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
@@ -304,22 +302,22 @@ class GroundingDINO(DINO):
             key: value.to(device)
             for key, value in self.support_tokenized.items()
         }
-        if self.language_model.use_sub_sentence_represent:
-            attention_mask, position_ids = \
-                generate_masks_with_special_tokens_and_transfer_map(
-                    tokenized, self.language_model.special_tokens)
-            token_type_ids = tokenized['token_type_ids']
-        else:
-            attention_mask = tokenized['attention_mask']
-            position_ids = None
-            token_type_ids = tokenized.get('token_type_ids', None)
         return {
             'input_ids': tokenized['input_ids'],
-            'attention_mask': attention_mask,
-            'position_ids': position_ids,
-            'token_type_ids': token_type_ids,
-            'text_token_mask': tokenized['attention_mask'].bool()
+            'attention_mask': tokenized['attention_mask'],
+            'token_type_ids': tokenized.get('token_type_ids', None)
         }
+
+    def _encode_support_cls_features(self, tokenizer_input: dict) -> Tensor:
+        """Encode support prompts with standard BERT row-wise attention."""
+        bert = self.language_model.language_backbone.body.model
+        outputs = bert(
+            input_ids=tokenizer_input['input_ids'],
+            attention_mask=tokenizer_input['attention_mask'],
+            token_type_ids=tokenizer_input.get('token_type_ids', None),
+            output_hidden_states=False,
+            return_dict=True)
+        return outputs.last_hidden_state[:, 0, :]
 
     def compute_class_text_prototypes(
             self,
@@ -343,28 +341,15 @@ class GroundingDINO(DINO):
                 return_special_tokens_mask=True,
                 return_tensors='pt',
                 truncation=True).to(device)
-            if self.language_model.use_sub_sentence_represent:
-                attention_mask, position_ids = \
-                    generate_masks_with_special_tokens_and_transfer_map(
-                        tokenized, self.language_model.special_tokens)
-                token_type_ids = tokenized['token_type_ids']
-            else:
-                attention_mask = tokenized.attention_mask
-                position_ids = None
-                token_type_ids = tokenized.get('token_type_ids', None)
             tokenizer_input = {
                 'input_ids': tokenized.input_ids,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-                'token_type_ids': token_type_ids,
-                'text_token_mask': tokenized.attention_mask.bool()
+                'attention_mask': tokenized.attention_mask,
+                'token_type_ids': tokenized.get('token_type_ids', None)
             }
             prompt_labels = prompt_labels.to(device)
             input_shape = tokenized.input_ids.shape
 
-        language_features = self.language_model.language_backbone(
-            tokenizer_input)
-        cls_features = language_features['hidden'][:, 0, :]
+        cls_features = self._encode_support_cls_features(tokenizer_input)
         num_classes = len(self.support_class_names)
         prototypes = []
         for class_idx in range(num_classes):

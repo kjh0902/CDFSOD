@@ -111,12 +111,28 @@ def offdiag_values(matrix):
 def summarize_class_separation(name, class_names, features, print_matrix):
     matrix = cosine_matrix(features)
     values = offdiag_values(matrix)
+    norms = features.norm(dim=-1)
     print(f'\n[{name}]')
     print(f'prototype shape: {tuple(features.shape)}')
+    print(f'prototype norm min/max: {norms.min().item():.6f} / '
+          f'{norms.max().item():.6f}')
     print(f'off-diagonal mean cosine: {values.mean().item():.6f}')
     print(f'off-diagonal std cosine:  {values.std().item():.6f}')
     print(f'off-diagonal min cosine:  {values.min().item():.6f}')
     print(f'off-diagonal max cosine:  {values.max().item():.6f}')
+    upper = torch.triu(torch.ones_like(matrix, dtype=torch.bool), diagonal=1)
+    pair_scores = matrix[upper]
+    pair_indices = upper.nonzero(as_tuple=False)
+    best_idx = pair_scores.argmax()
+    worst_idx = pair_scores.argmin()
+    best_pair = pair_indices[best_idx]
+    worst_pair = pair_indices[worst_idx]
+    print('most similar pair: '
+          f'{class_names[best_pair[0]]} - {class_names[best_pair[1]]} '
+          f'({pair_scores[best_idx].item():.6f})')
+    print('least similar pair: '
+          f'{class_names[worst_pair[0]]} - {class_names[worst_pair[1]]} '
+          f'({pair_scores[worst_idx].item():.6f})')
 
     if print_matrix:
         print('\nclass-by-class cosine matrix:')
