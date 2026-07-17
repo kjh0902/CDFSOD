@@ -79,6 +79,8 @@ class GroundingDINO(DINO):
         self._cached_eval_support_prototype_text_dict = None
         super().__init__(*args, **kwargs)
         self.support_image_prototype_generator = SupportImagePrototype()
+        self._debug_support_roi_features = []
+        self._debug_support_roi_labels = []
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
 
@@ -439,6 +441,71 @@ class GroundingDINO(DINO):
             support_labels=support_labels,
             num_classes=len(self.support_class_names))
 
+    def _debug_support_image_prototypes_and_exit(
+            self, support_images: Tensor,
+            support_data_samples: SampleList) -> None:
+        """Accumulate support RoIs, print prototypes, then exit successfully."""
+        print(f'support_images: {tuple(support_images.shape)}')
+        support_features = self.extract_feat(support_images)
+        for level_idx, feature in enumerate(support_features):
+            print(f'support_backbone_features_level_{level_idx}: '
+                  f'{tuple(feature.shape)}')
+        support_bboxes = [
+            data_sample.gt_instances.bboxes
+            for data_sample in support_data_samples
+        ]
+        support_labels = [
+            data_sample.gt_instances.labels
+            for data_sample in support_data_samples
+        ]
+        roi_features, roi_labels = (
+            self.support_image_prototype_generator.extract_roi_features(
+                support_features, support_bboxes, support_labels))
+        self._debug_support_roi_features.append(roi_features.detach())
+        self._debug_support_roi_labels.append(roi_labels.detach())
+
+        accumulated_labels = torch.cat(
+            self._debug_support_roi_labels, dim=0)
+        num_classes = len(self.support_class_names)
+        if num_classes <= 0:
+            raise ValueError('support_class_names must not be empty.')
+        if ((accumulated_labels < 0) |
+                (accumulated_labels >= num_classes)).any():
+            raise ValueError('Support GT labels must be in the range '
+                             f'[0, {num_classes - 1}].')
+        observed_classes = torch.unique(accumulated_labels).tolist()
+        print(f'observed_support_class_indices: {observed_classes}')
+        class_counts = torch.bincount(
+            accumulated_labels, minlength=num_classes).tolist()
+        print(f'accumulated_support_roi_counts_by_class: {class_counts}')
+        if self.support_prompt_bank is None:
+            self.build_support_prompt_bank()
+        expected_class_counts = [
+            len(self.support_prompt_bank[class_idx])
+            for class_idx in range(num_classes)
+        ]
+        print('expected_support_roi_counts_by_class: '
+              f'{expected_class_counts}')
+        waiting_classes = [
+            class_idx for class_idx, (current_count, expected_count) in
+            enumerate(zip(class_counts, expected_class_counts))
+            if current_count < expected_count
+        ]
+        if waiting_classes:
+            print(f'waiting_for_support_class_indices: {waiting_classes}')
+            return
+
+        accumulated_roi_features = torch.cat(
+            self._debug_support_roi_features, dim=0)
+        position_enriched_image_prototypes = (
+            self.support_image_prototype_generator.aggregate_roi_features(
+                accumulated_roi_features, accumulated_labels,
+                num_classes))
+        print('support image prototype debug run completed; exiting.')
+        print('final_support_image_prototypes: '
+              f'{tuple(position_enriched_image_prototypes.shape)}')
+        raise SystemExit(0)
+
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
         """Build text_dict from class-name-token averaged prototypes."""
         if (not self.training and self._cached_eval_support_prototype_text_dict
@@ -730,6 +797,8 @@ class GroundingDINO(DINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
+        self._debug_support_image_prototypes_and_exit(
+            batch_inputs, batch_data_samples)
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]

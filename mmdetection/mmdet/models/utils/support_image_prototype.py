@@ -87,10 +87,20 @@ class SupportImagePrototype(nn.Module):
         Returns:
             Tensor: Image prototypes with shape [C, 49, 256].
         """
-        if not support_features:
-            raise ValueError('support_features must not be empty.')
         if num_classes <= 0:
             raise ValueError('num_classes must be greater than zero.')
+        roi_aligned_features, roi_labels = self.extract_roi_features(
+            support_features, support_bboxes, support_labels)
+        return self.aggregate_roi_features(roi_aligned_features, roi_labels,
+                                           num_classes)
+
+    def extract_roi_features(
+            self, support_features: Tuple[Tensor],
+            support_bboxes: Sequence[Tensor],
+            support_labels: Sequence[Tensor]) -> Tuple[Tensor, Tensor]:
+        """Apply RoIAlign to one support batch and return features/labels."""
+        if not support_features:
+            raise ValueError('support_features must not be empty.')
         support_feature_map = support_features[0]
         if support_feature_map.size(1) != self.embed_dims:
             raise ValueError(
@@ -112,16 +122,27 @@ class SupportImagePrototype(nn.Module):
         if roi_labels.numel() != support_rois.size(0):
             raise ValueError('The number of support GT labels must match the '
                              'number of support GT bboxes.')
-        if ((roi_labels < 0) | (roi_labels >= num_classes)).any():
-            raise ValueError('Support GT labels must be in the range '
-                             f'[0, {num_classes - 1}].')
 
         self._print_shape('support_feature_map', support_feature_map)
         self._print_shape('support_rois', support_rois)
         roi_aligned_features = self.roi_align(support_feature_map,
                                               support_rois)
         self._print_shape('roi_aligned_features', roi_aligned_features)
+        return roi_aligned_features, roi_labels
 
+    def aggregate_roi_features(self, roi_aligned_features: Tensor,
+                               roi_labels: Tensor,
+                               num_classes: int) -> Tensor:
+        """Average RoIs by class, flatten them, and add 2D positions."""
+        if num_classes <= 0:
+            raise ValueError('num_classes must be greater than zero.')
+        if roi_aligned_features.size(0) != roi_labels.numel():
+            raise ValueError('RoI feature and label counts must match.')
+        if ((roi_labels < 0) | (roi_labels >= num_classes)).any():
+            raise ValueError('Support GT labels must be in the range '
+                             f'[0, {num_classes - 1}].')
+        self._print_shape('combined_roi_aligned_features',
+                          roi_aligned_features)
         class_shot_mean_features: List[Tensor] = []
         missing_classes = []
         for class_idx in range(num_classes):
