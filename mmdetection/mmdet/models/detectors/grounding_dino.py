@@ -17,6 +17,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from ..utils import SupportImagePrototype
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -77,6 +78,7 @@ class GroundingDINO(DINO):
         self.support_tokenized = None
         self._cached_eval_support_prototype_text_dict = None
         super().__init__(*args, **kwargs)
+        self.support_image_prototype_generator = SupportImagePrototype()
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
 
@@ -413,6 +415,29 @@ class GroundingDINO(DINO):
         prototypes = torch.stack(prototypes, dim=0)
 
         return prototypes
+
+    def compute_support_image_prototypes(
+            self, support_images: Tensor,
+            support_data_samples: SampleList) -> Tensor:
+        """Build class image prototypes from support images and GT boxes."""
+        print(f'support_images: {tuple(support_images.shape)}')
+        support_features = self.extract_feat(support_images)
+        for level_idx, feature in enumerate(support_features):
+            print(f'support_backbone_features_level_{level_idx}: '
+                  f'{tuple(feature.shape)}')
+        support_bboxes = [
+            data_sample.gt_instances.bboxes
+            for data_sample in support_data_samples
+        ]
+        support_labels = [
+            data_sample.gt_instances.labels
+            for data_sample in support_data_samples
+        ]
+        return self.support_image_prototype_generator(
+            support_features=support_features,
+            support_bboxes=support_bboxes,
+            support_labels=support_labels,
+            num_classes=len(self.support_class_names))
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
         """Build text_dict from class-name-token averaged prototypes."""
