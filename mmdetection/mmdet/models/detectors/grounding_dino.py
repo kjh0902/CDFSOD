@@ -246,10 +246,20 @@ class GroundingDINO(DINO):
         else:
             iterable_entries = entries
 
-        for item in iterable_entries:
+        unknown_class_names = set()
+        empty_caption_classes = set()
+        for item_idx, item in enumerate(iterable_entries):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f'Invalid support caption entry at index {item_idx}: '
+                    f'expected a dict, got {type(item).__name__}.')
             class_name = item.get('category_name', item.get('class_name'))
             caption = item.get('caption', '')
-            if class_name not in class_to_idx or not caption:
+            if class_name not in class_to_idx:
+                unknown_class_names.add(str(class_name))
+                continue
+            if not isinstance(caption, str) or not caption.strip():
+                empty_caption_classes.add(class_name)
                 continue
             prompt, class_span = self._format_support_prompt(
                 class_name, caption)
@@ -257,12 +267,28 @@ class GroundingDINO(DINO):
             prompt_bank[class_idx].append(prompt)
             span_bank[class_idx].append(class_span)
 
-        for class_idx, class_name in enumerate(self.support_class_names):
-            if len(prompt_bank[class_idx]) == 0:
-                prompt, class_span = self._format_support_prompt(
-                    class_name, '')
-                prompt_bank[class_idx].append(prompt)
-                span_bank[class_idx].append(class_span)
+        missing_caption_classes = [
+            class_name
+            for class_idx, class_name in enumerate(self.support_class_names)
+            if len(prompt_bank[class_idx]) == 0
+        ]
+        validation_errors = []
+        if unknown_class_names:
+            validation_errors.append(
+                'class names not found in support_class_names: '
+                f'{sorted(unknown_class_names)}')
+        if empty_caption_classes:
+            validation_errors.append(
+                'classes with empty captions: '
+                f'{sorted(empty_caption_classes)}')
+        if missing_caption_classes:
+            validation_errors.append(
+                'classes without any valid support caption: '
+                f'{missing_caption_classes}')
+        if validation_errors:
+            raise ValueError(
+                'Invalid support caption file '
+                f'{self.support_caption_file}: ' + '; '.join(validation_errors))
 
         prompt_texts = []
         prompt_labels = []
