@@ -22,6 +22,7 @@ model = dict(
     support_caption_file=support_caption_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
+    support_image_root=os.path.join(_base_.data_root, 'train'),
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],

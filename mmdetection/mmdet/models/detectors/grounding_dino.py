@@ -1,11 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import json
+import os
 import re
 import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import mmcv
 import torch
 import torch.nn as nn
 from mmengine.runner.amp import autocast
@@ -17,7 +19,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
-from ..utils import SupportImagePrototype
+from ..utils import SupportImagePrototype, TextImagePrototypeFusion
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -63,6 +65,9 @@ class GroundingDINO(DINO):
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
+                 support_image_root: Optional[str] = None,
+                 support_image_batch_size: int = 2,
+                 support_image_scale: Tuple[int, int] = (800, 1333),
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -72,15 +77,19 @@ class GroundingDINO(DINO):
         self.support_caption_file = support_caption_file
         self.support_class_names = list(support_class_names or [])
         self.support_domain_attribute = support_domain_attribute
+        self.support_image_root = support_image_root
+        self.support_image_batch_size = support_image_batch_size
+        self.support_image_scale = support_image_scale
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
         self.support_tokenized = None
-        self._cached_eval_support_prototype_text_dict = None
+        self.support_caption_entries = None
+        self._support_image_inputs = None
         super().__init__(*args, **kwargs)
         self.support_image_prototype_generator = SupportImagePrototype()
-        self._debug_support_roi_features = []
-        self._debug_support_roi_labels = []
+        self.text_image_prototype_fusion = TextImagePrototypeFusion(
+            embed_dims=self.embed_dims)
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
 
@@ -108,13 +117,6 @@ class GroundingDINO(DINO):
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
-
-    def train(self, mode: bool = True):
-        """Switch train/eval mode and clear stale eval text-token cache."""
-        super().train(mode)
-        if mode:
-            self._cached_eval_support_prototype_text_dict = None
-        return self
 
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -252,6 +254,8 @@ class GroundingDINO(DINO):
 
         unknown_class_names = set()
         empty_caption_classes = set()
+        invalid_image_entries = []
+        valid_caption_entries = []
         for item_idx, item in enumerate(iterable_entries):
             if not isinstance(item, dict):
                 raise ValueError(
@@ -270,6 +274,15 @@ class GroundingDINO(DINO):
             class_idx = class_to_idx[class_name]
             prompt_bank[class_idx].append(prompt)
             span_bank[class_idx].append(class_span)
+            file_name = item.get('file_name')
+            bbox = item.get('bbox')
+            if (not isinstance(file_name, str) or not file_name or
+                    not isinstance(bbox, (list, tuple)) or len(bbox) != 4):
+                invalid_image_entries.append(item_idx)
+                continue
+            valid_entry = dict(item)
+            valid_entry['class_idx'] = class_idx
+            valid_caption_entries.append(valid_entry)
 
         missing_caption_classes = [
             class_name
@@ -289,6 +302,10 @@ class GroundingDINO(DINO):
             validation_errors.append(
                 'classes without any valid support caption: '
                 f'{missing_caption_classes}')
+        if invalid_image_entries:
+            validation_errors.append(
+                'entries missing a valid file_name or xywh bbox at indices: '
+                f'{invalid_image_entries}')
         if validation_errors:
             raise ValueError(
                 'Invalid support caption file '
@@ -307,6 +324,22 @@ class GroundingDINO(DINO):
                 prompt_class_spans.append(class_span)
 
         self.support_prompt_bank = ordered_bank
+        self.support_caption_entries = valid_caption_entries
+        if self.support_image_root is None:
+            img_prefix = (caption_data.get('img_prefix')
+                          if isinstance(caption_data, dict) else None)
+            if not isinstance(img_prefix, str) or not img_prefix:
+                raise ValueError(
+                    'support_image_root or caption JSON img_prefix is '
+                    'required for support image prototypes.')
+            if os.path.isabs(img_prefix):
+                self.support_image_root = img_prefix
+            else:
+                dataset_root = os.path.dirname(
+                    os.path.dirname(os.path.abspath(
+                        self.support_caption_file)))
+                self.support_image_root = os.path.join(dataset_root,
+                                                       img_prefix)
         self.support_prompt_texts = prompt_texts
         self.support_prompt_labels = torch.tensor(prompt_labels,
                                                   dtype=torch.long)
@@ -418,108 +451,89 @@ class GroundingDINO(DINO):
 
         return prototypes
 
-    def compute_support_image_prototypes(
-            self, support_images: Tensor,
-            support_data_samples: SampleList) -> Tensor:
-        """Build class image prototypes from support images and GT boxes."""
-        print(f'support_images: {tuple(support_images.shape)}')
-        support_features = self.extract_feat(support_images)
-        for level_idx, feature in enumerate(support_features):
-            print(f'support_backbone_features_level_{level_idx}: '
-                  f'{tuple(feature.shape)}')
-        support_bboxes = [
-            data_sample.gt_instances.bboxes
-            for data_sample in support_data_samples
-        ]
-        support_labels = [
-            data_sample.gt_instances.labels
-            for data_sample in support_data_samples
-        ]
-        return self.support_image_prototype_generator(
-            support_features=support_features,
-            support_bboxes=support_bboxes,
-            support_labels=support_labels,
-            num_classes=len(self.support_class_names))
-
-    def _debug_support_image_prototypes_and_exit(
-            self, support_images: Tensor,
-            support_data_samples: SampleList) -> None:
-        """Accumulate support RoIs, print prototypes, then exit successfully."""
-        print(f'support_images: {tuple(support_images.shape)}')
-        support_features = self.extract_feat(support_images)
-        for level_idx, feature in enumerate(support_features):
-            print(f'support_backbone_features_level_{level_idx}: '
-                  f'{tuple(feature.shape)}')
-        support_bboxes = [
-            data_sample.gt_instances.bboxes
-            for data_sample in support_data_samples
-        ]
-        support_labels = [
-            data_sample.gt_instances.labels
-            for data_sample in support_data_samples
-        ]
-        roi_features, roi_labels = (
-            self.support_image_prototype_generator.extract_roi_features(
-                support_features, support_bboxes, support_labels))
-        self._debug_support_roi_features.append(roi_features.detach())
-        self._debug_support_roi_labels.append(roi_labels.detach())
-
-        accumulated_labels = torch.cat(
-            self._debug_support_roi_labels, dim=0)
-        num_classes = len(self.support_class_names)
-        if num_classes <= 0:
-            raise ValueError('support_class_names must not be empty.')
-        if ((accumulated_labels < 0) |
-                (accumulated_labels >= num_classes)).any():
-            raise ValueError('Support GT labels must be in the range '
-                             f'[0, {num_classes - 1}].')
-        observed_classes = torch.unique(accumulated_labels).tolist()
-        print(f'observed_support_class_indices: {observed_classes}')
-        class_counts = torch.bincount(
-            accumulated_labels, minlength=num_classes).tolist()
-        print(f'accumulated_support_roi_counts_by_class: {class_counts}')
-        if self.support_prompt_bank is None:
-            self.build_support_prompt_bank()
-        expected_class_counts = [
-            len(self.support_prompt_bank[class_idx])
-            for class_idx in range(num_classes)
-        ]
-        print('expected_support_roi_counts_by_class: '
-              f'{expected_class_counts}')
-        waiting_classes = [
-            class_idx for class_idx, (current_count, expected_count) in
-            enumerate(zip(class_counts, expected_class_counts))
-            if current_count < expected_count
-        ]
-        if waiting_classes:
-            print(f'waiting_for_support_class_indices: {waiting_classes}')
+    def _prepare_support_image_inputs(self) -> None:
+        """Load and resize support images once while keeping GT on CPU."""
+        if self._support_image_inputs is not None:
             return
+        if not self.support_caption_entries:
+            raise ValueError('No valid support image entries were found.')
+        if self.support_image_batch_size <= 0:
+            raise ValueError('support_image_batch_size must be positive.')
 
-        accumulated_roi_features = torch.cat(
-            self._debug_support_roi_features, dim=0)
-        position_enriched_image_prototypes = (
-            self.support_image_prototype_generator.aggregate_roi_features(
-                accumulated_roi_features, accumulated_labels,
-                num_classes))
-        print('support image prototype debug run completed; exiting.')
-        print('final_support_image_prototypes: '
-              f'{tuple(position_enriched_image_prototypes.shape)}')
-        raise SystemExit(0)
+        image_records = {}
+        for entry in self.support_caption_entries:
+            image_path = entry['file_name']
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(self.support_image_root, image_path)
+            record = image_records.setdefault(
+                image_path, dict(bboxes=[], labels=[]))
+            x, y, width, height = [float(value) for value in entry['bbox']]
+            if width <= 0 or height <= 0:
+                raise ValueError(
+                    f'Invalid support bbox in {image_path}: {entry["bbox"]}')
+            record['bboxes'].append((x, y, x + width, y + height))
+            record['labels'].append(entry['class_idx'])
+
+        support_image_inputs = []
+        for image_path, record in image_records.items():
+            image = mmcv.imread(image_path, flag='color')
+            if image is None:
+                raise FileNotFoundError(
+                    f'Unable to read support image: {image_path}')
+            original_height, original_width = image.shape[:2]
+            resized_image = mmcv.imrescale(image, self.support_image_scale)
+            resized_height, resized_width = resized_image.shape[:2]
+            width_scale = resized_width / original_width
+            height_scale = resized_height / original_height
+            bboxes = torch.tensor(record['bboxes'], dtype=torch.float32)
+            bboxes[:, 0::2] *= width_scale
+            bboxes[:, 1::2] *= height_scale
+            labels = torch.tensor(record['labels'], dtype=torch.long)
+            image_tensor = torch.from_numpy(
+                resized_image.transpose(2, 0, 1).copy())
+            support_image_inputs.append((image_tensor, bboxes, labels))
+        self._support_image_inputs = support_image_inputs
+
+    def compute_support_image_prototypes(self) -> Tensor:
+        """Build differentiable image prototypes from the full support set."""
+        self._prepare_support_image_inputs()
+        roi_features_per_batch = []
+        roi_labels_per_batch = []
+        for start_idx in range(0, len(self._support_image_inputs),
+                               self.support_image_batch_size):
+            support_batch = self._support_image_inputs[
+                start_idx:start_idx + self.support_image_batch_size]
+            raw_images = [item[0] for item in support_batch]
+            processed = self.data_preprocessor(
+                dict(inputs=raw_images, data_samples=None), training=False)
+            support_images = processed['inputs']
+            support_features = self.extract_feat(support_images)
+            support_bboxes = [
+                item[1].to(support_images.device) for item in support_batch
+            ]
+            support_labels = [
+                item[2].to(support_images.device) for item in support_batch
+            ]
+            roi_features, roi_labels = (
+                self.support_image_prototype_generator.extract_roi_features(
+                    support_features, support_bboxes, support_labels))
+            roi_features_per_batch.append(roi_features)
+            roi_labels_per_batch.append(roi_labels)
+
+        return self.support_image_prototype_generator.aggregate_roi_features(
+            torch.cat(roi_features_per_batch, dim=0),
+            torch.cat(roi_labels_per_batch, dim=0),
+            len(self.support_class_names))
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from class-name-token averaged prototypes."""
-        if (not self.training and self._cached_eval_support_prototype_text_dict
-                is not None):
-            cached = self._cached_eval_support_prototype_text_dict
-            return {
-                key: value.to(device)
-                for key, value in cached.items()
-            }
-
-        prototypes = self.compute_class_text_prototypes()
+        """Build text_dict from image-refined enriched text prototypes."""
+        text_prototypes = self.compute_class_text_prototypes()
         if self.text_feat_map is not None:
-            prototypes = self.text_feat_map(prototypes)
-        prototypes = prototypes.to(device)
+            text_prototypes = self.text_feat_map(text_prototypes)
+        text_prototypes = text_prototypes.to(device).unsqueeze(1)
+        image_prototypes = self.compute_support_image_prototypes().to(device)
+        prototypes = self.text_image_prototype_fusion(
+            text_prototypes, image_prototypes).squeeze(1)
         num_tokens = prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
@@ -542,12 +556,6 @@ class GroundingDINO(DINO):
             text_token_mask=text_token_mask,
             masks=text_self_attention_masks,
             position_ids=position_ids)
-
-        if not self.training:
-            self._cached_eval_support_prototype_text_dict = {
-                key: value.detach().cpu()
-                for key, value in text_dict.items()
-            }
         return text_dict
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
@@ -797,8 +805,6 @@ class GroundingDINO(DINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
-        self._debug_support_image_prototypes_and_exit(
-            batch_inputs, batch_data_samples)
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]

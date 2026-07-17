@@ -36,10 +36,6 @@ class SupportImagePrototype(nn.Module):
             sampling_ratio=sampling_ratio,
             aligned=True)
 
-    @staticmethod
-    def _print_shape(name: str, tensor: Tensor) -> None:
-        print(f'{name}: {tuple(tensor.shape)}')
-
     def _build_2d_positional_encoding(self, reference: Tensor) -> Tensor:
         """Create fixed 2D sine/cosine encoding with shape [1, HW, D]."""
         height = width = self.output_size
@@ -123,11 +119,8 @@ class SupportImagePrototype(nn.Module):
             raise ValueError('The number of support GT labels must match the '
                              'number of support GT bboxes.')
 
-        self._print_shape('support_feature_map', support_feature_map)
-        self._print_shape('support_rois', support_rois)
         roi_aligned_features = self.roi_align(support_feature_map,
                                               support_rois)
-        self._print_shape('roi_aligned_features', roi_aligned_features)
         return roi_aligned_features, roi_labels
 
     def aggregate_roi_features(self, roi_aligned_features: Tensor,
@@ -141,8 +134,6 @@ class SupportImagePrototype(nn.Module):
         if ((roi_labels < 0) | (roi_labels >= num_classes)).any():
             raise ValueError('Support GT labels must be in the range '
                              f'[0, {num_classes - 1}].')
-        self._print_shape('combined_roi_aligned_features',
-                          roi_aligned_features)
         class_shot_mean_features: List[Tensor] = []
         missing_classes = []
         for class_idx in range(num_classes):
@@ -158,20 +149,49 @@ class SupportImagePrototype(nn.Module):
 
         class_shot_mean_features = torch.stack(
             class_shot_mean_features, dim=0)
-        self._print_shape('class_shot_mean_features',
-                          class_shot_mean_features)
         flattened_class_prototypes = class_shot_mean_features.flatten(
             2).transpose(1, 2).contiguous()
-        self._print_shape('flattened_class_prototypes',
-                          flattened_class_prototypes)
 
         position_encoding_2d = self._build_2d_positional_encoding(
             flattened_class_prototypes)
         position_encoding_2d = position_encoding_2d.expand(
             num_classes, -1, -1)
-        self._print_shape('position_encoding_2d', position_encoding_2d)
         position_enriched_image_prototypes = (
             flattened_class_prototypes + position_encoding_2d)
-        self._print_shape('position_enriched_image_prototypes',
-                          position_enriched_image_prototypes)
         return position_enriched_image_prototypes
+
+
+class TextImagePrototypeFusion(nn.Module):
+    """Refine each class text prototype with its own image prototype."""
+
+    def __init__(self, embed_dims: int = 256, num_heads: int = 8) -> None:
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=embed_dims, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(embed_dims)
+
+    def forward(self, text_prototypes: Tensor,
+                image_prototypes: Tensor) -> Tensor:
+        """Apply independent per-class text-to-image cross-attention.
+
+        The class dimension is used as the attention batch dimension, so no
+        key or value from another class can participate in the attention.
+        """
+        if text_prototypes.dim() != 3 or text_prototypes.size(1) != 1:
+            raise ValueError('text_prototypes must have shape [C, 1, D].')
+        if image_prototypes.dim() != 3:
+            raise ValueError('image_prototypes must have shape [C, HW, D].')
+        if text_prototypes.size(0) != image_prototypes.size(0):
+            raise ValueError('Text and image prototype class counts differ.')
+        if (text_prototypes.size(-1) != self.embed_dims or
+                image_prototypes.size(-1) != self.embed_dims):
+            raise ValueError(
+                f'Prototype embedding dimension must be {self.embed_dims}.')
+
+        attended_text, _ = self.cross_attention(
+            query=text_prototypes,
+            key=image_prototypes,
+            value=image_prototypes,
+            need_weights=False)
+        return self.norm(text_prototypes + attended_text)
