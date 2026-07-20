@@ -86,6 +86,7 @@ class GroundingDINO(DINO):
         self.support_tokenized = None
         self.support_caption_entries = None
         self._support_image_inputs = None
+        self._prototype_token_ranges = None
         super().__init__(*args, **kwargs)
         self.support_image_prototype_generator = SupportImagePrototype()
         self.text_image_prototype_fusion = TextImagePrototypeFusion(
@@ -416,40 +417,51 @@ class GroundingDINO(DINO):
         return outputs.last_hidden_state
 
     def compute_support_class_token_features(self):
-        """Encode prompts and keep only class-name token features."""
+        """Group class-name token features by class and prompt position."""
         self.build_support_prompt_bank()
         device = next(self.language_model.parameters()).device
         tokenizer_input = self._prepare_cached_tokenized(device)
         hidden_states = self._encode_support_prompt_features(tokenizer_input)
 
-        selected_features = []
-        selected_labels = []
+        class_prompt_features = [
+            [] for _ in range(len(self.support_class_names))
+        ]
+        class_reference_token_ids = [
+            None for _ in range(len(self.support_class_names))
+        ]
         for prompt_idx, class_idx in enumerate(
                 self.support_prompt_labels.tolist()):
-            for token_idx in self.support_prompt_class_token_positions[
-                    prompt_idx]:
-                selected_features.append(hidden_states[prompt_idx, token_idx])
-                selected_labels.append(class_idx)
-        selected_features = torch.stack(selected_features, dim=0)
-        selected_labels = torch.tensor(
-            selected_labels, dtype=torch.long, device=device)
+            token_positions = self.support_prompt_class_token_positions[
+                prompt_idx]
+            prompt_token_ids = self.support_tokenized['input_ids'][
+                prompt_idx, token_positions]
+            reference_token_ids = class_reference_token_ids[class_idx]
+            if reference_token_ids is None:
+                class_reference_token_ids[class_idx] = prompt_token_ids
+            elif not torch.equal(reference_token_ids, prompt_token_ids):
+                raise RuntimeError(
+                    'Class-name subword tokenization differs across prompts '
+                    f'for class {self.support_class_names[class_idx]}.')
+            class_prompt_features[class_idx].append(
+                hidden_states[prompt_idx, token_positions])
 
-        return selected_features, selected_labels
-
-    def compute_class_text_prototypes(self):
-        """Average selected class-name token features into class prototypes."""
-        token_features, token_labels = self.compute_support_class_token_features()
-        prototypes = []
-        for class_idx in range(len(self.support_class_names)):
-            class_mask = token_labels == class_idx
-            if not class_mask.any():
+        stacked_class_prompt_features = []
+        for class_idx, prompt_features in enumerate(class_prompt_features):
+            if not prompt_features:
                 raise RuntimeError(
                     f'No support class-name tokens for class '
                     f'{self.support_class_names[class_idx]}')
-            prototypes.append(token_features[class_mask].mean(dim=0))
-        prototypes = torch.stack(prototypes, dim=0)
+            stacked_class_prompt_features.append(
+                torch.stack(prompt_features, dim=0))
+        return stacked_class_prompt_features
 
-        return prototypes
+    def compute_class_text_prototypes(self):
+        """Average prompts while preserving class-name subword positions."""
+        class_prompt_features = self.compute_support_class_token_features()
+        return [
+            prompt_features.mean(dim=0)
+            for prompt_features in class_prompt_features
+        ]
 
     def _prepare_support_image_inputs(self) -> None:
         """Load and resize support images once while keeping GT on CPU."""
@@ -527,13 +539,29 @@ class GroundingDINO(DINO):
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
         """Build text_dict from image-refined enriched text prototypes."""
-        text_prototypes = self.compute_class_text_prototypes()
+        class_text_prototypes = self.compute_class_text_prototypes()
         if self.text_feat_map is not None:
-            text_prototypes = self.text_feat_map(text_prototypes)
-        text_prototypes = text_prototypes.to(device).unsqueeze(1)
+            class_text_prototypes = [
+                self.text_feat_map(prototype)
+                for prototype in class_text_prototypes
+            ]
+        class_text_prototypes = [
+            prototype.to(device) for prototype in class_text_prototypes
+        ]
         image_prototypes = self.compute_support_image_prototypes().to(device)
-        prototypes = self.text_image_prototype_fusion(
-            text_prototypes, image_prototypes).squeeze(1)
+        refined_class_text_prototypes = self.text_image_prototype_fusion(
+            class_text_prototypes, image_prototypes)
+        prototype_lengths = [
+            prototype.size(0) for prototype in refined_class_text_prototypes
+        ]
+        token_ranges = []
+        token_start = 0
+        for prototype_length in prototype_lengths:
+            token_end = token_start + prototype_length
+            token_ranges.append((token_start, token_end))
+            token_start = token_end
+        self._prototype_token_ranges = token_ranges
+        prototypes = torch.cat(refined_class_text_prototypes, dim=0)
         num_tokens = prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
@@ -545,12 +573,17 @@ class GroundingDINO(DINO):
         embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
         text_token_mask = torch.ones(
             batch_size, num_tokens, dtype=torch.bool, device=device)
-        text_self_attention_masks = torch.eye(
-            num_tokens, dtype=torch.bool,
-            device=device).unsqueeze(0).expand(batch_size, -1, -1)
-        position_ids = torch.arange(
-            num_tokens, dtype=torch.long,
-            device=device).unsqueeze(0).expand(batch_size, -1)
+        text_self_attention_masks = torch.zeros(
+            num_tokens, num_tokens, dtype=torch.bool, device=device)
+        for token_start, token_end in token_ranges:
+            text_self_attention_masks[token_start:token_end,
+                                      token_start:token_end] = True
+        text_self_attention_masks = text_self_attention_masks.unsqueeze(
+            0).expand(batch_size, -1, -1)
+        position_ids = torch.cat([
+            torch.arange(length, dtype=torch.long, device=device)
+            for length in prototype_lengths
+        ]).unsqueeze(0).expand(batch_size, -1)
         text_dict = dict(
             embedded=embedded,
             text_token_mask=text_token_mask,
@@ -560,23 +593,30 @@ class GroundingDINO(DINO):
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Create positive maps from classes to class prototype positions."""
+        """Map each class to all of its refined class-name subword tokens."""
+        if self._prototype_token_ranges is None:
+            raise RuntimeError('Prototype token ranges have not been built.')
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         positive_maps = []
         for labels in gt_labels:
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
-            for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                positive_map[row_idx, label] = 1.0
+            for row_idx, label in enumerate(labels.cpu().tolist()):
+                token_start, token_end = self._prototype_token_ranges[label]
+                positive_map[row_idx, token_start:token_end] = (
+                    1.0 / (token_end - token_start))
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to class prototype positions."""
+        """Map 1-based class ids to their refined subword token positions."""
+        if self._prototype_token_ranges is None:
+            raise RuntimeError('Prototype token ranges have not been built.')
         return {
-            class_idx + 1: [class_idx]
-            for class_idx in range(len(self.support_class_names))
+            class_idx + 1: list(range(token_start, token_end))
+            for class_idx, (token_start, token_end) in enumerate(
+                self._prototype_token_ranges)
         }
 
     def get_tokens_positive_and_prompts(

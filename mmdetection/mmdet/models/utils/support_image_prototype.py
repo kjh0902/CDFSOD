@@ -171,27 +171,35 @@ class TextImagePrototypeFusion(nn.Module):
             embed_dim=embed_dims, num_heads=num_heads, batch_first=True)
         self.norm = nn.LayerNorm(embed_dims)
 
-    def forward(self, text_prototypes: Tensor,
-                image_prototypes: Tensor) -> Tensor:
+    def forward(self, text_prototypes: Sequence[Tensor],
+                image_prototypes: Tensor) -> List[Tensor]:
         """Apply independent per-class text-to-image cross-attention.
 
-        The class dimension is used as the attention batch dimension, so no
-        key or value from another class can participate in the attention.
+        Each class is processed in a separate attention call, so variable
+        class-name token counts are preserved and classes cannot mix.
         """
-        if text_prototypes.dim() != 3 or text_prototypes.size(1) != 1:
-            raise ValueError('text_prototypes must have shape [C, 1, D].')
         if image_prototypes.dim() != 3:
             raise ValueError('image_prototypes must have shape [C, HW, D].')
-        if text_prototypes.size(0) != image_prototypes.size(0):
+        if len(text_prototypes) != image_prototypes.size(0):
             raise ValueError('Text and image prototype class counts differ.')
-        if (text_prototypes.size(-1) != self.embed_dims or
-                image_prototypes.size(-1) != self.embed_dims):
+        if image_prototypes.size(-1) != self.embed_dims:
             raise ValueError(
                 f'Prototype embedding dimension must be {self.embed_dims}.')
 
-        attended_text, _ = self.cross_attention(
-            query=text_prototypes,
-            key=image_prototypes,
-            value=image_prototypes,
-            need_weights=False)
-        return self.norm(text_prototypes + attended_text)
+        refined_text_prototypes = []
+        for class_idx, class_text_prototype in enumerate(text_prototypes):
+            if (class_text_prototype.dim() != 2 or
+                    class_text_prototype.size(0) == 0 or
+                    class_text_prototype.size(-1) != self.embed_dims):
+                raise ValueError(
+                    'Each text prototype must have shape [T_c, D].')
+            class_query = class_text_prototype.unsqueeze(0)
+            class_image = image_prototypes[class_idx:class_idx + 1]
+            attended_text, _ = self.cross_attention(
+                query=class_query,
+                key=class_image,
+                value=class_image,
+                need_weights=False)
+            refined_text_prototypes.append(
+                self.norm(class_query + attended_text).squeeze(0))
+        return refined_text_prototypes
