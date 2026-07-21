@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import mmcv
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as cp
 from mmengine.runner.amp import autocast
 from torch import Tensor
 
@@ -493,24 +492,8 @@ class GroundingDINO(DINO):
             support_image_inputs.append((image_tensor, bboxes, labels))
         self._support_image_inputs = support_image_inputs
 
-    def _extract_support_roi_features(
-            self, support_images: Tensor,
-            support_bboxes: Sequence[Tensor],
-            support_labels: Sequence[Tensor]) -> Tuple[Tensor, Tensor]:
-        """Extract support RoIs as one checkpointable operation."""
-        support_features = self.extract_feat(support_images)
-        return self.support_image_prototype_generator.extract_roi_features(
-            support_features, support_bboxes, support_labels)
-
     def compute_support_image_prototypes(self) -> Tensor:
-        """Build differentiable image prototypes from the full support set.
-
-        During training, each support batch is checkpointed as a whole so its
-        backbone and neck activations are recomputed during backward instead
-        of being retained while the remaining support batches are processed.
-        Non-reentrant checkpointing is required because support images do not
-        require gradients, while the feature extractor parameters do.
-        """
+        """Build differentiable image prototypes from the full support set."""
         self._prepare_support_image_inputs()
         roi_features_per_batch = []
         roi_labels_per_batch = []
@@ -522,24 +505,16 @@ class GroundingDINO(DINO):
             processed = self.data_preprocessor(
                 dict(inputs=raw_images, data_samples=None), training=False)
             support_images = processed['inputs']
+            support_features = self.extract_feat(support_images)
             support_bboxes = [
                 item[1].to(support_images.device) for item in support_batch
             ]
             support_labels = [
                 item[2].to(support_images.device) for item in support_batch
             ]
-            if self.training and torch.is_grad_enabled():
-                roi_features, roi_labels = cp.checkpoint(
-                    self._extract_support_roi_features,
-                    support_images,
-                    support_bboxes,
-                    support_labels,
-                    use_reentrant=False,
-                    preserve_rng_state=True)
-            else:
-                roi_features, roi_labels = (
-                    self._extract_support_roi_features(
-                        support_images, support_bboxes, support_labels))
+            roi_features, roi_labels = (
+                self.support_image_prototype_generator.extract_roi_features(
+                    support_features, support_bboxes, support_labels))
             roi_features_per_batch.append(roi_features)
             roi_labels_per_batch.append(roi_labels)
 
