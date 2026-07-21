@@ -68,6 +68,7 @@ class GroundingDINO(DINO):
                  support_image_root: Optional[str] = None,
                  support_image_batch_size: int = 2,
                  support_image_scale: Tuple[int, int] = (800, 1333),
+                 support_images_per_class: Optional[int] = None,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -80,6 +81,10 @@ class GroundingDINO(DINO):
         self.support_image_root = support_image_root
         self.support_image_batch_size = support_image_batch_size
         self.support_image_scale = support_image_scale
+        if (support_images_per_class is not None and
+                support_images_per_class <= 0):
+            raise ValueError('support_images_per_class must be positive.')
+        self.support_images_per_class = support_images_per_class
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
@@ -458,8 +463,9 @@ class GroundingDINO(DINO):
         if self.support_image_batch_size <= 0:
             raise ValueError('support_image_batch_size must be positive.')
 
+        selected_entries = self._select_support_image_entries()
         image_records = {}
-        for entry in self.support_caption_entries:
+        for entry in selected_entries:
             image_path = entry['file_name']
             if not os.path.isabs(image_path):
                 image_path = os.path.join(self.support_image_root, image_path)
@@ -492,8 +498,31 @@ class GroundingDINO(DINO):
             support_image_inputs.append((image_tensor, bboxes, labels))
         self._support_image_inputs = support_image_inputs
 
+    def _select_support_image_entries(self) -> List[dict]:
+        """Limit image-prototype entries to a fixed image count per class.
+
+        Selection follows caption-file order for reproducibility. All support
+        captions remain available to the text-prototype path; this selection
+        affects only support images and RoIs used by the image prototype.
+        """
+        if self.support_images_per_class is None:
+            return self.support_caption_entries
+
+        selected_images = defaultdict(set)
+        selected_entries = []
+        for entry in self.support_caption_entries:
+            class_idx = entry['class_idx']
+            image_key = os.path.normpath(entry['file_name'])
+            class_images = selected_images[class_idx]
+            if image_key not in class_images:
+                if len(class_images) >= self.support_images_per_class:
+                    continue
+                class_images.add(image_key)
+            selected_entries.append(entry)
+        return selected_entries
+
     def compute_support_image_prototypes(self) -> Tensor:
-        """Build differentiable image prototypes from the full support set."""
+        """Build differentiable prototypes from configured support images."""
         self._prepare_support_image_inputs()
         roi_features_per_batch = []
         roi_labels_per_batch = []
