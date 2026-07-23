@@ -124,6 +124,7 @@ model = dict(
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
+    constructor='TrainableOnlyOptimWrapperConstructor',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={

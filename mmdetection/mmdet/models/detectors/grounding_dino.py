@@ -100,14 +100,17 @@ class GroundingDINO(DINO):
 
         # text modules
         self.language_model = MODELS.build(self.language_model_cfg)
+        self.language_model.requires_grad_(False)
+        self.language_model.eval()
         self.text_feat_map = nn.Linear(
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
 
     def train(self, mode: bool = True):
-        """Switch train/eval mode and clear stale eval text-token cache."""
+        """Switch train/eval mode while keeping the text encoder frozen."""
         super().train(mode)
+        self.language_model.eval()
         if mode:
             self._cached_eval_support_prototype_text_dict = None
         return self
