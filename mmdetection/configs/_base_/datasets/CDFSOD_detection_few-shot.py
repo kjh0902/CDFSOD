@@ -7,7 +7,6 @@ import os
 #   CDFSOD_TRAIN_ANN=annotations/1_shot.json
 #   CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json
 #   CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1
-#   CDFSOD_SUPPORT_IMAGES_PER_CLASS=2
 
 dataset_type = 'CocoDataset'
 datasets_root = os.getenv(
@@ -71,12 +70,6 @@ instance_caption_file = os.getenv('CDFSOD_CAPTION_FILE',
                                   default_caption_file)
 use_class_name_token_prototypes = os.getenv(
     'CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES', '1') != '0'
-support_images_per_class_env = os.getenv('CDFSOD_SUPPORT_IMAGES_PER_CLASS')
-support_images_per_class = (
-    int(support_images_per_class_env)
-    if support_images_per_class_env else None)
-if support_images_per_class is not None and support_images_per_class <= 0:
-    raise ValueError('CDFSOD_SUPPORT_IMAGES_PER_CLASS must be positive.')
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
