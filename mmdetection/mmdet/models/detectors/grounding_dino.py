@@ -1,11 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import json
+import os
 import re
 import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import mmcv
 import torch
 import torch.nn as nn
 from mmengine.runner.amp import autocast
@@ -17,6 +19,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from ..utils import MultiScaleVisualTextualizer
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -62,6 +65,12 @@ class GroundingDINO(DINO):
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
+                 use_multi_scale_visual_textualizer: bool = False,
+                 support_image_root: Optional[str] = None,
+                 support_image_batch_size: int = 2,
+                 support_image_scale: Tuple[int, int] = (800, 1333),
+                 support_feature_strides: Sequence[int] = (8, 16, 32, 64),
+                 support_spatial_hidden_dim: int = 128,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -71,12 +80,32 @@ class GroundingDINO(DINO):
         self.support_caption_file = support_caption_file
         self.support_class_names = list(support_class_names or [])
         self.support_domain_attribute = support_domain_attribute
+        self.use_multi_scale_visual_textualizer = \
+            use_multi_scale_visual_textualizer
+        if (self.use_multi_scale_visual_textualizer and
+                not self.use_class_name_token_prototypes):
+            raise ValueError('The visual textualizer requires enriched class '
+                             'text prototypes.')
+        self.support_image_root = support_image_root
+        self.support_image_batch_size = support_image_batch_size
+        self.support_image_scale = support_image_scale
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
         self.support_tokenized = None
+        self.support_caption_entries = None
+        self.support_shots_per_class = 0
+        self._support_image_inputs = None
+        self._prototype_tokens_per_class = 1
         self._cached_eval_support_prototype_text_dict = None
         super().__init__(*args, **kwargs)
+        self.visual_textualizer = None
+        if self.use_multi_scale_visual_textualizer:
+            self.visual_textualizer = MultiScaleVisualTextualizer(
+                output_size=7,
+                feature_strides=support_feature_strides,
+                embed_dims=self.embed_dims,
+                spatial_hidden_dim=support_spatial_hidden_dim)
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
 
@@ -249,16 +278,35 @@ class GroundingDINO(DINO):
         else:
             iterable_entries = entries
 
-        for item in iterable_entries:
+        visual_entries = []
+        invalid_visual_entries = []
+        for item_idx, item in enumerate(iterable_entries):
+            if not isinstance(item, dict):
+                if self.use_multi_scale_visual_textualizer:
+                    invalid_visual_entries.append(item_idx)
+                continue
             class_name = item.get('category_name', item.get('class_name'))
             caption = item.get('caption', '')
             if class_name not in class_to_idx or not caption:
+                if (self.use_multi_scale_visual_textualizer and
+                        class_name in class_to_idx):
+                    invalid_visual_entries.append(item_idx)
                 continue
             prompt, class_span = self._format_support_prompt(
                 class_name, caption)
             class_idx = class_to_idx[class_name]
             prompt_bank[class_idx].append(prompt)
             span_bank[class_idx].append(class_span)
+            if self.use_multi_scale_visual_textualizer:
+                file_name = item.get('file_name')
+                bbox = item.get('bbox')
+                if (not isinstance(file_name, str) or not file_name or
+                        not isinstance(bbox, (list, tuple)) or len(bbox) != 4):
+                    invalid_visual_entries.append(item_idx)
+                else:
+                    visual_entry = dict(item)
+                    visual_entry['class_idx'] = class_idx
+                    visual_entries.append(visual_entry)
 
         for class_idx, class_name in enumerate(self.support_class_names):
             if len(prompt_bank[class_idx]) == 0:
@@ -279,6 +327,44 @@ class GroundingDINO(DINO):
                 prompt_labels.append(class_idx)
                 prompt_class_spans.append(class_span)
 
+        if self.use_multi_scale_visual_textualizer:
+            if invalid_visual_entries:
+                raise ValueError(
+                    'Visual support entries need a non-empty caption, '
+                    'file_name, and xywh bbox. Invalid indices: '
+                    f'{invalid_visual_entries}.')
+            shots_per_class = [
+                sum(entry['class_idx'] == class_idx
+                    for entry in visual_entries)
+                for class_idx in range(len(self.support_class_names))
+            ]
+            if any(num_shots == 0 for num_shots in shots_per_class):
+                raise ValueError(
+                    'Every class needs at least one visual support instance, '
+                    f'got {shots_per_class}.')
+            if len(set(shots_per_class)) != 1:
+                raise ValueError(
+                    'All classes must use the same K-shot count, got '
+                    f'{shots_per_class}.')
+            self.support_caption_entries = visual_entries
+            self.support_shots_per_class = shots_per_class[0]
+            self._prototype_tokens_per_class = \
+                self.support_shots_per_class + 1
+            if self.support_image_root is None:
+                img_prefix = (caption_data.get('img_prefix')
+                              if isinstance(caption_data, dict) else None)
+                if not isinstance(img_prefix, str) or not img_prefix:
+                    raise ValueError(
+                        'support_image_root or caption JSON img_prefix is '
+                        'required for visual support tokens.')
+                if os.path.isabs(img_prefix):
+                    self.support_image_root = img_prefix
+                else:
+                    dataset_root = os.path.dirname(
+                        os.path.dirname(
+                            os.path.abspath(self.support_caption_file)))
+                    self.support_image_root = os.path.join(
+                        dataset_root, img_prefix)
         self.support_prompt_bank = ordered_bank
         self.support_prompt_texts = prompt_texts
         self.support_prompt_labels = torch.tensor(prompt_labels,
@@ -391,8 +477,88 @@ class GroundingDINO(DINO):
 
         return prototypes
 
+    def _prepare_support_image_inputs(self) -> None:
+        """Load and resize support images once while keeping GT on CPU."""
+        if self._support_image_inputs is not None:
+            return
+        if not self.support_caption_entries:
+            raise ValueError('No valid visual support entries were found.')
+        if self.support_image_batch_size <= 0:
+            raise ValueError('support_image_batch_size must be positive.')
+
+        image_records = {}
+        for entry in self.support_caption_entries:
+            image_path = entry['file_name']
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(self.support_image_root, image_path)
+            record = image_records.setdefault(
+                image_path, dict(bboxes=[], labels=[]))
+            x, y, width, height = [float(value) for value in entry['bbox']]
+            if width <= 0 or height <= 0:
+                raise ValueError(
+                    f'Invalid support bbox in {image_path}: {entry["bbox"]}')
+            record['bboxes'].append((x, y, x + width, y + height))
+            record['labels'].append(entry['class_idx'])
+
+        support_image_inputs = []
+        for image_path, record in image_records.items():
+            image = mmcv.imread(image_path, flag='color')
+            if image is None:
+                raise FileNotFoundError(
+                    f'Unable to read support image: {image_path}')
+            original_height, original_width = image.shape[:2]
+            resized_image = mmcv.imrescale(image, self.support_image_scale)
+            resized_height, resized_width = resized_image.shape[:2]
+            width_scale = resized_width / original_width
+            height_scale = resized_height / original_height
+            bboxes = torch.tensor(record['bboxes'], dtype=torch.float32)
+            bboxes[:, 0::2] *= width_scale
+            bboxes[:, 1::2] *= height_scale
+            labels = torch.tensor(record['labels'], dtype=torch.long)
+            image_tensor = torch.from_numpy(
+                resized_image.transpose(2, 0, 1).copy())
+            support_image_inputs.append((image_tensor, bboxes, labels))
+        self._support_image_inputs = support_image_inputs
+
+    def compute_support_visual_tokens(self) -> Tensor:
+        """Return four-level RoI tokens without averaging K shots."""
+        if self.visual_textualizer is None:
+            raise RuntimeError('The multi-scale visual textualizer is disabled.')
+        self._prepare_support_image_inputs()
+        instance_tokens = []
+        instance_labels = []
+        for start_idx in range(0, len(self._support_image_inputs),
+                               self.support_image_batch_size):
+            support_batch = self._support_image_inputs[
+                start_idx:start_idx + self.support_image_batch_size]
+            raw_images = [item[0] for item in support_batch]
+            processed = self.data_preprocessor(
+                dict(inputs=raw_images, data_samples=None), training=False)
+            support_images = processed['inputs']
+            support_features = self.extract_feat(support_images)
+            support_bboxes = [
+                item[1].to(support_images.device) for item in support_batch
+            ]
+            support_labels = [
+                item[2].to(support_images.device) for item in support_batch
+            ]
+            tokens, labels = self.visual_textualizer.extract_instance_tokens(
+                support_features, support_bboxes, support_labels)
+            instance_tokens.append(tokens)
+            instance_labels.append(labels)
+
+        visual_tokens = self.visual_textualizer.arrange_by_class(
+            torch.cat(instance_tokens, dim=0),
+            torch.cat(instance_labels, dim=0),
+            len(self.support_class_names))
+        if visual_tokens.size(1) != self.support_shots_per_class:
+            raise RuntimeError(
+                f'Expected {self.support_shots_per_class} support shots per '
+                f'class, got {visual_tokens.size(1)}.')
+        return visual_tokens
+
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from class-name-token averaged prototypes."""
+        """Build class-major enriched text and K-shot visual tokens."""
         if (not self.training and self._cached_eval_support_prototype_text_dict
                 is not None):
             cached = self._cached_eval_support_prototype_text_dict
@@ -401,24 +567,39 @@ class GroundingDINO(DINO):
                 for key, value in cached.items()
             }
 
-        prototypes = self.compute_class_text_prototypes()
+        text_prototypes = self.compute_class_text_prototypes()
         if self.text_feat_map is not None:
-            prototypes = self.text_feat_map(prototypes)
-        prototypes = prototypes.to(device)
+            text_prototypes = self.text_feat_map(text_prototypes)
+        text_prototypes = text_prototypes.to(device)
+
+        if self.use_multi_scale_visual_textualizer:
+            visual_tokens = self.compute_support_visual_tokens().to(device)
+            class_tokens = torch.cat(
+                (text_prototypes.unsqueeze(1), visual_tokens), dim=1)
+        else:
+            class_tokens = text_prototypes.unsqueeze(1)
+        self._prototype_tokens_per_class = class_tokens.size(1)
+        prototypes = class_tokens.flatten(0, 1)
         num_tokens = prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         if num_tokens > max_text_len:
             raise RuntimeError(
-                f'Class text prototypes ({num_tokens}) exceed max_text_len '
+                f'Class text and visual tokens ({num_tokens}) exceed '
+                f'max_text_len '
                 f'({max_text_len}).')
 
         embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
         text_token_mask = torch.ones(
             batch_size, num_tokens, dtype=torch.bool, device=device)
-        text_self_attention_masks = torch.eye(
-            num_tokens, dtype=torch.bool,
-            device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        class_attention_mask = torch.zeros(
+            num_tokens, num_tokens, dtype=torch.bool, device=device)
+        for class_idx in range(len(self.support_class_names)):
+            start = class_idx * self._prototype_tokens_per_class
+            end = start + self._prototype_tokens_per_class
+            class_attention_mask[start:end, start:end] = True
+        text_self_attention_masks = class_attention_mask.unsqueeze(0).expand(
+            batch_size, -1, -1)
         position_ids = torch.arange(
             num_tokens, dtype=torch.long,
             device=device).unsqueeze(0).expand(batch_size, -1)
@@ -437,7 +618,7 @@ class GroundingDINO(DINO):
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Create positive maps from classes to class prototype positions."""
+        """Map each class to its enriched text and all K visual tokens."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         positive_maps = []
@@ -445,14 +626,21 @@ class GroundingDINO(DINO):
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                positive_map[row_idx, label] = 1.0
+                if label < 0 or label >= len(self.support_class_names):
+                    raise ValueError(f'GT class label {label} is out of range.')
+                start = label * self._prototype_tokens_per_class
+                end = start + self._prototype_tokens_per_class
+                positive_map[row_idx, start:end] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to class prototype positions."""
+        """Map 1-based class ids to enriched text and visual token positions."""
         return {
-            class_idx + 1: [class_idx]
+            class_idx + 1: list(
+                range(
+                    class_idx * self._prototype_tokens_per_class,
+                    (class_idx + 1) * self._prototype_tokens_per_class))
             for class_idx in range(len(self.support_class_names))
         }
 
