@@ -85,9 +85,9 @@ class MultiScaleVisualTextualizer(nn.Module):
         instance_tokens = torch.stack(scale_tokens, dim=0).amax(dim=0)
         return instance_tokens, roi_labels
 
-    def arrange_by_class(self, instance_tokens: Tensor, labels: Tensor,
-                         num_classes: int) -> Tensor:
-        """Keep every shot and arrange tokens as ``[C, K, D]``."""
+    def aggregate_by_class(self, instance_tokens: Tensor, labels: Tensor,
+                           num_classes: int) -> Tensor:
+        """Average all instance tokens of each class into ``[C, D]``."""
         if instance_tokens.dim() != 2:
             raise ValueError('instance_tokens must have shape [N, D].')
         if instance_tokens.size(0) != labels.numel():
@@ -99,15 +99,12 @@ class MultiScaleVisualTextualizer(nn.Module):
         shots_per_class = []
         for class_idx in range(num_classes):
             tokens = instance_tokens[labels == class_idx]
-            class_tokens.append(tokens)
+            if tokens.size(0) > 0:
+                class_tokens.append(tokens.mean(dim=0))
             shots_per_class.append(tokens.size(0))
         if any(num_shots == 0 for num_shots in shots_per_class):
             raise ValueError(
                 f'Every class needs at least one support RoI, got '
-                f'{shots_per_class}.')
-        if len(set(shots_per_class)) != 1:
-            raise ValueError(
-                f'All classes must have the same K-shot count, got '
                 f'{shots_per_class}.')
 
         return torch.stack(class_tokens, dim=0)
