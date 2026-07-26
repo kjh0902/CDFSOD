@@ -14,16 +14,12 @@ export CDFSOD_TRAIN_ANN="annotations/${SHOT}_shot.json"
 export CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES="${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES:-1}"
 export CDFSOD_CAPTION_FILE="${CDFSOD_CAPTION_FILE:-annotations/${SHOT}_shot_captions.json}"
 
-if [ "$CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES" = "0" ]; then
-  echo "Two-stage training requires the visual textualizer." >&2
-  echo "Set CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1." >&2
-  exit 2
-fi
-
-CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB-visual-cross-attention.py"
+CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py"
 TEXT_TAG="class_name_token_prototype"
+if [ "$CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES" = "0" ]; then
+  TEXT_TAG="class_name"
+fi
 WORK_DIR="work_dirs/${DATASET}_${SHOT}shot_${TEXT_TAG}"
-CHECKPOINT="${WORK_DIR}/epoch_30.pth"
 
 echo "dataset: ${DATASET}"
 echo "shot: ${SHOT}"
@@ -34,13 +30,9 @@ echo "config: ${CONFIG}"
 echo "work dir: ${WORK_DIR}"
 
 if [ "$GPUS" = "1" ]; then
-  # Keep the full model in FP32 for stable joint fine-tuning.
-  python tools/train.py "$CONFIG" --work-dir "$WORK_DIR"
-  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
-    "$CONFIG" "$CHECKPOINT" --work-dir "$WORK_DIR"
+  python tools/train.py "$CONFIG" --amp --work-dir "$WORK_DIR"
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py "$CONFIG" "$WORK_DIR/epoch_30.pth" --work-dir "$WORK_DIR"
 else
-  bash tools/dist_train.sh "$CONFIG" "$GPUS" --work-dir "$WORK_DIR"
-  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_test.sh \
-    "$CONFIG" "$CHECKPOINT" "$GPUS" \
-    --work-dir "$WORK_DIR"
+  bash tools/dist_train.sh "$CONFIG" "$GPUS" --amp --work-dir "$WORK_DIR"
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_test.sh "$CONFIG" "$WORK_DIR/epoch_30.pth" "$GPUS" --work-dir "$WORK_DIR"
 fi

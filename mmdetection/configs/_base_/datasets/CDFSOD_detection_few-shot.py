@@ -73,6 +73,7 @@ use_class_name_token_prototypes = os.getenv(
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
+support_image_scale = (800, 1333)
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),
@@ -118,7 +119,7 @@ train_pipeline = [
 
 test_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),
-    dict(type='FixScaleResize', scale=(800, 1333), keep_ratio=True),
+    dict(type='FixScaleResize', scale=support_image_scale, keep_ratio=True),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(
         type='PackDetInputs',

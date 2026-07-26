@@ -4,7 +4,7 @@ from .gaussian_target import (gather_feat, gaussian_radius,
                               get_topk_from_heatmap, transpose_and_gather_feat)
 from .image import imrenormalize
 from .make_divisible import make_divisible
-from .multi_scale_visual_textualizer import MultiScaleVisualTextualizer
+from .support_prototype_fusion import SupportPrototypeFusion
 # Disable yapf because it conflicts with isort.
 # yapf: disable
 from .misc import (align_tensor, aligned_bilinear, center_of_mass,
@@ -35,5 +35,5 @@ __all__ = [
     'reweight_loss_dict', 'relative_coordinate_maps', 'aligned_bilinear',
     'unfold_wo_center', 'imrenormalize', 'VLFuse', 'permute_and_flatten',
     'BertEncoderLayer', 'align_tensor', 'weighted_boxes_fusion',
-    'MultiScaleVisualTextualizer'
+    'SupportPrototypeFusion'
 ]
