@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .checkloss_hook import CheckInvalidLossHook
+from .loss_gradient_file_logger_hook import LossGradientFileLoggerHook
 from .mean_teacher_hook import MeanTeacherHook
 from .memory_profiler_hook import MemoryProfilerHook
 from .num_class_check_hook import NumClassCheckHook
@@ -17,5 +18,5 @@ __all__ = [
     'SetEpochInfoHook', 'MemoryProfilerHook', 'DetVisualizationHook',
     'NumClassCheckHook', 'MeanTeacherHook', 'trigger_visualization_hook',
     'PipelineSwitchHook', 'TrackVisualizationHook',
-    'GroundingVisualizationHook'
+    'GroundingVisualizationHook', 'LossGradientFileLoggerHook'
 ]

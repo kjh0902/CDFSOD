@@ -21,3 +21,8 @@ default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
         interval=max_epochs))
+custom_hooks = [
+    dict(
+        type='LossGradientFileLoggerHook',
+        filename='loss_gradient_per_iter.jsonl')
+]
