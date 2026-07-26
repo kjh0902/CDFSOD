@@ -168,6 +168,23 @@ class GroundingDINO(DINO):
         self.language_model.requires_grad_(False)
         self.language_model.eval()
 
+    def set_training_stage(self, training_stage: str) -> None:
+        """Switch trainability and modes without rebuilding the optimizer."""
+        if training_stage not in ('mlp_only', 'full_finetune'):
+            raise ValueError(
+                'training_stage must be "mlp_only" or "full_finetune", '
+                f'but got {training_stage!r}.')
+        self.training_stage = training_stage
+        self._configure_trainable_parameters()
+        if self.training:
+            self.train(True)
+
+    def clear_support_caches(self) -> None:
+        """Discard support inputs/prototypes built by the previous stage."""
+        self._support_image_inputs = None
+        self._cached_eval_support_prototype_text_dict = None
+        self._prototype_tokens_per_class = 1
+
     def _set_frozen_modules_eval(self) -> None:
         """Keep modules with no trainable descendants in eval mode."""
         for module in self.modules():
