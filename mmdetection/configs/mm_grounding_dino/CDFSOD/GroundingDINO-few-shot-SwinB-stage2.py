@@ -6,17 +6,11 @@ _base_ = [
 model = dict(training_stage='full_finetune')
 
 stage2_epochs = 25
-optim_wrapper = dict(optimizer=dict(lr=1e-5))
-param_scheduler = [
-    dict(
-        type='MultiStepLR',
-        begin=0,
-        end=stage2_epochs,
-        by_epoch=True,
-        # Stage 2 epoch 15 is global epoch 20 after the five-epoch Stage 1.
-        milestones=[15],
-        gamma=0.1)
-]
+# NEU-DET 1-shot has only three iterations per epoch. Keep a stable learning
+# rate for all 75 Stage 2 updates instead of starving the fine-tuning phase
+# with the previous 1e-5 -> 1e-6 schedule.
+optim_wrapper = dict(optimizer=dict(lr=5e-5))
+param_scheduler = []
 train_cfg = dict(
     type='EpochBasedTrainLoop',
     max_epochs=stage2_epochs,
@@ -25,4 +19,6 @@ train_cfg = dict(
 default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
-        interval=stage2_epochs))
+        interval=stage2_epochs,
+        # Stage 2 uses local epochs 1--25, but this is global epoch 30.
+        filename_tmpl='epoch_30.pth'))

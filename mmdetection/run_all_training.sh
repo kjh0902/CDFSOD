@@ -24,10 +24,8 @@ STAGE1_CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB-sta
 STAGE2_CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB-stage2.py"
 TEXT_TAG="class_name_token_prototype"
 WORK_DIR="work_dirs/${DATASET}_${SHOT}shot_${TEXT_TAG}"
-STAGE1_WORK_DIR="${WORK_DIR}/stage1_mlp_only"
-STAGE2_WORK_DIR="${WORK_DIR}/stage2_full_finetune"
-STAGE1_CHECKPOINT="${STAGE1_WORK_DIR}/epoch_5.pth"
-STAGE2_CHECKPOINT="${STAGE2_WORK_DIR}/epoch_25.pth"
+STAGE1_CHECKPOINT="${WORK_DIR}/epoch_5.pth"
+STAGE2_CHECKPOINT="${WORK_DIR}/epoch_30.pth"
 
 echo "dataset: ${DATASET}"
 echo "shot: ${SHOT}"
@@ -39,23 +37,24 @@ echo "stage 2 config: ${STAGE2_CONFIG}"
 echo "work dir: ${WORK_DIR}"
 
 if [ "$GPUS" = "1" ]; then
-  python tools/train.py "$STAGE1_CONFIG" --amp --work-dir "$STAGE1_WORK_DIR"
+  # FP32 avoids the non-finite gradients observed with AMP in both stages.
+  python tools/train.py "$STAGE1_CONFIG" --work-dir "$WORK_DIR"
   # Stage 1 is a trusted local MMEngine checkpoint. PyTorch 2.6 otherwise
   # defaults torch.load() to weights_only=True and rejects its HistoryBuffer.
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/train.py \
-    "$STAGE2_CONFIG" --amp \
-    --work-dir "$STAGE2_WORK_DIR" \
+    "$STAGE2_CONFIG" \
+    --work-dir "$WORK_DIR" \
     --cfg-options "load_from=${STAGE1_CHECKPOINT}"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
-    "$STAGE2_CONFIG" "$STAGE2_CHECKPOINT" --work-dir "$STAGE2_WORK_DIR"
+    "$STAGE2_CONFIG" "$STAGE2_CHECKPOINT" --work-dir "$WORK_DIR"
 else
-  bash tools/dist_train.sh "$STAGE1_CONFIG" "$GPUS" --amp \
-    --work-dir "$STAGE1_WORK_DIR"
+  bash tools/dist_train.sh "$STAGE1_CONFIG" "$GPUS" \
+    --work-dir "$WORK_DIR"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_train.sh \
-    "$STAGE2_CONFIG" "$GPUS" --amp \
-    --work-dir "$STAGE2_WORK_DIR" \
+    "$STAGE2_CONFIG" "$GPUS" \
+    --work-dir "$WORK_DIR" \
     --cfg-options "load_from=${STAGE1_CHECKPOINT}"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_test.sh \
     "$STAGE2_CONFIG" "$STAGE2_CHECKPOINT" "$GPUS" \
-    --work-dir "$STAGE2_WORK_DIR"
+    --work-dir "$WORK_DIR"
 fi
