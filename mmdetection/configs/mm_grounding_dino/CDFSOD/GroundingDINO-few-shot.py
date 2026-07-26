@@ -25,7 +25,7 @@ model = dict(
     use_multi_scale_visual_textualizer=_base_.use_class_name_token_prototypes,
     support_image_root=os.path.join(_base_.data_root, 'train'),
     support_feature_strides=(8, 16, 32, 64),
-    support_spatial_hidden_dim=128,
+    support_visual_num_heads=8,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -128,7 +128,6 @@ model = dict(
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
-    constructor='TrainableOnlyOptimWrapperConstructor',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={

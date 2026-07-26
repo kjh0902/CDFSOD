@@ -20,7 +20,7 @@ if [ "$CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES" = "0" ]; then
   exit 2
 fi
 
-CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB-two-stage.py"
+CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB-visual-cross-attention.py"
 TEXT_TAG="class_name_token_prototype"
 WORK_DIR="work_dirs/${DATASET}_${SHOT}shot_${TEXT_TAG}"
 CHECKPOINT="${WORK_DIR}/epoch_30.pth"
@@ -34,7 +34,7 @@ echo "config: ${CONFIG}"
 echo "work dir: ${WORK_DIR}"
 
 if [ "$GPUS" = "1" ]; then
-  # FP32 avoids the non-finite gradients observed with AMP in both stages.
+  # Keep the full model in FP32 for stable joint fine-tuning.
   python tools/train.py "$CONFIG" --work-dir "$WORK_DIR"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
     "$CONFIG" "$CHECKPOINT" --work-dir "$WORK_DIR"

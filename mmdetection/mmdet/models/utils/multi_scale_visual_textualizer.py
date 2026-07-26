@@ -16,18 +16,24 @@ class MultiScaleVisualTextualizer(nn.Module):
                  output_size: int = 7,
                  feature_strides: Sequence[int] = (8, 16, 32, 64),
                  embed_dims: int = 256,
-                 spatial_hidden_dim: int = 128,
+                 num_attention_heads: int = 8,
                  sampling_ratio: int = 2) -> None:
         super().__init__()
         if output_size <= 0:
             raise ValueError('output_size must be positive.')
         if len(feature_strides) != 4:
             raise ValueError('Exactly four feature strides are required.')
-        if spatial_hidden_dim <= 0:
-            raise ValueError('spatial_hidden_dim must be positive.')
+        if embed_dims % 2 != 0:
+            raise ValueError('embed_dims must be even for 2D embeddings.')
+        if num_attention_heads <= 0:
+            raise ValueError('num_attention_heads must be positive.')
+        if embed_dims % num_attention_heads != 0:
+            raise ValueError(
+                'embed_dims must be divisible by num_attention_heads.')
 
         self.output_size = output_size
         self.embed_dims = embed_dims
+        self.num_levels = len(feature_strides)
         self.roi_align_layers = nn.ModuleList([
             RoIAlign(
                 output_size=(output_size, output_size),
@@ -35,18 +41,23 @@ class MultiScaleVisualTextualizer(nn.Module):
                 sampling_ratio=sampling_ratio,
                 aligned=True) for stride in feature_strides
         ])
-        spatial_dim = output_size * output_size
-        self.spatial_projection = nn.Sequential(
-            nn.Linear(spatial_dim, spatial_hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(spatial_hidden_dim, 1),
+        position_dims = embed_dims // 2
+        self.row_embedding = nn.Embedding(output_size, position_dims)
+        self.column_embedding = nn.Embedding(output_size, position_dims)
+        self.level_embedding = nn.Embedding(self.num_levels, embed_dims)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_attention_heads,
+            dropout=0.0,
+            batch_first=True,
         )
 
     def extract_instance_tokens(
             self, support_features: Tuple[Tensor],
             support_bboxes: Sequence[Tensor],
-            support_labels: Sequence[Tensor]) -> Tuple[Tensor, Tensor]:
-        """RoIAlign four levels and return one max-pooled token per RoI."""
+            support_labels: Sequence[Tensor],
+            class_text_prototypes: Tensor) -> Tuple[Tensor, Tensor]:
+        """Attend from class text to all scale-major RoI tokens."""
         if len(support_features) != len(self.roi_align_layers):
             raise ValueError(
                 f'Expected {len(self.roi_align_layers)} neck features, got '
@@ -67,8 +78,23 @@ class MultiScaleVisualTextualizer(nn.Module):
         if roi_labels.numel() != support_rois.size(0):
             raise ValueError('The number of support labels must match the '
                              'number of support RoIs.')
+        if (class_text_prototypes.dim() != 2 or
+                class_text_prototypes.size(1) != self.embed_dims):
+            raise ValueError(
+                'class_text_prototypes must have shape '
+                f'[C, {self.embed_dims}].')
+        if ((roi_labels < 0) |
+                (roi_labels >= class_text_prototypes.size(0))).any():
+            raise ValueError('Support labels are outside the prototype range.')
 
-        scale_tokens = []
+        rows = self.row_embedding.weight[:, None, :].expand(
+            self.output_size, self.output_size, -1)
+        columns = self.column_embedding.weight[None, :, :].expand(
+            self.output_size, self.output_size, -1)
+        spatial_positions = torch.cat((rows, columns), dim=-1).reshape(
+            self.output_size * self.output_size, self.embed_dims)
+
+        scale_major_tokens = []
         for level_idx, (feature,
                         roi_align) in enumerate(zip(support_features,
                                                   self.roi_align_layers)):
@@ -78,16 +104,25 @@ class MultiScaleVisualTextualizer(nn.Module):
                     f'[B, {self.embed_dims}, H, W], got '
                     f'{tuple(feature.shape)}.')
             roi_features = roi_align(feature, support_rois)
-            flattened = roi_features.flatten(2)
-            scale_tokens.append(
-                self.spatial_projection(flattened).squeeze(-1))
+            roi_tokens = roi_features.flatten(2).transpose(1, 2)
+            level_position = self.level_embedding.weight[level_idx]
+            roi_tokens = (roi_tokens + spatial_positions[None, :, :] +
+                          level_position[None, None, :])
+            scale_major_tokens.append(roi_tokens)
 
-        instance_tokens = torch.stack(scale_tokens, dim=0).amax(dim=0)
+        multi_scale_tokens = torch.cat(scale_major_tokens, dim=1)
+        text_queries = class_text_prototypes[roi_labels].unsqueeze(1)
+        attended_tokens, _ = self.cross_attention(
+            query=text_queries,
+            key=multi_scale_tokens,
+            value=multi_scale_tokens,
+            need_weights=False)
+        instance_tokens = attended_tokens.squeeze(1)
         return instance_tokens, roi_labels
 
     def aggregate_by_class(self, instance_tokens: Tensor, labels: Tensor,
                            num_classes: int) -> Tensor:
-        """Average all instance tokens of each class into ``[C, D]``."""
+        """Average instance tokens into class prototypes ``[C, 1, D]``."""
         if instance_tokens.dim() != 2:
             raise ValueError('instance_tokens must have shape [N, D].')
         if instance_tokens.size(0) != labels.numel():
@@ -107,4 +142,4 @@ class MultiScaleVisualTextualizer(nn.Module):
                 f'Every class needs at least one support RoI, got '
                 f'{shots_per_class}.')
 
-        return torch.stack(class_tokens, dim=0)
+        return torch.stack(class_tokens, dim=0).unsqueeze(1)

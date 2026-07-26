@@ -70,8 +70,7 @@ class GroundingDINO(DINO):
                  support_image_batch_size: int = 2,
                  support_image_scale: Tuple[int, int] = (800, 1333),
                  support_feature_strides: Sequence[int] = (8, 16, 32, 64),
-                 support_spatial_hidden_dim: int = 128,
-                 training_stage: str = 'full_finetune',
+                 support_visual_num_heads: int = 8,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -90,11 +89,6 @@ class GroundingDINO(DINO):
         self.support_image_root = support_image_root
         self.support_image_batch_size = support_image_batch_size
         self.support_image_scale = support_image_scale
-        if training_stage not in ('mlp_only', 'full_finetune'):
-            raise ValueError(
-                'training_stage must be "mlp_only" or "full_finetune", '
-                f'but got {training_stage!r}.')
-        self.training_stage = training_stage
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
@@ -110,10 +104,9 @@ class GroundingDINO(DINO):
                 output_size=7,
                 feature_strides=support_feature_strides,
                 embed_dims=self.embed_dims,
-                spatial_hidden_dim=support_spatial_hidden_dim)
+                num_attention_heads=support_visual_num_heads)
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
-        self._configure_trainable_parameters()
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -135,65 +128,10 @@ class GroundingDINO(DINO):
 
         # text modules
         self.language_model = MODELS.build(self.language_model_cfg)
-        self.language_model.requires_grad_(False)
-        self.language_model.eval()
         self.text_feat_map = nn.Linear(
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
-
-    def train(self, mode: bool = True):
-        """Set the stage-specific modes and keep the text encoder frozen."""
-        super().train(mode)
-        self.language_model.eval()
-        if mode and self.training_stage == 'mlp_only':
-            self._set_frozen_modules_eval()
-        if mode:
-            self._cached_eval_support_prototype_text_dict = None
-        return self
-
-    def _configure_trainable_parameters(self) -> None:
-        """Apply the trainable-parameter policy for the selected stage."""
-        if self.training_stage == 'mlp_only':
-            if self.visual_textualizer is None:
-                raise ValueError(
-                    'The mlp_only stage requires the multi-scale visual '
-                    'textualizer.')
-            self.requires_grad_(False)
-            self.visual_textualizer.spatial_projection.requires_grad_(True)
-        else:
-            self.requires_grad_(True)
-
-        # BERT is frozen in every training stage.
-        self.language_model.requires_grad_(False)
-        self.language_model.eval()
-
-    def set_training_stage(self, training_stage: str) -> None:
-        """Switch trainability and modes without rebuilding the optimizer."""
-        if training_stage not in ('mlp_only', 'full_finetune'):
-            raise ValueError(
-                'training_stage must be "mlp_only" or "full_finetune", '
-                f'but got {training_stage!r}.')
-        self.training_stage = training_stage
-        self._configure_trainable_parameters()
-        if self.training:
-            self.train(True)
-
-    def clear_support_caches(self) -> None:
-        """Discard support inputs/prototypes built by the previous stage."""
-        self._support_image_inputs = None
-        self._cached_eval_support_prototype_text_dict = None
-        self._prototype_tokens_per_class = 1
-
-    def _set_frozen_modules_eval(self) -> None:
-        """Keep modules with no trainable descendants in eval mode."""
-        for module in self.modules():
-            if module is self:
-                continue
-            parameters = tuple(module.parameters())
-            if parameters and not any(param.requires_grad
-                                      for param in parameters):
-                module.eval()
 
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -564,8 +502,9 @@ class GroundingDINO(DINO):
             support_image_inputs.append((image_tensor, bboxes, labels))
         self._support_image_inputs = support_image_inputs
 
-    def compute_support_visual_tokens(self) -> Tensor:
-        """Average four-level RoI tokens into one token per class."""
+    def compute_support_visual_tokens(
+            self, class_text_prototypes: Tensor) -> Tensor:
+        """Build text-guided visual prototypes from four-level RoI tokens."""
         if self.visual_textualizer is None:
             raise RuntimeError('The multi-scale visual textualizer is disabled.')
         self._prepare_support_image_inputs()
@@ -587,7 +526,8 @@ class GroundingDINO(DINO):
                 item[2].to(support_images.device) for item in support_batch
             ]
             tokens, labels = self.visual_textualizer.extract_instance_tokens(
-                support_features, support_bboxes, support_labels)
+                support_features, support_bboxes, support_labels,
+                class_text_prototypes)
             instance_tokens.append(tokens)
             instance_labels.append(labels)
 
@@ -613,10 +553,10 @@ class GroundingDINO(DINO):
         text_prototypes = text_prototypes.to(device)
 
         if self.use_multi_scale_visual_textualizer:
-            visual_tokens = self.compute_support_visual_tokens().to(device)
+            visual_tokens = self.compute_support_visual_tokens(
+                text_prototypes).to(device)
             class_tokens = torch.cat(
-                (text_prototypes.unsqueeze(1),
-                 visual_tokens.unsqueeze(1)), dim=1)
+                (text_prototypes.unsqueeze(1), visual_tokens), dim=1)
         else:
             class_tokens = text_prototypes.unsqueeze(1)
         self._prototype_tokens_per_class = class_tokens.size(1)
@@ -659,7 +599,7 @@ class GroundingDINO(DINO):
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Map each class to its enriched text and all K visual tokens."""
+        """Map each class to its text token and visual prototype token."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         positive_maps = []
@@ -676,7 +616,7 @@ class GroundingDINO(DINO):
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to enriched text and visual token positions."""
+        """Map class ids to their text and visual prototype positions."""
         return {
             class_idx + 1: list(
                 range(

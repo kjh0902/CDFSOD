@@ -2,10 +2,8 @@ _base_ = [
     './GroundingDINO-few-shot-SwinB.py',
 ]
 
-# Build the model in Stage 1 mode. With no paramwise_cfg, MMEngine registers
-# model.parameters() in full even while most parameters require no gradient.
-model = dict(training_stage='mlp_only')
-
+# Train BERT, the detector, and the visual cross-attention jointly from the
+# first epoch with a single FP32 OptimWrapper.
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
@@ -23,10 +21,3 @@ default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
         interval=max_epochs))
-
-custom_hooks = [
-    dict(
-        type='GroundingDinoTwoStageHook',
-        mlp_only_epochs=5,
-        priority='VERY_HIGH')
-]
