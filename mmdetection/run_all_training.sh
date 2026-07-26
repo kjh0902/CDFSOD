@@ -40,7 +40,10 @@ echo "work dir: ${WORK_DIR}"
 
 if [ "$GPUS" = "1" ]; then
   python tools/train.py "$STAGE1_CONFIG" --amp --work-dir "$STAGE1_WORK_DIR"
-  python tools/train.py "$STAGE2_CONFIG" --amp \
+  # Stage 1 is a trusted local MMEngine checkpoint. PyTorch 2.6 otherwise
+  # defaults torch.load() to weights_only=True and rejects its HistoryBuffer.
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/train.py \
+    "$STAGE2_CONFIG" --amp \
     --work-dir "$STAGE2_WORK_DIR" \
     --cfg-options "load_from=${STAGE1_CHECKPOINT}"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
@@ -48,7 +51,8 @@ if [ "$GPUS" = "1" ]; then
 else
   bash tools/dist_train.sh "$STAGE1_CONFIG" "$GPUS" --amp \
     --work-dir "$STAGE1_WORK_DIR"
-  bash tools/dist_train.sh "$STAGE2_CONFIG" "$GPUS" --amp \
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_train.sh \
+    "$STAGE2_CONFIG" "$GPUS" --amp \
     --work-dir "$STAGE2_WORK_DIR" \
     --cfg-options "load_from=${STAGE1_CHECKPOINT}"
   TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 bash tools/dist_test.sh \
