@@ -12,6 +12,7 @@ model = dict(
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
+    enable_textualized_visual_tokens=True,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],

@@ -2,7 +2,7 @@
 import copy
 import re
 import warnings
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -11,9 +11,11 @@ from torch import Tensor
 
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
+from mmdet.structures.bbox import bbox2roi
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from ..utils import TextualizedVisualTokenGenerator
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -55,12 +57,22 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 enable_textualized_visual_tokens: bool = False,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        self.enable_textualized_visual_tokens = \
+            enable_textualized_visual_tokens
         super().__init__(*args, **kwargs)
+        self.textualized_visual_token_generator = None
+        if self.enable_textualized_visual_tokens:
+            self.textualized_visual_token_generator = \
+                TextualizedVisualTokenGenerator()
+            # Tokens are diagnostic-only until a downstream loss consumes
+            # them. Freezing avoids changing optimization or DDP behavior.
+            self.textualized_visual_token_generator.requires_grad_(False)
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -92,6 +104,19 @@ class GroundingDINO(DINO):
         super().init_weights()
         nn.init.constant_(self.text_feat_map.bias.data, 0)
         nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+
+    def generate_textualized_visual_tokens(
+            self, visual_features: Sequence[Tensor],
+            batch_data_samples: SampleList) -> Tensor:
+        """Generate per-GT visual tokens without using them in detection."""
+        if self.textualized_visual_token_generator is None:
+            raise RuntimeError('Textualized visual token generation is off.')
+        gt_bboxes = [
+            data_sample.gt_instances.bboxes
+            for data_sample in batch_data_samples
+        ]
+        rois = bbox2roi(gt_bboxes)
+        return self.textualized_visual_token_generator(visual_features, rois)
 
     def to_plain_text_prompts(self, original_caption):
         caption_string = ''
@@ -456,6 +481,10 @@ class GroundingDINO(DINO):
                 visual_features = self.extract_feat(batch_inputs)
         else:
             visual_features = self.extract_feat(batch_inputs)
+        if self.textualized_visual_token_generator is not None:
+            with torch.no_grad():
+                self.generate_textualized_visual_tokens(
+                    visual_features, batch_data_samples)
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
