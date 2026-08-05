@@ -139,7 +139,7 @@ train_dataloader = dict(
 support_dataloader = dict(
     batch_size=1,
     num_workers=2,
-    persistent_workers=False,
+    persistent_workers=True,
     drop_last=False,
     sampler=dict(type='SupportSampler', shuffle=False),
     dataset=dict(

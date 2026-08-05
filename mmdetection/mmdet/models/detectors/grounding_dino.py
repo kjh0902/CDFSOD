@@ -66,6 +66,8 @@ class GroundingDINO(DINO):
         self.enable_textualized_visual_tokens = \
             enable_textualized_visual_tokens
         super().__init__(*args, **kwargs)
+        self._support_dataloader = None
+        self._training_support_class_names = None
         self._support_visual_tokens = None
         self._support_visual_token_labels = None
         self._support_class_names = None
@@ -132,15 +134,21 @@ class GroundingDINO(DINO):
     def has_support_token_cache(self) -> bool:
         return self._support_visual_tokens is not None
 
-    @torch.no_grad()
-    def build_support_token_cache(self, support_dataloader,
-                                  class_names: Sequence[str]) -> None:
-        """Cache every support-object token in deterministic class order."""
+    def set_support_dataloader(self, support_dataloader,
+                               class_names: Sequence[str]) -> None:
+        """Attach the deterministic support loader used during training."""
+        self._support_dataloader = support_dataloader
+        self._training_support_class_names = tuple(class_names)
+
+    def _generate_support_tokens(
+            self, support_dataloader, class_names: Sequence[str],
+            detach: bool = False
+    ) -> Tuple[Tensor, Tensor, Tuple[str, ...]]:
+        """Generate one token for every object and group by class."""
         if self.textualized_visual_token_generator is None:
             raise RuntimeError(
                 'Textualized visual token generation must be enabled.')
 
-        self.eval()
         num_classes = len(class_names)
         tokens_by_class = [[] for _ in range(num_classes)]
 
@@ -170,7 +178,8 @@ class GroundingDINO(DINO):
                     if class_index < 0 or class_index >= num_classes:
                         raise RuntimeError(
                             f'Invalid support class index {class_index}.')
-                    tokens_by_class[class_index].append(token.detach())
+                    tokens_by_class[class_index].append(
+                        token.detach() if detach else token)
 
         token_counts = [len(class_tokens) for class_tokens in tokens_by_class]
         if any(count == 0 for count in token_counts):
@@ -183,19 +192,42 @@ class GroundingDINO(DINO):
                 'Support set does not contain an object for every class. '
                 f'Collected counts: {missing}')
 
-        self._support_visual_tokens = torch.stack([
+        support_visual_tokens = torch.stack([
             token for class_tokens in tokens_by_class for token in class_tokens
         ])
-        self._support_visual_token_labels = torch.cat([
+        support_visual_token_labels = torch.cat([
             torch.full(
                 (count, ),
                 class_index,
                 dtype=torch.long,
-                device=self._support_visual_tokens.device)
+                device=support_visual_tokens.device)
             for class_index, count in enumerate(token_counts)
         ])
-        self._support_class_names = tuple(
+        support_class_names = tuple(
             clean_label_name(str(class_name)) for class_name in class_names)
+        return (support_visual_tokens, support_visual_token_labels,
+                support_class_names)
+
+    def generate_training_support_tokens(
+            self) -> Tuple[Tensor, Tensor, Tuple[str, ...]]:
+        """Regenerate all support-object tokens for the current iteration."""
+        if self._support_dataloader is None:
+            raise RuntimeError(
+                'The support dataloader must be attached before training.')
+        return self._generate_support_tokens(
+            self._support_dataloader,
+            class_names=self._training_support_class_names)
+
+    @torch.no_grad()
+    def build_support_token_cache(self, support_dataloader,
+                                  class_names: Sequence[str]) -> None:
+        """Cache every support-object token in deterministic class order."""
+        self.eval()
+        support_outputs = self._generate_support_tokens(
+            support_dataloader, class_names=class_names, detach=True)
+        self._support_visual_tokens, \
+            self._support_visual_token_labels, \
+            self._support_class_names = support_outputs
 
     def to_plain_text_prompts(self, original_caption):
         caption_string = ''
@@ -557,21 +589,31 @@ class GroundingDINO(DINO):
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 
-        if self.use_autocast:
-            with autocast(enabled=True):
-                visual_features = self.extract_feat(batch_inputs)
-        else:
-            visual_features = self.extract_feat(batch_inputs)
-
         if self.textualized_visual_token_generator is not None:
-            visual_tokens = self.generate_textualized_visual_tokens(
-                visual_features, batch_data_samples)
-            visual_tokens = visual_tokens.split(
-                [len(labels) for labels in gt_labels])
+            support_visual_tokens, support_labels, support_class_names = \
+                self.generate_training_support_tokens()
+            for text_prompt, class_positive_map in zip(
+                    text_prompts, class_name_positive_maps):
+                if isinstance(text_prompt, (list, tuple)):
+                    prompt_class_names = tuple(
+                        clean_label_name(str(class_name))
+                        for class_name in text_prompt)
+                    if prompt_class_names != support_class_names:
+                        raise RuntimeError(
+                            'Support-set class order does not match the '
+                            'training prompt class order.')
+                if class_positive_map.size(0) != len(support_class_names):
+                    raise RuntimeError(
+                        'Support-set class count does not match the training '
+                        'prompt class count.')
+            support_positive_maps = [
+                class_positive_map.to(support_labels.device)[support_labels]
+                for class_positive_map in class_name_positive_maps
+            ]
             text_dict = self.language_model(
                 new_text_prompts,
-                visual_tokens=visual_tokens,
-                visual_token_positive_maps=positive_maps,
+                visual_tokens=[support_visual_tokens] * len(batch_inputs),
+                visual_token_positive_maps=support_positive_maps,
                 class_name_positive_maps=class_name_positive_maps)
         else:
             text_dict = self.language_model(new_text_prompts)
@@ -587,6 +629,12 @@ class GroundingDINO(DINO):
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
                     len(positive_map), 1)
+
+        if self.use_autocast:
+            with autocast(enabled=True):
+                visual_features = self.extract_feat(batch_inputs)
+        else:
+            visual_features = self.extract_feat(batch_inputs)
 
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
