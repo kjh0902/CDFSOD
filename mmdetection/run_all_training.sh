@@ -11,6 +11,7 @@ export PYTHONPATH="$MMDET_DIR:${PYTHONPATH:-}"
 export CDFSOD_DATA_ROOT="${CDFSOD_DATA_ROOT:-/home/aislab5090/CDFSOD/junhyung/datasets}"
 export CDFSOD_DATASET="$DATASET"
 export CDFSOD_TRAIN_ANN="annotations/${SHOT}_shot.json"
+export CDFSOD_SHOT="$SHOT"
 
 CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py"
 WORK_DIR="work_dirs/${DATASET}_${SHOT}shot"

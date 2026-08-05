@@ -66,6 +66,9 @@ class GroundingDINO(DINO):
         self.enable_textualized_visual_tokens = \
             enable_textualized_visual_tokens
         super().__init__(*args, **kwargs)
+        self._support_visual_tokens = None
+        self._support_visual_token_labels = None
+        self._support_class_names = None
         self.textualized_visual_token_generator = None
         if self.enable_textualized_visual_tokens:
             for parameter in self.parameters():
@@ -124,6 +127,76 @@ class GroundingDINO(DINO):
         ]
         rois = bbox2roi(gt_bboxes)
         return self.textualized_visual_token_generator(visual_features, rois)
+
+    @property
+    def has_support_token_cache(self) -> bool:
+        return self._support_visual_tokens is not None
+
+    @torch.no_grad()
+    def build_support_token_cache(self, support_dataloader,
+                                  support_shots: int,
+                                  class_names: Sequence[str]) -> None:
+        """Create a deterministic class-major cache from support images."""
+        if self.textualized_visual_token_generator is None:
+            raise RuntimeError(
+                'Textualized visual token generation must be enabled.')
+        if support_shots <= 0:
+            raise ValueError('support_shots must be a positive integer.')
+
+        self.eval()
+        num_classes = len(class_names)
+        tokens_by_class = [[] for _ in range(num_classes)]
+
+        for data_batch in support_dataloader:
+            processed_batch = self.data_preprocessor(
+                data_batch, training=False)
+            batch_inputs = processed_batch['inputs']
+            batch_data_samples = processed_batch['data_samples']
+
+            if self.use_autocast:
+                with autocast(enabled=True):
+                    visual_features = self.extract_feat(batch_inputs)
+            else:
+                visual_features = self.extract_feat(batch_inputs)
+            visual_tokens = self.generate_textualized_visual_tokens(
+                visual_features, batch_data_samples)
+            visual_tokens = visual_tokens.split([
+                len(data_sample.gt_instances.labels)
+                for data_sample in batch_data_samples
+            ])
+
+            for data_sample, image_tokens in zip(batch_data_samples,
+                                                 visual_tokens):
+                labels = data_sample.gt_instances.labels
+                for class_index in range(num_classes):
+                    if len(tokens_by_class[class_index]) >= support_shots:
+                        continue
+                    matches = torch.nonzero(
+                        labels == class_index, as_tuple=False).flatten()
+                    if matches.numel() > 0:
+                        tokens_by_class[class_index].append(
+                            image_tokens[matches[0]].detach())
+
+        token_counts = [len(class_tokens) for class_tokens in tokens_by_class]
+        if any(count != support_shots for count in token_counts):
+            missing = {
+                str(class_names[index]): count
+                for index, count in enumerate(token_counts)
+                if count != support_shots
+            }
+            raise RuntimeError(
+                f'Support set does not provide {support_shots} images for '
+                f'every class. Collected counts: {missing}')
+
+        self._support_visual_tokens = torch.stack([
+            token for class_tokens in tokens_by_class for token in class_tokens
+        ])
+        self._support_visual_token_labels = torch.arange(
+            num_classes,
+            device=self._support_visual_tokens.device).repeat_interleave(
+                support_shots)
+        self._support_class_names = tuple(
+            clean_label_name(str(class_name)) for class_name in class_names)
 
     def to_plain_text_prompts(self, original_caption):
         caption_string = ''
@@ -551,13 +624,17 @@ class GroundingDINO(DINO):
                 for text_prompt, tokens_positive in zip(
                     text_prompts, tokens_positives)
             ]
-        token_positive_maps, text_prompts, _, entities = zip(
+        token_positive_maps, text_prompts, class_name_positive_maps, entities = zip(
             *_positive_maps_and_prompts)
 
         # image feature extraction
         visual_feats = self.extract_feat(batch_inputs)
 
         if isinstance(text_prompts[0], list):
+            if self.textualized_visual_token_generator is not None:
+                raise RuntimeError(
+                    'Support-token inference does not support chunked text '
+                    'prompts.')
             # chunked text prompts, only bs=1 is supported
             assert len(batch_inputs) == 1
             count = 0
@@ -592,7 +669,34 @@ class GroundingDINO(DINO):
             is_rec_tasks = [False] * len(results_list)
         else:
             # extract text feats
-            text_dict = self.language_model(list(text_prompts))
+            if self.textualized_visual_token_generator is not None:
+                if not self.has_support_token_cache:
+                    raise RuntimeError(
+                        'Support visual tokens must be cached before test.')
+                support_visual_tokens = []
+                support_positive_maps = []
+                for class_positive_map, entity in zip(
+                        class_name_positive_maps, entities):
+                    prompt_class_names = tuple(
+                        clean_label_name(str(class_name))
+                        for class_name in entity)
+                    if prompt_class_names != self._support_class_names:
+                        raise RuntimeError(
+                            'Support-set class order does not match the test '
+                            'prompt class order.')
+                    support_visual_tokens.append(
+                        self._support_visual_tokens)
+                    support_positive_maps.append(
+                        class_positive_map.to(
+                            self._support_visual_token_labels.device)[
+                                self._support_visual_token_labels])
+                text_dict = self.language_model(
+                    list(text_prompts),
+                    visual_tokens=support_visual_tokens,
+                    visual_token_positive_maps=support_positive_maps,
+                    class_name_positive_maps=class_name_positive_maps)
+            else:
+                text_dict = self.language_model(list(text_prompts))
             # text feature map layer
             if self.text_feat_map is not None:
                 text_dict['embedded'] = self.text_feat_map(

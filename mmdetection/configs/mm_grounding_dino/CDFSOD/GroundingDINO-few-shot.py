@@ -145,3 +145,9 @@ default_hooks = dict(
         interval=max_epochs))
 
 auto_scale_lr = dict(base_batch_size=16)
+custom_hooks = [
+    dict(
+        type='SupportTokenCacheHook',
+        support_dataloader=_base_.support_dataloader,
+        support_shots=_base_.support_shots)
+]
