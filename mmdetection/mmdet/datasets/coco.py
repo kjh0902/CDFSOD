@@ -155,9 +155,6 @@ class CocoDataset(BaseDetDataset):
                 instance['ignore_flag'] = 0
             instance['bbox'] = bbox
             instance['bbox_label'] = self.cat2label[ann['category_id']]
-            ann_id = ann.get('id', None)
-            if ann_id is not None:
-                instance['ann_id'] = int(ann_id)
 
             if ann.get('segmentation', None):
                 instance['mask'] = ann['segmentation']

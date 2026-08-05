@@ -305,13 +305,6 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         results['gt_bboxes_labels'] = np.array(
             gt_bboxes_labels, dtype=np.int64)
 
-    def _load_ann_ids(self, results: dict) -> None:
-        """Load annotation ids aligned with gt boxes and labels."""
-        gt_ann_ids = []
-        for instance in results.get('instances', []):
-            gt_ann_ids.append(instance.get('ann_id', -1))
-        results['gt_ann_ids'] = np.array(gt_ann_ids, dtype=np.int64)
-
     def _poly2mask(self, mask_ann: Union[list, dict], img_h: int,
                    img_w: int) -> np.ndarray:
         """Private function to convert masks represented with polygon to
@@ -450,9 +443,6 @@ class LoadAnnotations(MMCV_LoadAnnotations):
             self._load_bboxes(results)
         if self.with_label:
             self._load_labels(results)
-        if any('ann_id' in instance for instance in
-               results.get('instances', [])):
-            self._load_ann_ids(results)
         if self.with_mask:
             self._load_masks(results)
         if self.with_seg:
@@ -797,8 +787,7 @@ class FilterAnnotations(BaseTransform):
             if self.keep_empty:
                 return None
 
-        keys = ('gt_bboxes', 'gt_bboxes_labels', 'gt_ann_ids', 'gt_masks',
-                'gt_ignore_flags')
+        keys = ('gt_bboxes', 'gt_bboxes_labels', 'gt_masks', 'gt_ignore_flags')
         for key in keys:
             if key in results:
                 results[key] = results[key][keep]
