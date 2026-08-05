@@ -4,6 +4,7 @@
 구조입니다. 학습 중에는 매 iteration마다 고정 resize된 전체 support set의 모든 GT
 object token을 다시 생성합니다. 평가에서는 최종 checkpoint로 같은 token을 한 번
 생성해 캐시하고 모든 test image의 BERT 입력에 재사용합니다.
+textualizer, BERT, Grounding DINO를 포함한 전체 모델 파라미터가 함께 학습됩니다.
 
 ```bash
 bash run_all_training.sh NEU-DET 1 1

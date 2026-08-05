@@ -24,7 +24,7 @@ def test_textualized_visual_token_shape():
     assert tokens.shape == (2, 768)
 
 
-def test_textualizer_gradient_through_frozen_bert():
+def test_gradients_reach_textualizer_bert_and_detection_head():
     transformers = pytest.importorskip('transformers')
     generator = TextualizedVisualTokenGenerator()
     features = (
@@ -49,8 +49,6 @@ def test_textualizer_gradient_through_frozen_bert():
     encoder.model = transformers.BertModel(config, add_pooling_layer=False)
     encoder.language_dim = config.hidden_size
     encoder.num_layers_of_embedded = 1
-    encoder.requires_grad_(False)
-    encoder.eval()
 
     input_ids = torch.tensor([[1, 2]])
     word_embeddings = encoder.model.get_input_embeddings()(input_ids)
@@ -78,14 +76,15 @@ def test_textualizer_gradient_through_frozen_bert():
             attention_mask=attention_mask,
             position_ids=position_ids,
             token_type_ids=token_type_ids))['embedded']
-    frozen_detection_head = nn.Linear(768, 1)
-    frozen_detection_head.requires_grad_(False)
-    loss = frozen_detection_head(text_features[:, 0]).sum()
+    detection_head = nn.Linear(768, 1)
+    loss = detection_head(text_features[:, 0]).sum()
     loss.backward()
 
     assert generator.projection.weight.grad is not None
     assert torch.count_nonzero(generator.projection.weight.grad) > 0
-    assert all(parameter.grad is None for parameter in encoder.parameters())
-    assert all(
-        parameter.grad is None
-        for parameter in frozen_detection_head.parameters())
+    assert any(
+        parameter.grad is not None
+        and torch.count_nonzero(parameter.grad) > 0
+        for parameter in encoder.parameters())
+    assert detection_head.weight.grad is not None
+    assert torch.count_nonzero(detection_head.weight.grad) > 0

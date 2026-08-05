@@ -73,18 +73,9 @@ class GroundingDINO(DINO):
         self._support_class_names = None
         self.textualized_visual_token_generator = None
         if self.enable_textualized_visual_tokens:
-            for parameter in self.parameters():
-                parameter.requires_grad_(False)
             self.textualized_visual_token_generator = \
                 TextualizedVisualTokenGenerator()
-            self.language_model.eval()
-
-    def train(self, mode: bool = True):
-        """Keep frozen BERT in evaluation mode while training textualizer."""
-        super().train(mode)
-        if self.enable_textualized_visual_tokens:
-            self.language_model.eval()
-        return self
+            self.requires_grad_(True)
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""

@@ -2,7 +2,8 @@
 
 이 저장소는 CDFSOD few-shot detection을 위한 일반 Grounding DINO 학습 코드입니다.
 학습 시 매 iteration마다 고정 resize된 전체 support set의 모든 GT object에서 visual
-token을 다시 생성하고 detection loss로 textualizer를 학습합니다. Random flip/crop은
+token을 다시 생성하고 detection loss로 textualizer를 포함한 Grounding DINO와 BERT
+전체를 학습합니다. Random flip/crop은
 detection training image에만 적용됩니다. 평가 시에는 최종 checkpoint로 같은 support
 token을 한 번 생성해 캐시하고 모든 test image의 BERT 입력에 공통으로 재사용합니다.
 

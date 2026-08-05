@@ -115,12 +115,8 @@ model = dict(
 optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
-    constructor='TextualizerOptimizerConstructor',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
-    clip_grad=dict(max_norm=0.1, norm_type=2),
-    paramwise_cfg=dict(custom_keys={
-        'textualized_visual_token_generator': dict(lr_mult=1.0)
-    }))
+    clip_grad=dict(max_norm=0.1, norm_type=2))
 
 max_epochs = 30
 param_scheduler = [
