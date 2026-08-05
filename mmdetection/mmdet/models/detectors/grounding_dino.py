@@ -68,11 +68,18 @@ class GroundingDINO(DINO):
         super().__init__(*args, **kwargs)
         self.textualized_visual_token_generator = None
         if self.enable_textualized_visual_tokens:
+            for parameter in self.parameters():
+                parameter.requires_grad_(False)
             self.textualized_visual_token_generator = \
                 TextualizedVisualTokenGenerator()
-            # Tokens are diagnostic-only until a downstream loss consumes
-            # them. Freezing avoids changing optimization or DDP behavior.
-            self.textualized_visual_token_generator.requires_grad_(False)
+            self.language_model.eval()
+
+    def train(self, mode: bool = True):
+        """Keep frozen BERT in evaluation mode while training textualizer."""
+        super().train(mode)
+        if self.enable_textualized_visual_tokens:
+            self.language_model.eval()
+        return self
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -108,7 +115,7 @@ class GroundingDINO(DINO):
     def generate_textualized_visual_tokens(
             self, visual_features: Sequence[Tensor],
             batch_data_samples: SampleList) -> Tensor:
-        """Generate per-GT visual tokens without using them in detection."""
+        """Generate one visual token for every GT instance in the batch."""
         if self.textualized_visual_token_generator is None:
             raise RuntimeError('Textualized visual token generation is off.')
         gt_bboxes = [
@@ -420,6 +427,7 @@ class GroundingDINO(DINO):
                 for data_samples in batch_data_samples
             ]
             positive_maps = []
+            class_name_positive_maps = []
             for token_positive, text_prompt, gt_label in zip(
                     tokens_positive, text_prompts, gt_labels):
                 tokenized = self.language_model.tokenizer(
@@ -427,6 +435,9 @@ class GroundingDINO(DINO):
                     padding='max_length'
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt')
+                _, class_name_positive_map = self.get_positive_map(
+                    tokenized, token_positive)
+                class_name_positive_maps.append(class_name_positive_map)
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
@@ -437,6 +448,7 @@ class GroundingDINO(DINO):
         else:
             new_text_prompts = []
             positive_maps = []
+            class_name_positive_maps = []
             if len(set(text_prompts)) == 1:
                 # All the text prompts are the same,
                 # so there is no need to calculate them multiple times.
@@ -444,6 +456,11 @@ class GroundingDINO(DINO):
                     self.get_tokens_and_prompts(
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
+                _, class_name_positive_map = self.get_positive_map(
+                    tokenized, tokens_positive)
+                class_name_positive_maps = [
+                    class_name_positive_map
+                ] * len(batch_inputs)
                 for gt_label in gt_labels:
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -456,6 +473,10 @@ class GroundingDINO(DINO):
                     tokenized, caption_string, tokens_positive, _ = \
                         self.get_tokens_and_prompts(
                             text_prompt, True)
+                    _, class_name_positive_map = self.get_positive_map(
+                        tokenized, tokens_positive)
+                    class_name_positive_maps.append(
+                        class_name_positive_map)
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
@@ -464,7 +485,25 @@ class GroundingDINO(DINO):
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 
-        text_dict = self.language_model(new_text_prompts)
+        if self.use_autocast:
+            with autocast(enabled=True):
+                visual_features = self.extract_feat(batch_inputs)
+        else:
+            visual_features = self.extract_feat(batch_inputs)
+
+        if self.textualized_visual_token_generator is not None:
+            visual_tokens = self.generate_textualized_visual_tokens(
+                visual_features, batch_data_samples)
+            visual_tokens = visual_tokens.split(
+                [len(labels) for labels in gt_labels])
+            text_dict = self.language_model(
+                new_text_prompts,
+                visual_tokens=visual_tokens,
+                visual_token_positive_maps=positive_maps,
+                class_name_positive_maps=class_name_positive_maps)
+        else:
+            text_dict = self.language_model(new_text_prompts)
+
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
@@ -476,15 +515,7 @@ class GroundingDINO(DINO):
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
                     len(positive_map), 1)
-        if self.use_autocast:
-            with autocast(enabled=True):
-                visual_features = self.extract_feat(batch_inputs)
-        else:
-            visual_features = self.extract_feat(batch_inputs)
-        if self.textualized_visual_token_generator is not None:
-            with torch.no_grad():
-                self.generate_textualized_visual_tokens(
-                    visual_features, batch_data_samples)
+
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 

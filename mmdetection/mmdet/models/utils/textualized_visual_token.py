@@ -4,7 +4,6 @@ from typing import Sequence, Tuple
 import torch
 import torch.nn as nn
 from mmcv.ops import RoIAlign
-from mmengine.logging import MMLogger
 from torch import Tensor
 
 
@@ -15,8 +14,7 @@ class TextualizedVisualTokenGenerator(nn.Module):
                  featmap_strides: Sequence[int] = (8, 16, 32, 64),
                  output_size: Tuple[int, int] = (7, 7),
                  in_channels: int = 256,
-                 token_dim: int = 768,
-                 log_shapes: bool = True) -> None:
+                 token_dim: int = 768) -> None:
         super().__init__()
         if len(featmap_strides) != 4:
             raise ValueError('Exactly four feature strides are required.')
@@ -33,8 +31,6 @@ class TextualizedVisualTokenGenerator(nn.Module):
         self.pool_1x1 = nn.AdaptiveAvgPool2d((1, 1))
         self.pool_2x2 = nn.AdaptiveAvgPool2d((2, 2))
         self.projection = nn.Linear(in_channels * 5, token_dim)
-        self.log_shapes = log_shapes
-        self._shapes_logged = False
 
     def forward(self, features: Sequence[Tensor], rois: Tensor) -> Tensor:
         if len(features) != 4:
@@ -60,23 +56,4 @@ class TextualizedVisualTokenGenerator(nn.Module):
         flattened_2x2 = pooled_2x2.flatten(1)
         concatenated = torch.cat([flattened_1x1, flattened_2x2], dim=1)
         concatenated = concatenated.to(self.projection.weight.dtype)
-        tokens = self.projection(concatenated)
-
-        if self.log_shapes and not self._shapes_logged:
-            shapes = dict(
-                features=[tuple(feature.shape) for feature in features],
-                rois=tuple(rois.shape),
-                roi_features=[tuple(feature.shape) for feature in roi_features],
-                stacked=tuple(stacked.shape),
-                level_max=tuple(max_pooled.shape),
-                pooled_1x1=tuple(pooled_1x1.shape),
-                pooled_2x2=tuple(pooled_2x2.shape),
-                flattened_1x1=tuple(flattened_1x1.shape),
-                flattened_2x2=tuple(flattened_2x2.shape),
-                concatenated=tuple(concatenated.shape),
-                tokens=tuple(tokens.shape))
-            MMLogger.get_current_instance().info(
-                f'Textualized visual token shapes: {shapes}')
-            self._shapes_logged = True
-
-        return tokens
+        return self.projection(concatenated)
