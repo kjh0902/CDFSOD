@@ -2,7 +2,7 @@
 
 이 저장소는 CDFSOD few-shot detection을 위한 일반 Grounding DINO 학습 코드입니다.
 학습 시 textualizer가 GT RoI로 visual token을 생성하고 detection loss로 학습됩니다.
-평가 시에는 support set에서 클래스별 shot 수만큼 token을 한 번 생성해 캐시하고,
+평가 시에는 support set의 모든 GT object에서 token을 한 번 생성해 캐시하고,
 모든 test image의 class-name BERT 입력에 공통으로 재사용합니다.
 
 ## 데이터 구조
@@ -70,7 +70,6 @@ CDFSOD_DATA_ROOT=/other/datasets \
 cd mmdetection
 CDFSOD_DATASET=NEU-DET \
 CDFSOD_TRAIN_ANN=annotations/1_shot.json \
-CDFSOD_SHOT=1 \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
   work_dirs/NEU-DET_1shot/epoch_30.pth \

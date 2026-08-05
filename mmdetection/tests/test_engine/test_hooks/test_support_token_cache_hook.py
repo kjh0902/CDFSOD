@@ -1,20 +1,31 @@
 from types import SimpleNamespace
 
+from mmengine.runner import Runner
+
 from mmdet.engine.hooks import SupportTokenCacheHook
 
 
-def test_support_token_cache_hook_resolves_shots_from_work_dir():
-    hook = SupportTokenCacheHook(support_dataloader={})
-    runner = SimpleNamespace(
-        work_dir='/tmp/work_dirs/NEU-DET_5shot', _load_from=None)
+def test_support_token_cache_hook_builds_cache_once(monkeypatch):
+    support_dataloader = SimpleNamespace(
+        dataset=SimpleNamespace(metainfo={'classes': ('a', 'b')}))
+    monkeypatch.setattr(
+        Runner, 'build_dataloader', lambda dataloader, seed: support_dataloader)
 
-    assert hook._resolve_support_shots(runner) == 5
+    class Model:
+        has_support_token_cache = False
 
+        def __init__(self):
+            self.calls = []
 
-def test_support_token_cache_hook_prefers_configured_shots():
-    hook = SupportTokenCacheHook(
-        support_dataloader={}, support_shots=10)
-    runner = SimpleNamespace(
-        work_dir='/tmp/work_dirs/NEU-DET_1shot', _load_from=None)
+        def build_support_token_cache(self, dataloader, class_names):
+            self.calls.append((dataloader, class_names))
+            self.has_support_token_cache = True
 
-    assert hook._resolve_support_shots(runner) == 10
+    model = Model()
+    runner = SimpleNamespace(model=model, seed=42)
+    hook = SupportTokenCacheHook(support_dataloader={'dataset': {}})
+
+    hook.before_test(runner)
+    hook.before_test(runner)
+
+    assert model.calls == [(support_dataloader, ('a', 'b'))]

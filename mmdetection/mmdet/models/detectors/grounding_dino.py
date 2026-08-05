@@ -134,14 +134,11 @@ class GroundingDINO(DINO):
 
     @torch.no_grad()
     def build_support_token_cache(self, support_dataloader,
-                                  support_shots: int,
                                   class_names: Sequence[str]) -> None:
-        """Create a deterministic class-major cache from support images."""
+        """Cache every support-object token in deterministic class order."""
         if self.textualized_visual_token_generator is None:
             raise RuntimeError(
                 'Textualized visual token generation must be enabled.')
-        if support_shots <= 0:
-            raise ValueError('support_shots must be a positive integer.')
 
         self.eval()
         num_classes = len(class_names)
@@ -168,33 +165,35 @@ class GroundingDINO(DINO):
             for data_sample, image_tokens in zip(batch_data_samples,
                                                  visual_tokens):
                 labels = data_sample.gt_instances.labels
-                for class_index in range(num_classes):
-                    if len(tokens_by_class[class_index]) >= support_shots:
-                        continue
-                    matches = torch.nonzero(
-                        labels == class_index, as_tuple=False).flatten()
-                    if matches.numel() > 0:
-                        tokens_by_class[class_index].append(
-                            image_tokens[matches[0]].detach())
+                for label, token in zip(labels, image_tokens):
+                    class_index = int(label.item())
+                    if class_index < 0 or class_index >= num_classes:
+                        raise RuntimeError(
+                            f'Invalid support class index {class_index}.')
+                    tokens_by_class[class_index].append(token.detach())
 
         token_counts = [len(class_tokens) for class_tokens in tokens_by_class]
-        if any(count != support_shots for count in token_counts):
+        if any(count == 0 for count in token_counts):
             missing = {
                 str(class_names[index]): count
                 for index, count in enumerate(token_counts)
-                if count != support_shots
+                if count == 0
             }
             raise RuntimeError(
-                f'Support set does not provide {support_shots} images for '
-                f'every class. Collected counts: {missing}')
+                'Support set does not contain an object for every class. '
+                f'Collected counts: {missing}')
 
         self._support_visual_tokens = torch.stack([
             token for class_tokens in tokens_by_class for token in class_tokens
         ])
-        self._support_visual_token_labels = torch.arange(
-            num_classes,
-            device=self._support_visual_tokens.device).repeat_interleave(
-                support_shots)
+        self._support_visual_token_labels = torch.cat([
+            torch.full(
+                (count, ),
+                class_index,
+                dtype=torch.long,
+                device=self._support_visual_tokens.device)
+            for class_index, count in enumerate(token_counts)
+        ])
         self._support_class_names = tuple(
             clean_label_name(str(class_name)) for class_name in class_names)
 

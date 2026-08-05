@@ -37,7 +37,7 @@ def make_support_batch(labels, token_values):
     return dict(inputs=tokens, data_samples=[data_sample])
 
 
-def test_support_cache_is_class_major_and_one_token_per_image():
+def test_support_cache_contains_every_object_in_class_major_order():
     model = SupportCacheHarness()
     support_dataloader = [
         make_support_batch([1, 0, 0], [10, 20, 30]),
@@ -46,8 +46,8 @@ def test_support_cache_is_class_major_and_one_token_per_image():
     ]
 
     model.build_support_token_cache(
-        support_dataloader, support_shots=2, class_names=('a', 'b'))
+        support_dataloader, class_names=('a', 'b'))
 
-    assert model._support_visual_tokens[:, 0].tolist() == [20, 40, 10, 50]
-    assert model._support_visual_token_labels.tolist() == [0, 0, 1, 1]
+    assert model._support_visual_tokens[:, 0].tolist() == [20, 30, 40, 10, 50]
+    assert model._support_visual_token_labels.tolist() == [0, 0, 0, 1, 1]
     assert model._support_class_names == ('a', 'b')

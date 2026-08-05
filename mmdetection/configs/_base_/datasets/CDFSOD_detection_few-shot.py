@@ -1,5 +1,4 @@
 import os
-import re
 
 # Dataset settings for the compact CDFSOD GroundingDINO baseline.
 # Override with:
@@ -56,10 +55,6 @@ classes_by_dataset = {
 metainfo = dict(classes=classes_by_dataset[dataset_name])
 
 train_ann_file = os.getenv('CDFSOD_TRAIN_ANN', 'annotations/train.json')
-shot_match = re.search(r'(?<!\d)(\d+)_shot', train_ann_file)
-support_shots_value = os.getenv(
-    'CDFSOD_SHOT', shot_match.group(1) if shot_match is not None else '')
-support_shots = int(support_shots_value) if support_shots_value else None
 val_ann_file = 'annotations/test.json'
 test_ann_file = 'annotations/test.json'
 
