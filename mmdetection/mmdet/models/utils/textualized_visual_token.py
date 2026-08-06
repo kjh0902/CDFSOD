@@ -28,9 +28,8 @@ class TextualizedVisualTokenGenerator(nn.Module):
                 pool_mode='avg',
                 aligned=True) for stride in featmap_strides
         ])
-        self.pool_1x1 = nn.AdaptiveAvgPool2d((1, 1))
-        self.pool_2x2 = nn.AdaptiveAvgPool2d((2, 2))
-        self.projection = nn.Linear(in_channels * 5, token_dim)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.projection = nn.Linear(in_channels, token_dim)
 
     def forward(self, features: Sequence[Tensor], rois: Tensor) -> Tensor:
         if len(features) != 4:
@@ -47,13 +46,10 @@ class TextualizedVisualTokenGenerator(nn.Module):
             roi_align(feature, rois)
             for roi_align, feature in zip(self.roi_align_layers, features)
         ]
-        stacked = torch.stack(roi_features, dim=1)
-        max_pooled = stacked.max(dim=1).values
-
-        pooled_1x1 = self.pool_1x1(max_pooled)
-        pooled_2x2 = self.pool_2x2(max_pooled)
-        flattened_1x1 = pooled_1x1.flatten(1)
-        flattened_2x2 = pooled_2x2.flatten(1)
-        concatenated = torch.cat([flattened_1x1, flattened_2x2], dim=1)
-        concatenated = concatenated.to(self.projection.weight.dtype)
-        return self.projection(concatenated)
+        level_features = [
+            self.global_avg_pool(roi_feature).flatten(1)
+            for roi_feature in roi_features
+        ]
+        averaged = torch.stack(level_features, dim=0).mean(dim=0)
+        averaged = averaged.to(self.projection.weight.dtype)
+        return self.projection(averaged)

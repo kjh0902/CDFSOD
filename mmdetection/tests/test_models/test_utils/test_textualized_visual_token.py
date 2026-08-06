@@ -22,6 +22,24 @@ def test_textualized_visual_token_shape():
     tokens = generator(features, rois)
 
     assert tokens.shape == (2, 768)
+    assert generator.projection.in_features == 256
+
+
+def test_textualized_visual_token_averages_gap_across_levels():
+    generator = TextualizedVisualTokenGenerator(token_dim=256)
+    with torch.no_grad():
+        generator.projection.weight.copy_(torch.eye(256))
+        generator.projection.bias.zero_()
+
+    features = tuple(
+        torch.full((1, 256, size, size), float(level))
+        for level, size in zip((1, 2, 3, 4), (16, 8, 4, 2)))
+    rois = torch.tensor([[0, 32, 32, 96, 96]], dtype=torch.float32)
+
+    tokens = generator(features, rois)
+
+    assert tokens.shape == (1, 256)
+    assert torch.allclose(tokens, torch.full_like(tokens, 2.5))
 
 
 def test_gradients_reach_textualizer_bert_and_detection_head():
