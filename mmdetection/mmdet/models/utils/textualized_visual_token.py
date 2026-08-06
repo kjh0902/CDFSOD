@@ -29,11 +29,7 @@ class TextualizedVisualTokenGenerator(nn.Module):
                 aligned=True) for stride in featmap_strides
         ])
         self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.projection = nn.Sequential(
-            nn.Linear(in_channels, 512),
-            nn.GELU(),
-            nn.Linear(512, token_dim),
-        )
+        self.projection = nn.Linear(in_channels, token_dim)
 
     def forward(self, features: Sequence[Tensor], rois: Tensor) -> Tensor:
         if len(features) != 4:
@@ -53,5 +49,5 @@ class TextualizedVisualTokenGenerator(nn.Module):
         stacked = torch.stack(roi_features, dim=1)
         max_pooled = stacked.max(dim=1).values
         pooled = self.global_avg_pool(max_pooled).flatten(1)
-        pooled = pooled.to(self.projection[0].weight.dtype)
+        pooled = pooled.to(self.projection.weight.dtype)
         return self.projection(pooled)
