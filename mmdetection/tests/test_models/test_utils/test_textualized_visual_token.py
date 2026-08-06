@@ -22,7 +22,13 @@ def test_textualized_visual_token_shape():
     tokens = generator(features, rois)
 
     assert tokens.shape == (2, 768)
-    assert generator.projection.in_features == 256
+    assert isinstance(generator.projection[0], nn.Linear)
+    assert generator.projection[0].in_features == 256
+    assert generator.projection[0].out_features == 512
+    assert isinstance(generator.projection[1], nn.GELU)
+    assert isinstance(generator.projection[2], nn.Linear)
+    assert generator.projection[2].in_features == 512
+    assert generator.projection[2].out_features == 768
 
 
 def test_textualized_visual_token_max_pools_levels_before_gap():
@@ -36,10 +42,10 @@ def test_textualized_visual_token_max_pools_levels_before_gap():
         def forward(self, feature, rois):
             return self.roi_feature.expand(rois.size(0), -1, -1, -1)
 
-    generator = TextualizedVisualTokenGenerator(token_dim=256)
-    with torch.no_grad():
-        generator.projection.weight.copy_(torch.eye(256))
-        generator.projection.bias.zero_()
+    generator = TextualizedVisualTokenGenerator()
+    projection_inputs = []
+    hook = generator.projection.register_forward_pre_hook(
+        lambda module, inputs: projection_inputs.append(inputs[0].detach()))
 
     left_feature = torch.zeros(1, 256, 7, 7)
     left_feature[:, :, :, :4] = 1
@@ -57,9 +63,12 @@ def test_textualized_visual_token_max_pools_levels_before_gap():
     rois = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.float32)
 
     tokens = generator(features, rois)
+    hook.remove()
 
-    assert tokens.shape == (1, 256)
-    assert torch.allclose(tokens, torch.full_like(tokens, 10 / 7))
+    assert tokens.shape == (1, 768)
+    assert len(projection_inputs) == 1
+    assert torch.allclose(
+        projection_inputs[0], torch.full_like(projection_inputs[0], 10 / 7))
 
 
 def test_gradients_reach_textualizer_bert_and_detection_head():
@@ -118,8 +127,9 @@ def test_gradients_reach_textualizer_bert_and_detection_head():
     loss = detection_head(text_features[:, 0]).sum()
     loss.backward()
 
-    assert generator.projection.weight.grad is not None
-    assert torch.count_nonzero(generator.projection.weight.grad) > 0
+    for layer in (generator.projection[0], generator.projection[2]):
+        assert layer.weight.grad is not None
+        assert torch.count_nonzero(layer.weight.grad) > 0
     assert any(
         parameter.grad is not None
         and torch.count_nonzero(parameter.grad) > 0
