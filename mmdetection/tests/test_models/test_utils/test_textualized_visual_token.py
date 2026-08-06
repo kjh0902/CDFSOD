@@ -25,21 +25,41 @@ def test_textualized_visual_token_shape():
     assert generator.projection.in_features == 256
 
 
-def test_textualized_visual_token_averages_gap_across_levels():
+def test_textualized_visual_token_max_pools_levels_before_gap():
+
+    class FixedRoIAlign(nn.Module):
+
+        def __init__(self, roi_feature):
+            super().__init__()
+            self.register_buffer('roi_feature', roi_feature)
+
+        def forward(self, feature, rois):
+            return self.roi_feature.expand(rois.size(0), -1, -1, -1)
+
     generator = TextualizedVisualTokenGenerator(token_dim=256)
     with torch.no_grad():
         generator.projection.weight.copy_(torch.eye(256))
         generator.projection.bias.zero_()
 
-    features = tuple(
-        torch.full((1, 256, size, size), float(level))
-        for level, size in zip((1, 2, 3, 4), (16, 8, 4, 2)))
-    rois = torch.tensor([[0, 32, 32, 96, 96]], dtype=torch.float32)
+    left_feature = torch.zeros(1, 256, 7, 7)
+    left_feature[:, :, :, :4] = 1
+    right_feature = torch.zeros(1, 256, 7, 7)
+    right_feature[:, :, :, 4:] = 2
+    zero_feature = torch.zeros(1, 256, 7, 7)
+    generator.roi_align_layers = nn.ModuleList([
+        FixedRoIAlign(left_feature),
+        FixedRoIAlign(right_feature),
+        FixedRoIAlign(zero_feature),
+        FixedRoIAlign(zero_feature),
+    ])
+
+    features = tuple(torch.zeros(1, 256, 1, 1) for _ in range(4))
+    rois = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.float32)
 
     tokens = generator(features, rois)
 
     assert tokens.shape == (1, 256)
-    assert torch.allclose(tokens, torch.full_like(tokens, 2.5))
+    assert torch.allclose(tokens, torch.full_like(tokens, 10 / 7))
 
 
 def test_gradients_reach_textualizer_bert_and_detection_head():

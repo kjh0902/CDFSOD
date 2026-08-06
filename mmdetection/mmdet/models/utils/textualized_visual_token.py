@@ -46,10 +46,8 @@ class TextualizedVisualTokenGenerator(nn.Module):
             roi_align(feature, rois)
             for roi_align, feature in zip(self.roi_align_layers, features)
         ]
-        level_features = [
-            self.global_avg_pool(roi_feature).flatten(1)
-            for roi_feature in roi_features
-        ]
-        averaged = torch.stack(level_features, dim=0).mean(dim=0)
-        averaged = averaged.to(self.projection.weight.dtype)
-        return self.projection(averaged)
+        stacked = torch.stack(roi_features, dim=1)
+        max_pooled = stacked.max(dim=1).values
+        pooled = self.global_avg_pool(max_pooled).flatten(1)
+        pooled = pooled.to(self.projection.weight.dtype)
+        return self.projection(pooled)
