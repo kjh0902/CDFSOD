@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -36,7 +37,7 @@ class SupportCacheHarness(nn.Module):
 def make_support_batch(labels, token_values):
     labels = torch.tensor(labels, dtype=torch.long)
     tokens = torch.tensor(token_values, dtype=torch.float32).unsqueeze(-1)
-    tokens = tokens.repeat(1, 768)
+    tokens = tokens.repeat(1, 256)
     data_sample = SimpleNamespace(
         gt_instances=SimpleNamespace(labels=labels))
     return dict(inputs=tokens, data_samples=[data_sample])
@@ -88,3 +89,71 @@ def test_training_support_tokens_are_regenerated_every_call():
     assert second_tokens[:, 0].tolist() == [10, 20]
     assert first_labels.tolist() == [0, 1]
     assert second_labels.tolist() == [0, 1]
+
+
+class VisualTokenAppendHarness:
+    _append_support_visual_tokens = \
+        GroundingDINO._append_support_visual_tokens
+
+    def __init__(self, max_text_len=8):
+        self.embed_dims = 256
+        self.bbox_head = SimpleNamespace(max_text_len=max_text_len)
+
+
+def make_text_dict():
+    return dict(
+        embedded=torch.zeros(2, 3, 256),
+        text_token_mask=torch.tensor([
+            [True, True, True],
+            [True, True, False],
+        ]),
+        position_ids=torch.tensor([
+            [0, 1, 2],
+            [0, 1, 0],
+        ]),
+        masks=torch.tensor([
+            [[True, False, False],
+             [False, True, True],
+             [False, True, True]],
+            [[True, False, False],
+             [False, True, False],
+             [False, False, True]],
+        ]))
+
+
+def test_support_visual_tokens_are_appended_after_text_projection():
+    model = VisualTokenAppendHarness()
+    text_dict = make_text_dict()
+    original_text_masks = text_dict['masks'].clone()
+    support_visual_tokens = torch.randn(2, 256, requires_grad=True)
+
+    output = model._append_support_visual_tokens(
+        text_dict, support_visual_tokens)
+
+    assert output['embedded'].shape == (2, 5, 256)
+    assert torch.equal(
+        output['embedded'][:, 3:],
+        support_visual_tokens.detach().unsqueeze(0).expand(2, -1, -1))
+    assert output['text_token_mask'].tolist() == [
+        [True, True, True, True, True],
+        [True, True, False, True, True],
+    ]
+    assert output['position_ids'].tolist() == [
+        [0, 1, 2, 3, 4],
+        [0, 1, 0, 3, 4],
+    ]
+    assert torch.equal(output['masks'][:, :3, :3], original_text_masks)
+    assert output['masks'][0, 3:, :].all()
+    assert not output['masks'][1, 2, 3:].any()
+    assert not output['masks'][1, 3:, 2].any()
+
+    output['embedded'][:, 3:].sum().backward()
+    assert support_visual_tokens.grad is not None
+
+
+def test_support_visual_tokens_must_fit_detection_text_length():
+    model = VisualTokenAppendHarness(max_text_len=4)
+
+    with pytest.raises(ValueError, match='supports only 4'):
+        model._append_support_visual_tokens(
+            make_text_dict(), torch.randn(2, 256))

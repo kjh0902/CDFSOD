@@ -121,6 +121,68 @@ class GroundingDINO(DINO):
         rois = bbox2roi(gt_bboxes)
         return self.textualized_visual_token_generator(visual_features, rois)
 
+    def _append_support_visual_tokens(self, text_dict: Dict,
+                                      support_visual_tokens: Tensor) -> Dict:
+        """Append object-level support tokens after the text projection."""
+        text_features = text_dict['embedded']
+        if text_features.ndim != 3 or \
+                text_features.size(-1) != self.embed_dims:
+            raise ValueError(
+                'Projected text features must have shape '
+                f'[B, L, {self.embed_dims}].')
+        if support_visual_tokens.ndim != 2 or \
+                support_visual_tokens.size(-1) != self.embed_dims:
+            raise ValueError(
+                'Support visual tokens must have shape '
+                f'[N, {self.embed_dims}].')
+        if support_visual_tokens.size(0) == 0:
+            return text_dict
+
+        batch_size, text_length, _ = text_features.shape
+        num_visual_tokens = support_visual_tokens.size(0)
+        total_length = text_length + num_visual_tokens
+        if total_length > self.bbox_head.max_text_len:
+            raise ValueError(
+                f'Text ({text_length}) and support visual tokens '
+                f'({num_visual_tokens}) require {total_length} sequence '
+                f'positions, but the detection head supports only '
+                f'{self.bbox_head.max_text_len}.')
+
+        support_visual_tokens = support_visual_tokens.to(
+            device=text_features.device, dtype=text_features.dtype)
+        batched_visual_tokens = support_visual_tokens.unsqueeze(0).expand(
+            batch_size, -1, -1)
+        text_dict['embedded'] = torch.cat(
+            [text_features, batched_visual_tokens], dim=1)
+
+        text_token_mask = text_dict['text_token_mask'].bool()
+        visual_token_mask = text_token_mask.new_ones(
+            (batch_size, num_visual_tokens))
+        text_dict['text_token_mask'] = torch.cat(
+            [text_token_mask, visual_token_mask], dim=1)
+
+        position_ids = text_dict['position_ids']
+        visual_position_ids = torch.arange(
+            text_length,
+            total_length,
+            device=position_ids.device,
+            dtype=position_ids.dtype).unsqueeze(0).expand(batch_size, -1)
+        text_dict['position_ids'] = torch.cat(
+            [position_ids, visual_position_ids], dim=1)
+
+        text_self_attention_masks = text_dict['masks'].bool()
+        expanded_attention_masks = text_self_attention_masks.new_zeros(
+            (batch_size, total_length, total_length))
+        expanded_attention_masks[:, :text_length, :text_length] = \
+            text_self_attention_masks
+        expanded_attention_masks[:, :text_length, text_length:] = \
+            text_token_mask.unsqueeze(-1)
+        expanded_attention_masks[:, text_length:, :text_length] = \
+            text_token_mask.unsqueeze(1)
+        expanded_attention_masks[:, text_length:, text_length:] = True
+        text_dict['masks'] = expanded_attention_masks
+        return text_dict
+
     @property
     def has_support_token_cache(self) -> bool:
         return self._support_visual_tokens is not None
@@ -580,8 +642,9 @@ class GroundingDINO(DINO):
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 
+        support_visual_tokens = None
         if self.textualized_visual_token_generator is not None:
-            support_visual_tokens, support_labels, support_class_names = \
+            support_visual_tokens, _, support_class_names = \
                 self.generate_training_support_tokens()
             for text_prompt, class_positive_map in zip(
                     text_prompts, class_name_positive_maps):
@@ -597,20 +660,13 @@ class GroundingDINO(DINO):
                     raise RuntimeError(
                         'Support-set class count does not match the training '
                         'prompt class count.')
-            support_positive_maps = [
-                class_positive_map.to(support_labels.device)[support_labels]
-                for class_positive_map in class_name_positive_maps
-            ]
-            text_dict = self.language_model(
-                new_text_prompts,
-                visual_tokens=[support_visual_tokens] * len(batch_inputs),
-                visual_token_positive_maps=support_positive_maps,
-                class_name_positive_maps=class_name_positive_maps)
-        else:
-            text_dict = self.language_model(new_text_prompts)
+        text_dict = self.language_model(new_text_prompts)
 
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        if support_visual_tokens is not None:
+            text_dict = self._append_support_visual_tokens(
+                text_dict, support_visual_tokens)
 
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
@@ -707,12 +763,11 @@ class GroundingDINO(DINO):
             is_rec_tasks = [False] * len(results_list)
         else:
             # extract text feats
+            support_visual_tokens = None
             if self.textualized_visual_token_generator is not None:
                 if not self.has_support_token_cache:
                     raise RuntimeError(
                         'Support visual tokens must be cached before test.')
-                support_visual_tokens = []
-                support_positive_maps = []
                 for class_positive_map, entity in zip(
                         class_name_positive_maps, entities):
                     prompt_class_names = tuple(
@@ -722,23 +777,15 @@ class GroundingDINO(DINO):
                         raise RuntimeError(
                             'Support-set class order does not match the test '
                             'prompt class order.')
-                    support_visual_tokens.append(
-                        self._support_visual_tokens)
-                    support_positive_maps.append(
-                        class_positive_map.to(
-                            self._support_visual_token_labels.device)[
-                                self._support_visual_token_labels])
-                text_dict = self.language_model(
-                    list(text_prompts),
-                    visual_tokens=support_visual_tokens,
-                    visual_token_positive_maps=support_positive_maps,
-                    class_name_positive_maps=class_name_positive_maps)
-            else:
-                text_dict = self.language_model(list(text_prompts))
+                support_visual_tokens = self._support_visual_tokens
+            text_dict = self.language_model(list(text_prompts))
             # text feature map layer
             if self.text_feat_map is not None:
                 text_dict['embedded'] = self.text_feat_map(
                     text_dict['embedded'])
+            if support_visual_tokens is not None:
+                text_dict = self._append_support_visual_tokens(
+                    text_dict, support_visual_tokens)
 
             is_rec_tasks = []
             for i, data_samples in enumerate(batch_data_samples):

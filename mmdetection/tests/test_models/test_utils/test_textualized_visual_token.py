@@ -1,8 +1,6 @@
-import pytest
 import torch
 import torch.nn as nn
 
-from mmdet.models.language_models.bert import BertEncoder
 from mmdet.models.utils import TextualizedVisualTokenGenerator
 
 
@@ -21,8 +19,8 @@ def test_textualized_visual_token_shape():
 
     tokens = generator(features, rois)
 
-    assert tokens.shape == (2, 768)
-    assert generator.projection.in_features == 256
+    assert tokens.shape == (2, 256)
+    assert sum(parameter.numel() for parameter in generator.parameters()) == 0
 
 
 def test_textualized_visual_token_max_pools_levels_before_gap():
@@ -36,10 +34,7 @@ def test_textualized_visual_token_max_pools_levels_before_gap():
         def forward(self, feature, rois):
             return self.roi_feature.expand(rois.size(0), -1, -1, -1)
 
-    generator = TextualizedVisualTokenGenerator(token_dim=256)
-    with torch.no_grad():
-        generator.projection.weight.copy_(torch.eye(256))
-        generator.projection.bias.zero_()
+    generator = TextualizedVisualTokenGenerator()
 
     left_feature = torch.zeros(1, 256, 7, 7)
     left_feature[:, :, :, :4] = 1
@@ -62,67 +57,20 @@ def test_textualized_visual_token_max_pools_levels_before_gap():
     assert torch.allclose(tokens, torch.full_like(tokens, 10 / 7))
 
 
-def test_gradients_reach_textualizer_bert_and_detection_head():
-    transformers = pytest.importorskip('transformers')
+def test_gradients_pass_through_parameter_free_textualizer():
     generator = TextualizedVisualTokenGenerator()
     features = (
-        torch.randn(1, 256, 16, 16),
-        torch.randn(1, 256, 8, 8),
-        torch.randn(1, 256, 4, 4),
-        torch.randn(1, 256, 2, 2),
+        torch.randn(1, 256, 16, 16, requires_grad=True),
+        torch.randn(1, 256, 8, 8, requires_grad=True),
+        torch.randn(1, 256, 4, 4, requires_grad=True),
+        torch.randn(1, 256, 2, 2, requires_grad=True),
     )
     rois = torch.tensor([[0, 8, 8, 96, 96]], dtype=torch.float32)
     visual_token = generator(features, rois)
-
-    config = transformers.BertConfig(
-        vocab_size=32,
-        hidden_size=768,
-        num_hidden_layers=1,
-        num_attention_heads=12,
-        intermediate_size=128,
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0)
-    encoder = BertEncoder.__new__(BertEncoder)
-    nn.Module.__init__(encoder)
-    encoder.model = transformers.BertModel(config, add_pooling_layer=False)
-    encoder.language_dim = config.hidden_size
-    encoder.num_layers_of_embedded = 1
-
-    input_ids = torch.tensor([[1, 2]])
-    word_embeddings = encoder.model.get_input_embeddings()(input_ids)
-    inputs_embeds = torch.cat(
-        [word_embeddings, visual_token.unsqueeze(0)], dim=1)
-    position_ids = torch.arange(3).unsqueeze(0)
-    token_type_ids = torch.zeros_like(position_ids)
-    attention_mask = torch.ones((1, 3, 3), dtype=torch.bool)
-
-    embeddings = encoder.model.embeddings
-    expected_visual_embedding = embeddings.LayerNorm(
-        inputs_embeds[:, -1] + embeddings.position_embeddings(
-            position_ids[:, -1]) + embeddings.token_type_embeddings(
-                token_type_ids[:, -1]))
-    actual_embeddings = embeddings(
-        inputs_embeds=inputs_embeds,
-        position_ids=position_ids,
-        token_type_ids=token_type_ids)
-    assert torch.allclose(
-        actual_embeddings[:, -1], expected_visual_embedding, atol=1e-6)
-
-    text_features = encoder(
-        dict(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            token_type_ids=token_type_ids))['embedded']
-    detection_head = nn.Linear(768, 1)
-    loss = detection_head(text_features[:, 0]).sum()
+    detection_head = nn.Linear(256, 1)
+    loss = detection_head(visual_token).sum()
     loss.backward()
 
-    assert generator.projection.weight.grad is not None
-    assert torch.count_nonzero(generator.projection.weight.grad) > 0
-    assert any(
-        parameter.grad is not None
-        and torch.count_nonzero(parameter.grad) > 0
-        for parameter in encoder.parameters())
+    assert any(feature.grad is not None for feature in features)
     assert detection_head.weight.grad is not None
     assert torch.count_nonzero(detection_head.weight.grad) > 0
