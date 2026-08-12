@@ -48,6 +48,17 @@ class COCO(_COCO):
     def load_imgs(self, ids):
         return self.loadImgs(ids)
 
+    def loadRes(self, res_file):
+        """Load detection results from COCO-format predictions.
+
+        ``info`` is optional in COCO annotations, but pycocotools 2.0.10
+        unconditionally copies it while loading results.  CD-FSOD annotation
+        files omit this metadata, so provide an empty value for compatibility
+        without changing any images, annotations, or categories.
+        """
+        self.dataset.setdefault('info', {})
+        return super().loadRes(res_file)
+
 
 # just for the ease of import
 COCOeval = _COCOeval
