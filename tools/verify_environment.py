@@ -3,12 +3,14 @@
 
 import os
 import sys
+from importlib.metadata import version
 
 import mmcv
 import mmengine
 import mmdet
 import torch
 import torchvision
+from fairscale.nn.checkpoint import checkpoint_wrapper
 from mmcv.ops import get_compiler_version, get_compiling_cuda_version, nms
 
 
@@ -24,6 +26,8 @@ require(torchvision.__version__.startswith("0.22.1+cu128"),
 require(mmengine.__version__ == "0.10.7", f"Unexpected MMEngine: {mmengine.__version__}")
 require(mmcv.__version__.startswith("2.2.0"), f"Unexpected MMCV: {mmcv.__version__}")
 require(mmdet.__version__ == "3.3.0", f"Unexpected vendored MMDetection: {mmdet.__version__}")
+require(version("fairscale") == "0.4.13", f"Unexpected FairScale: {version('fairscale')}")
+require(callable(checkpoint_wrapper), "FairScale checkpoint_wrapper is unavailable")
 require(torch.cuda.is_available(), "torch.cuda.is_available() is false")
 require(torch.cuda.device_count() == 1,
         "Expose exactly one GPU with CUDA_VISIBLE_DEVICES=0 when running this check")
@@ -51,6 +55,7 @@ print(f"Python: {sys.version.split()[0]}")
 print(f"PyTorch: {torch.__version__}; torchvision: {torchvision.__version__}")
 print(f"MMEngine: {mmengine.__version__}; MMCV: {mmcv.__version__}")
 print(f"Vendored MMDetection: {mmdet.__version__}")
+print(f"FairScale: {version('fairscale')}")
 print(f"MMCV compiler: {get_compiler_version()}; CUDA: {get_compiling_cuda_version()}")
 print(f"GPU: {name}; capability: {capability}; visible: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
 print("[OK] PyTorch and MMCV CUDA operations passed on GPU 0")

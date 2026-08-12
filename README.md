@@ -17,6 +17,7 @@ method는 변경하지 않았으며, CUDA/PyTorch/MMCV 호환성, GPU 지정, �
 | CUDA build toolkit | 12.8 (conda 환경 내부) |
 | MMEngine | 0.10.7 |
 | MMCV | 2.2.0 소스 빌드, commit `a8073c74bf83d62ec36a103f835faa4837fb6585` |
+| FairScale | 0.4.13 |
 
 `nvidia-smi`의 `CUDA Version: 13.2`는 드라이버가 지원하는 최대 CUDA 버전이다. 이
 프로젝트는 RTX 5090용 코드가 포함된 공식 `cu128` PyTorch wheel과 동일한 CUDA 12.8
@@ -43,6 +44,7 @@ bash scripts/install_rtx5090.sh
 - PyTorch가 RTX 5090과 `sm_120`을 인식하는지
 - GPU 0에서 CUDA matmul/backward가 동작하는지
 - 직접 빌드한 MMCV CUDA NMS가 GPU 0에서 동작하는지
+- FairScale activation checkpointing을 import할 수 있는지
 - Python/PyTorch/torchvision/MMEngine/MMCV 버전이 고정값과 일치하는지
 
 설치 후 다시 확인하려면 다음을 실행한다.
@@ -71,6 +73,10 @@ data/cdfsod/
 
 데이터는 [CD-FSOD benchmark](https://github.com/lovelyqian/CDFSOD-benchmark)에서
 준비한다. Swin-B 사전학습 checkpoint를 내려받는다.
+
+아래 URL과 같이 출처를 신뢰할 수 있는 checkpoint만 사용한다. PyTorch 2.6 이상에서는
+MMEngine checkpoint의 학습 이력 메타데이터를 읽기 위해 제한되지 않은 pickle loader가
+필요하며, 이 저장소의 `tools/train.py`와 `tools/test.py`가 해당 호환 설정을 자동 적용한다.
 
 ```bash
 mkdir -p checkpoints
@@ -154,6 +160,12 @@ python analyze_results_rf100.py exp_rf100vlfsod_results
   환경이다. 환경을 삭제하고 `environment.yml`부터 다시 만든다.
 - `No module named mmcv._ext`: `mmcv-lite` 또는 다른 PyTorch ABI용 MMCV가 설치된
   상태다. `scripts/install_rtx5090.sh`로 CUDA ops를 다시 빌드한다.
+- `please install fairscale`: 이전 requirements에 activation checkpointing 의존성이
+  누락된 경우다. 최신 코드를 받은 뒤 `python -m pip install -r requirements.txt`를 실행한다.
+- `Weights only load failed` 또는 `HistoryBuffer was not an allowed global`: PyTorch 2.6+
+  호환 처리가 포함되지 않은 이전 코드다. 최신 `tools/train.py`/`tools/test.py`를 사용한다.
+  다른 진입점을 직접 사용해야 하고 checkpoint 출처를 신뢰한다면
+  `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`을 지정한다.
 - MMCV 빌드 OOM: `MAX_JOBS=1 bash scripts/install_rtx5090.sh`로 재실행한다.
 - `Address already in use`: 실행 명령의 `PORT`를 사용하지 않는 값으로 바꾼다.
 - CUDA OOM: 논문 config의 batch size나 모델 구조를 임의 변경하기 전에 다른 GPU

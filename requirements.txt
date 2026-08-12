@@ -5,6 +5,7 @@
 # - MMCV must be compiled for the active torch ABI and RTX 5090 (sm_120).
 
 addict==2.4.0
+fairscale==0.4.13
 matplotlib==3.10.8
 nltk==3.9.2
 numpy==1.26.4

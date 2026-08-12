@@ -5,6 +5,11 @@ import os.path as osp
 import warnings
 from copy import deepcopy
 
+# PyTorch 2.6+ defaults torch.load() to weights_only=True, while the trusted
+# MMEngine checkpoints used by this project contain HistoryBuffer metadata.
+# Restore the legacy loader only for call sites that do not choose explicitly.
+os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+
 from mmengine import ConfigDict
 from mmengine.config import Config, DictAction
 from mmengine.runner import Runner
