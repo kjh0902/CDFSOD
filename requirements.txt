@@ -1,35 +1,28 @@
-# Python dependencies that are safe to install before building MMCV.
+# Runtime dependencies for the vendored MMDetection 3.3.0 code.
 #
-# Do not put torch, torchvision, mmcv, or -e ./mmdetection here.
-# Install order:
-#   1. torch/torchvision CUDA wheel
-#   2. this file
-#   3. mmcv source build against the installed torch
-#   4. ./mmdetection editable install with --no-build-isolation
+# PyTorch and MMCV are intentionally installed by scripts/install_rtx5090.sh:
+# - torch/torchvision must come from the official CUDA 12.8 wheel index.
+# - MMCV must be compiled for the active torch ABI and RTX 5090 (sm_120).
 
-setuptools==80.9.0
-wheel==0.45.1
-mmengine==0.10.7
-
+addict==2.4.0
+matplotlib==3.10.8
+nltk==3.9.2
 numpy==1.26.4
-opencv-python==4.11.0.86
-pycocotools==2.0.8
-scipy==1.13.1
-shapely==2.0.7
-matplotlib==3.9.4
-pillow==11.2.1
-terminaltables==3.1.10
-tqdm==4.67.1
-PyYAML==6.0.2
+opencv-python-headless==4.11.0.86
 packaging==25.0
+pillow==11.3.0
+pycocotools==2.0.10
+pyyaml==6.0.2
+rich==14.2.0
+scipy==1.15.3
+sentencepiece==0.2.0
+shapely==2.1.2
+six==1.17.0
+termcolor==3.2.0
+terminaltables==3.1.10
+transformers==4.57.1
+yapf==0.43.0
 
-transformers==4.46.3
-tokenizers==0.20.3
-huggingface-hub==0.30.2
-safetensors==0.5.3
-regex==2024.11.6
-requests==2.32.3
-ftfy==6.3.1
-nltk==3.9.1
-
-yapf==0.40.2
+# MMEngine 0.10.7 is installed with --no-deps by install_rtx5090.sh after
+# this file so that its opencv-python dependency does not replace the
+# headless server build above.

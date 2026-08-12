@@ -1,0 +1,12 @@
+name: ft-fsod
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - cuda-nvcc=12.8
+  - cuda-toolkit=12.8
+  - ninja
+  - git
+  - cxx-compiler
