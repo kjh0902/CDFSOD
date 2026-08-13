@@ -4,15 +4,24 @@ _base_ = [
     '../../_base_/default_runtime.py',
 ]
 
+import os
+
 lang_model_name = 'bert-base-uncased'
 num_classes = len(_base_.metainfo['classes'])
+support_caption_file = _base_.instance_caption_file
+if not os.path.isabs(support_caption_file):
+    support_caption_file = os.path.join(_base_.data_root,
+                                        support_caption_file)
 
 model = dict(
     type='GroundingDINO',
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
-    enable_textualized_visual_tokens=True,
+    use_class_name_token_prototypes=_base_.use_class_name_token_prototypes,
+    support_caption_file=support_caption_file,
+    support_class_names=_base_.metainfo['classes'],
+    support_domain_attribute=_base_.domain_attribute,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -116,7 +125,11 @@ optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
-    clip_grad=dict(max_norm=0.1, norm_type=2))
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    paramwise_cfg=dict(custom_keys={
+        'absolute_pos_embed': dict(decay_mult=0.),
+        'backbone': dict(lr_mult=0.1)
+    }))
 
 max_epochs = 30
 param_scheduler = [
@@ -141,8 +154,3 @@ default_hooks = dict(
         interval=max_epochs))
 
 auto_scale_lr = dict(base_batch_size=16)
-custom_hooks = [
-    dict(
-        type='SupportTokenCacheHook',
-        support_dataloader=_base_.support_dataloader)
-]

@@ -117,6 +117,9 @@ docs/modelzoo_statistics.md
 mmdet/.mim
 work_dirs/
 
+# Local home-style cache accidentally created when '~' is not expanded.
+~/
+
 # Pytorch
 *.pth
 *.py~

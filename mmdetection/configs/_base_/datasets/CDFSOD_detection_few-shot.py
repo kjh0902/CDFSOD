@@ -5,6 +5,8 @@ import os
 #   CDFSOD_DATA_ROOT=/path/to/datasets
 #   CDFSOD_DATASET=NEU-DET
 #   CDFSOD_TRAIN_ANN=annotations/1_shot.json
+#   CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json
+#   CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1
 
 dataset_type = 'CocoDataset'
 datasets_root = os.getenv(
@@ -54,9 +56,23 @@ classes_by_dataset = {
 
 metainfo = dict(classes=classes_by_dataset[dataset_name])
 
+domain_attributes_by_dataset = {
+    'NEU-DET': 'industrial steel surface defect image',
+    'clipart1k': 'clipart style object image',
+    'UODD': 'underwater object detection image',
+}
+
 train_ann_file = os.getenv('CDFSOD_TRAIN_ANN', 'annotations/train.json')
 val_ann_file = 'annotations/test.json'
 test_ann_file = 'annotations/test.json'
+default_caption_file = train_ann_file.rsplit('.', 1)[0] + '_captions.json'
+instance_caption_file = os.getenv('CDFSOD_CAPTION_FILE',
+                                  default_caption_file)
+use_class_name_token_prototypes = os.getenv(
+    'CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES', '1') != '0'
+domain_attribute = os.getenv(
+    'CDFSOD_DOMAIN_ATTRIBUTE',
+    domain_attributes_by_dataset[dataset_name])
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=backend_args),
@@ -110,16 +126,6 @@ test_pipeline = [
                    'scale_factor', 'text', 'custom_entities'))
 ]
 
-support_pipeline = [
-    dict(type='LoadImageFromFile', backend_args=backend_args),
-    dict(type='FixScaleResize', scale=(800, 1333), keep_ratio=True),
-    dict(type='LoadAnnotations', with_bbox=True),
-    dict(
-        type='PackDetInputs',
-        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
-                   'scale_factor', 'text', 'custom_entities'))
-]
-
 train_dataloader = dict(
     batch_size=2,
     num_workers=4,
@@ -134,22 +140,6 @@ train_dataloader = dict(
         metainfo=metainfo,
         pipeline=train_pipeline,
         filter_cfg=dict(filter_empty_gt=False),
-        return_classes=True))
-
-support_dataloader = dict(
-    batch_size=1,
-    num_workers=2,
-    persistent_workers=True,
-    drop_last=False,
-    sampler=dict(type='SupportSampler', shuffle=False),
-    dataset=dict(
-        type=dataset_type,
-        data_root=data_root,
-        ann_file=train_ann_file,
-        data_prefix=dict(img='train/'),
-        test_mode=True,
-        metainfo=metainfo,
-        pipeline=support_pipeline,
         return_classes=True))
 
 val_dataloader = dict(
