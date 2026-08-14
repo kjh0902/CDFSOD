@@ -286,6 +286,18 @@ class GroundingDINO(DINO):
             self._find_class_name_token_positions(
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
+        self.support_class_token_counts = []
+        for class_idx, class_name in enumerate(self.support_class_names):
+            token_counts = {
+                len(self.support_prompt_class_token_positions[prompt_idx])
+                for prompt_idx, prompt_class_idx in enumerate(prompt_labels)
+                if prompt_class_idx == class_idx
+            }
+            if len(token_counts) != 1:
+                raise RuntimeError(
+                    f'Inconsistent class-name token counts for class '
+                    f'{class_name}: {sorted(token_counts)}')
+            self.support_class_token_counts.append(token_counts.pop())
 
     def _format_support_prompt(self, class_name: str,
                                caption: str) -> Tuple[str, Tuple[int, int]]:
@@ -374,7 +386,7 @@ class GroundingDINO(DINO):
         return selected_features, selected_labels
 
     def compute_class_text_prototypes(self):
-        """Average selected class-name token features into class prototypes."""
+        """Average class-name token features over support captions only."""
         token_features, token_labels = self.compute_support_class_token_features()
         prototypes = []
         for class_idx in range(len(self.support_class_names)):
@@ -383,13 +395,17 @@ class GroundingDINO(DINO):
                 raise RuntimeError(
                     f'No support class-name tokens for class '
                     f'{self.support_class_names[class_idx]}')
-            prototypes.append(token_features[class_mask].mean(dim=0))
-        prototypes = torch.stack(prototypes, dim=0)
+            token_count = self.support_class_token_counts[class_idx]
+            class_features = token_features[class_mask]
+            class_features = class_features.reshape(
+                -1, token_count, class_features.size(-1))
+            prototypes.append(class_features.mean(dim=0))
+        prototypes = torch.cat(prototypes, dim=0)
 
         return prototypes
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from class-name-token averaged prototypes."""
+        """Build text_dict while preserving class-name subword tokens."""
         if (not self.training and self._cached_eval_support_prototype_text_dict
                 is not None):
             cached = self._cached_eval_support_prototype_text_dict
@@ -434,24 +450,35 @@ class GroundingDINO(DINO):
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Create positive maps from classes to class prototype positions."""
+        """Create positive maps from classes to all their token positions."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
+        class_token_starts = []
+        token_start = 0
+        for token_count in self.support_class_token_counts:
+            class_token_starts.append(token_start)
+            token_start += token_count
         positive_maps = []
         for labels in gt_labels:
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                positive_map[row_idx, label] = 1.0
+                token_start = class_token_starts[label]
+                token_end = token_start + self.support_class_token_counts[label]
+                positive_map[row_idx, token_start:token_end] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to class prototype positions."""
-        return {
-            class_idx + 1: [class_idx]
-            for class_idx in range(len(self.support_class_names))
-        }
+        """Map 1-based class ids to all class prototype token positions."""
+        token_positive_map = {}
+        token_start = 0
+        for class_idx, token_count in enumerate(
+                self.support_class_token_counts):
+            token_positive_map[class_idx + 1] = list(
+                range(token_start, token_start + token_count))
+            token_start += token_count
+        return token_positive_map
 
     def get_tokens_positive_and_prompts(
         self,
