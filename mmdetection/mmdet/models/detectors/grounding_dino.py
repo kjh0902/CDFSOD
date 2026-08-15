@@ -287,15 +287,15 @@ class GroundingDINO(DINO):
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
 
-    def _format_support_prompt(self, class_name: str,
-                               caption: str) -> Tuple[str, Tuple[int, int]]:
+    def _format_support_prompt(
+            self, class_name: str,
+            visual_description: str) -> Tuple[str, Tuple[int, int]]:
         clean_class_name = clean_label_name(class_name).strip()
-        parts = [clean_class_name]
-        if caption:
-            parts.append(caption.strip().rstrip('.'))
-        if self.support_domain_attribute:
-            parts.append(self.support_domain_attribute.strip().rstrip('.'))
-        prompt = ', '.join(parts) + '.'
+        if visual_description:
+            description = visual_description.strip().rstrip('.')
+            prompt = f'{clean_class_name}: {description}.'
+        else:
+            prompt = clean_class_name + '.'
         return prompt, (0, len(clean_class_name))
 
     def _tokenize_support_prompts(self, prompts: Sequence[str]) -> dict:
