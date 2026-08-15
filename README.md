@@ -1,9 +1,9 @@
 # CDFSOD Grounding DINO class-name token prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 support image의 instance caption과 domain attribute를
-BERT prompt로 사용하되, class name에 해당하는 token feature만 선택하고 class별로
-평균하여 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
+학습 코드입니다. 기본 설정은 원본 support image와 GT bbox로 생성한 instance visual
+description을 BERT prompt로 사용하되, class name에 해당하는 token feature만 선택하고
+class별로 평균하여 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
 
 ## 데이터 구조
 
@@ -24,16 +24,16 @@ DATASET_NAME/
   test/
 ```
 
-지원 데이터셋은 `NEU-DET`, `clipart1k`, `UODD`이며 class name과 기본 domain
-attribute는
+지원 데이터셋은 `NEU-DET`, `clipart1k`, `UODD`이며 class name은
 `mmdetection/configs/_base_/datasets/CDFSOD_detection_few-shot.py`에 정의되어
 있습니다.
 
-## support caption 생성
+## support visual description 생성
 
-기본 prototype 방식으로 학습하려면 먼저 shot annotation의 각 GT bbox crop에 대한
-caption JSON을 생성합니다. 다음 예시는 NEU-DET 1-shot 데이터에 BLIP caption을
-생성합니다.
+기본 prototype 방식으로 학습하려면 먼저 shot annotation의 각 GT bbox에 대한 visual
+description JSON을 생성합니다. 스크립트는 crop이 아닌 원본 이미지 전체와 COCO
+형식의 bbox, class name을 Qwen3-VL에 입력합니다. 다음 예시는 NEU-DET 1-shot
+description을 생성합니다.
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
@@ -43,10 +43,10 @@ python mmdetection/tools/generate_instance_captions.py \
   --output annotations/1_shot_captions.json
 ```
 
-caption 생성 스크립트는 기본적으로
-`Salesforce/blip-image-captioning-base`를 사용하며, CUDA를 사용할 수 없으면 CPU로
-전환합니다. 다른 모델이나 장치를 사용하려면 각각 `--model-name`, `--device`로
-지정할 수 있습니다.
+생성 스크립트는 기본적으로 `Qwen/Qwen3-VL-8B-Instruct`를 사용하며, CUDA를 사용할
+수 없으면 CPU로 전환합니다. 다른 Qwen3-VL checkpoint나 장치를 사용하려면 각각
+`--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 visual
+description은 기존 `captions` 배열의 `caption` 필드에 저장됩니다.
 
 ## 학습과 평가
 
@@ -69,12 +69,11 @@ CDFSOD_DATA_ROOT=/other/datasets \
   bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
-기본 caption 파일은 `annotations/{SHOT}_shot_captions.json`입니다. 다른 파일이나
-domain attribute를 사용하려면 다음과 같이 지정합니다.
+기본 visual description 파일은 `annotations/{SHOT}_shot_captions.json`입니다. 다른
+파일을 사용하려면 다음과 같이 지정합니다.
 
 ```bash
 CDFSOD_CAPTION_FILE=annotations/custom_captions.json \
-CDFSOD_DOMAIN_ATTRIBUTE="custom domain description" \
   bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
@@ -82,7 +81,7 @@ CDFSOD_DOMAIN_ATTRIBUTE="custom domain description" \
 `mmdetection/work_dirs/{DATASET}_{SHOT}shot_class_name_token_prototype`에 저장됩니다.
 스크립트는 30 epoch 학습 후 `epoch_30.pth`를 평가합니다.
 
-caption prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은
+visual-description prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은
 다음과 같이 실행합니다. 결과 경로에는 `_class_name` suffix가 붙습니다.
 
 ```bash
@@ -103,7 +102,7 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - epochs: `30`
 - LR milestone: epoch `20`, gamma `0.1`
 - train annotation: `annotations/{SHOT}_shot.json`
-- support caption: `annotations/{SHOT}_shot_captions.json`
+- support visual description: `annotations/{SHOT}_shot_captions.json`
 - validation/test annotation: `annotations/test.json`
 
 상세 설정은

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate BLIP captions for COCO support-set object crops.
+"""Generate Qwen3-VL descriptions for COCO support-set instances.
 
 Example:
     python tools/generate_instance_captions.py \
@@ -15,23 +15,30 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from transformers import BlipForConditionalGeneration, BlipProcessor
+
+
+DESCRIPTION_PROMPT = """Class name: {class_name}
+Bounding box: {bbox} in [x, y, width, height] format.
+
+Describe only the visual characteristics inside the bounding box.
+Do not mention the class name or bounding box in the output."""
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Caption each GT bbox crop in a COCO annotation file.')
+        description=(
+            'Describe each GT bbox from the full image with Qwen3-VL.'))
     parser.add_argument('--dataset-root', required=True)
     parser.add_argument('--ann-file', required=True)
     parser.add_argument('--img-prefix', default='train')
     parser.add_argument('--output', required=True)
     parser.add_argument(
         '--model-name',
-        default='Salesforce/blip-image-captioning-base',
-        help='Hugging Face BLIP model name or local path.')
+        default='Qwen/Qwen3-VL-8B-Instruct',
+        help='Hugging Face Qwen3-VL model name or local path.')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--max-new-tokens', type=int, default=30)
+    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--max-new-tokens', type=int, default=64)
     return parser.parse_args()
 
 
@@ -42,28 +49,53 @@ def resolve_path(root: Path, path: str) -> Path:
     return root / path
 
 
-def crop_bbox(image: Image.Image, bbox):
-    x, y, w, h = bbox
-    left = max(0, int(round(x)))
-    top = max(0, int(round(y)))
-    right = min(image.width, int(round(x + w)))
-    bottom = min(image.height, int(round(y + h)))
-    if right <= left or bottom <= top:
-        return None
-    return image.crop((left, top, right, bottom)).convert('RGB')
+def build_description_prompt(class_name, bbox):
+    return DESCRIPTION_PROMPT.format(
+        class_name=class_name,
+        bbox=json.dumps(bbox, ensure_ascii=False))
 
 
 def flush_batch(batch, processor, model, device, max_new_tokens, captions):
     if not batch:
         return
 
-    crops = [item['crop'] for item in batch]
-    inputs = processor(images=crops, return_tensors='pt', padding=True)
-    inputs = {key: value.to(device) for key, value in inputs.items()}
+    conversations = []
+    for item in batch:
+        conversations.append([{
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'image',
+                    'image': item['image'],
+                },
+                {
+                    'type': 'text',
+                    'text': build_description_prompt(
+                        item['meta']['category_name'], item['meta']['bbox']),
+                },
+            ],
+        }])
+
+    inputs = processor.apply_chat_template(
+        conversations,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors='pt',
+        padding=True)
+    inputs = inputs.to(device)
 
     with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    decoded = processor.batch_decode(outputs, skip_special_tokens=True)
+        outputs = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    generated_ids = [
+        output_ids[len(input_ids):]
+        for input_ids, output_ids in zip(inputs.input_ids, outputs)
+    ]
+    decoded = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False)
 
     for item, caption in zip(batch, decoded):
         meta = item['meta']
@@ -73,6 +105,8 @@ def flush_batch(batch, processor, model, device, max_new_tokens, captions):
 
 
 def main():
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
     args = parse_args()
     dataset_root = Path(args.dataset_root)
     ann_path = resolve_path(dataset_root, args.ann_file)
@@ -93,8 +127,9 @@ def main():
         for category in coco.get('categories', [])
     }
 
-    processor = BlipProcessor.from_pretrained(args.model_name)
-    model = BlipForConditionalGeneration.from_pretrained(args.model_name)
+    processor = AutoProcessor.from_pretrained(args.model_name)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_name, dtype='auto')
     model.to(device)
     model.eval()
 
@@ -111,12 +146,9 @@ def main():
 
         if image_path not in image_cache:
             image_cache[image_path] = Image.open(image_path).convert('RGB')
-        crop = crop_bbox(image_cache[image_path], ann['bbox'])
-        if crop is None:
-            continue
 
         batch.append({
-            'crop': crop,
+            'image': image_cache[image_path],
             'meta': {
                 'ann_id': ann['id'],
                 'image_id': ann['image_id'],
@@ -145,7 +177,7 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
         f.write('\n')
 
-    print(f'Wrote {len(captions)} captions to {output_path}')
+    print(f'Wrote {len(captions)} visual descriptions to {output_path}')
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@
 
 ## 핵심 실행 명령어
 
-support caption 생성:
+support visual description 생성:
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
@@ -47,8 +47,8 @@ python tools/test.py \
 
 기본값은 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1`입니다.
 
-학습 중 support caption JSON을 한 번 읽어서 class별 prompt bank를 만들고, 매 iteration마다 현재 BERT로 전체 support enriched prompt를 다시 encoding합니다.
-BERT에는 `{class_name}, {instance_caption}, {domain_attribute}.` 전체 prompt가 들어가지만, 출력에서는 tokenizer `offset_mapping`을 이용해 class name 문자 범위와 겹치는 token feature만 선택합니다.
+Qwen3-VL은 원본 이미지 전체와 GT bbox, class name을 입력받아 bbox 내부의 visual description을 생성합니다. 학습 중 이 JSON을 한 번 읽어서 class별 prompt bank를 만들고, 매 iteration마다 현재 BERT로 전체 support enriched prompt를 다시 encoding합니다.
+BERT에는 `{class_name}: {visual_description}.` 전체 prompt가 들어가지만, 출력에서는 tokenizer `offset_mapping`을 이용해 class name 문자 범위와 겹치는 token feature만 선택합니다.
 
 선택된 class-name token feature는 같은 class끼리 전부 평균해서 class당 1개 text prototype으로 만듭니다. `[CLS]` token은 사용하지 않습니다.
 baseline을 원하면 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`으로 실행하면 됩니다.
