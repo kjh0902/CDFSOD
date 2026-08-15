@@ -18,11 +18,10 @@ from PIL import Image
 
 
 COMMON_DESCRIPTION_INSTRUCTION = (
-    'Describe only the common visual characteristics inside the bounding '
-    'boxes across all images.\n\n'
+    'Describe only the common visual characteristics across all images.\n\n'
     'Output exactly one concise sentence.\n'
     'Start directly with the visual attributes.\n'
-    'Do not mention the images, regions, bounding boxes, or class name.\n'
+    'Do not mention the images, regions, or class name.\n'
     'Do not infer causes or meanings; describe only visible appearance.')
 
 
@@ -55,13 +54,19 @@ def resolve_path(root: Path, path: str) -> Path:
     return root / path
 
 
-def build_common_description_prompt(class_name, instances):
-    lines = [f'Class name: {class_name}', '']
-    for image_idx, instance in enumerate(instances, start=1):
-        bbox = json.dumps(instance['bbox'], ensure_ascii=False)
-        lines.append(f'Image {image_idx} bounding box: {bbox}')
-    lines.extend(['', COMMON_DESCRIPTION_INSTRUCTION])
-    return '\n'.join(lines)
+def crop_bbox(image, bbox):
+    x, y, width, height = bbox
+    left = max(0, int(round(x)))
+    top = max(0, int(round(y)))
+    right = min(image.width, int(round(x + width)))
+    bottom = min(image.height, int(round(y + height)))
+    if right <= left or bottom <= top:
+        return None
+    return image.crop((left, top, right, bottom)).convert('RGB')
+
+
+def build_common_description_prompt(class_name):
+    return f'Class name: {class_name}\n\n{COMMON_DESCRIPTION_INSTRUCTION}'
 
 
 def build_class_groups(coco, images, categories, img_root):
@@ -77,6 +82,10 @@ def build_class_groups(coco, images, categories, img_root):
 
         if image_path not in image_cache:
             image_cache[image_path] = Image.open(image_path).convert('RGB')
+        crop = crop_bbox(image_cache[image_path], ann['bbox'])
+        if crop is None:
+            raise ValueError(
+                f'Invalid bbox for annotation {ann["id"]}: {ann["bbox"]}')
 
         category_id = ann['category_id']
         if category_id not in groups:
@@ -90,7 +99,7 @@ def build_class_groups(coco, images, categories, img_root):
             'image_id': ann['image_id'],
             'bbox': ann['bbox'],
             'file_name': file_name,
-            'image': image_cache[image_path],
+            'image': crop,
         })
 
     return list(groups.values())
@@ -111,7 +120,7 @@ def flush_batch(batch, processor, model, device, max_new_tokens, captions):
         content.append({
             'type': 'text',
             'text': build_common_description_prompt(
-                class_group['category_name'], class_group['instances']),
+                class_group['category_name']),
         })
         conversations.append([{
             'role': 'user',

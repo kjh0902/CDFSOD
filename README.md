@@ -1,7 +1,7 @@
 # CDFSOD Grounding DINO class-name token prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 클래스별 K-shot support image 전체와 각 GT bbox로
+학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop들로
 생성한 common visual description을 BERT prompt로 사용하되, class name에 해당하는
 token feature만 선택하여 text prototype을 만듭니다. `[CLS]` token은 사용하지
 않습니다.
@@ -32,9 +32,10 @@ DATASET_NAME/
 ## support visual description 생성
 
 기본 prototype 방식으로 학습하려면 먼저 클래스별 common visual description JSON을
-생성합니다. 스크립트는 같은 클래스의 K개 원본 support image와 각 COCO 형식 bbox,
-class name을 하나의 Qwen3-VL conversation에 입력하여 클래스당 description 하나를
-생성합니다. 다음 예시는 NEU-DET 1-shot description을 생성합니다.
+생성합니다. 스크립트는 같은 클래스의 K개 GT bbox crop과 class name을 하나의
+Qwen3-VL conversation에 입력하여 클래스당 description 하나를 생성합니다. bbox
+좌표와 원본 이미지 전체는 Qwen에 전달하지 않습니다. 다음 예시는 NEU-DET 1-shot
+description을 생성합니다.
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
