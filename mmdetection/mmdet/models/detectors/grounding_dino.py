@@ -58,6 +58,7 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 use_bn_style_prompt: bool = False,
                  use_class_name_token_prototypes: bool = False,
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
@@ -67,6 +68,7 @@ class GroundingDINO(DINO):
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        self.use_bn_style_prompt = use_bn_style_prompt
         self.use_class_name_token_prototypes = use_class_name_token_prototypes
         self.support_caption_file = support_caption_file
         self.support_class_names = list(support_class_names or [])
@@ -82,6 +84,8 @@ class GroundingDINO(DINO):
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
+        if self.use_bn_style_prompt:
+            self.style_prompt = nn.BatchNorm2d(3)
         self.positional_encoding = SinePositionalEncoding(
             **self.positional_encoding)
         self.encoder = GroundingDinoTransformerEncoder(**self.encoder)
@@ -117,6 +121,12 @@ class GroundingDINO(DINO):
         super().init_weights()
         nn.init.constant_(self.text_feat_map.bias.data, 0)
         nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
+        """Apply the BN style prompt immediately before the backbone."""
+        if self.use_bn_style_prompt:
+            batch_inputs = self.style_prompt(batch_inputs)
+        return super().extract_feat(batch_inputs)
 
     def to_enhance_text_prompts(self, original_caption, enhanced_text_prompts):
         caption_string = ''
@@ -287,15 +297,15 @@ class GroundingDINO(DINO):
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
 
-    def _format_support_prompt(self, class_name: str,
-                               caption: str) -> Tuple[str, Tuple[int, int]]:
+    def _format_support_prompt(
+            self, class_name: str,
+            visual_description: str) -> Tuple[str, Tuple[int, int]]:
         clean_class_name = clean_label_name(class_name).strip()
-        parts = [clean_class_name]
-        if caption:
-            parts.append(caption.strip().rstrip('.'))
-        if self.support_domain_attribute:
-            parts.append(self.support_domain_attribute.strip().rstrip('.'))
-        prompt = ', '.join(parts) + '.'
+        if visual_description:
+            description = visual_description.strip().rstrip('.')
+            prompt = f'{clean_class_name}: {description}.'
+        else:
+            prompt = clean_class_name + '.'
         return prompt, (0, len(clean_class_name))
 
     def _tokenize_support_prompts(self, prompts: Sequence[str]) -> dict:
