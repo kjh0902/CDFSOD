@@ -1,9 +1,10 @@
 # CDFSOD Grounding DINO class-name token prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 원본 support image와 GT bbox로 생성한 instance visual
-description을 BERT prompt로 사용하되, class name에 해당하는 token feature만 선택하고
-class별로 평균하여 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
+학습 코드입니다. 기본 설정은 클래스별 K-shot support image 전체와 각 GT bbox로
+생성한 common visual description을 BERT prompt로 사용하되, class name에 해당하는
+token feature만 선택하여 text prototype을 만듭니다. `[CLS]` token은 사용하지
+않습니다.
 
 ## 데이터 구조
 
@@ -30,10 +31,10 @@ DATASET_NAME/
 
 ## support visual description 생성
 
-기본 prototype 방식으로 학습하려면 먼저 shot annotation의 각 GT bbox에 대한 visual
-description JSON을 생성합니다. 스크립트는 crop이 아닌 원본 이미지 전체와 COCO
-형식의 bbox, class name을 Qwen3-VL에 입력합니다. 다음 예시는 NEU-DET 1-shot
-description을 생성합니다.
+기본 prototype 방식으로 학습하려면 먼저 클래스별 common visual description JSON을
+생성합니다. 스크립트는 같은 클래스의 K개 원본 support image와 각 COCO 형식 bbox,
+class name을 하나의 Qwen3-VL conversation에 입력하여 클래스당 description 하나를
+생성합니다. 다음 예시는 NEU-DET 1-shot description을 생성합니다.
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
@@ -45,8 +46,9 @@ python mmdetection/tools/generate_instance_captions.py \
 
 생성 스크립트는 기본적으로 `Qwen/Qwen3-VL-8B-Instruct`를 사용하며, CUDA를 사용할
 수 없으면 CPU로 전환합니다. 다른 Qwen3-VL checkpoint나 장치를 사용하려면 각각
-`--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 visual
-description은 기존 `captions` 배열의 `caption` 필드에 저장됩니다.
+`--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 common
+visual description은 기존 `captions` 배열의 `caption` 필드에 클래스당 하나씩
+저장됩니다.
 
 ## 학습과 평가
 
