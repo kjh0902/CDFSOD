@@ -17,9 +17,13 @@ import torch
 from PIL import Image
 
 
-COMMON_DESCRIPTION_INSTRUCTION = """Describe the common visual characteristics \
-of the regions inside the bounding boxes across all images.
-Do not mention the bounding boxes in the output."""
+COMMON_DESCRIPTION_INSTRUCTION = (
+    'Describe only the common visual characteristics inside the bounding '
+    'boxes across all images.\n\n'
+    'Output exactly one concise sentence.\n'
+    'Start directly with the visual attributes.\n'
+    'Do not mention the images, regions, bounding boxes, or class name.\n'
+    'Do not infer causes or meanings; describe only visible appearance.')
 
 
 def parse_args():
@@ -40,7 +44,7 @@ def parse_args():
         type=int,
         default=1,
         help='Number of classes to process in one inference batch.')
-    parser.add_argument('--max-new-tokens', type=int, default=64)
+    parser.add_argument('--max-new-tokens', type=int, default=128)
     return parser.parse_args()
 
 
