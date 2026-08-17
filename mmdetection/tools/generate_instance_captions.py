@@ -12,6 +12,7 @@ Example:
 import argparse
 import json
 import re
+import warnings
 from pathlib import Path
 
 import torch
@@ -115,9 +116,10 @@ def normalize_and_validate_description(description, class_name):
             f'Qwen returned an empty description for {class_name}')
     if re.search(_class_name_pattern(class_name), description,
                  flags=re.IGNORECASE):
-        raise ValueError(
-            f'Description directly mentions class name {class_name!r}: '
-            f'{description!r}')
+        warnings.warn(
+            f'Description mentions class name {class_name!r}; keeping the '
+            f'generated sentence unchanged: {description!r}',
+            UserWarning)
     if description[-1] not in '.!?':
         description += '.'
     sentence_ends = re.findall(r'[.!?]+(?=\s|$)', description)

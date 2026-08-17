@@ -44,9 +44,10 @@ def test_description_validation():
     assert generator.normalize_and_validate_description(
         'Long, thin, gently curved forms', 'scratches') == (
             'Long, thin, gently curved forms.')
-    with pytest.raises(ValueError, match='directly mentions class name'):
-        generator.normalize_and_validate_description(
+    with pytest.warns(UserWarning, match='mentions class name'):
+        description = generator.normalize_and_validate_description(
             'The rolled-in scale has a long boundary.', 'rolled-in_scale')
+    assert description == 'The rolled-in scale has a long boundary.'
     with pytest.raises(ValueError, match='exactly one sentence'):
         generator.normalize_and_validate_description(
             'Dark and smooth. It is also thin.', 'inclusion')
