@@ -322,7 +322,9 @@ class GroundingDINO(DINO):
 
     def _find_class_name_token_positions(self, offset_mapping: Tensor,
                                          class_spans: Sequence[Tuple[int,
-                                                                    int]]):
+                                                                    int]],
+                                         prompt_texts: Optional[
+                                             Sequence[str]] = None):
         token_positions = []
         for prompt_idx, (span_start, span_end) in enumerate(class_spans):
             positions = []
@@ -333,7 +335,8 @@ class GroundingDINO(DINO):
                 if token_start < span_end and token_end > span_start:
                     positions.append(token_idx)
             if len(positions) == 0:
-                prompt = self.support_prompt_texts[prompt_idx]
+                prompts = prompt_texts or self.support_prompt_texts
+                prompt = prompts[prompt_idx]
                 raise RuntimeError(
                     f'No class-name tokens found for prompt: {prompt}')
             token_positions.append(positions)
@@ -397,6 +400,101 @@ class GroundingDINO(DINO):
         prototypes = torch.stack(prototypes, dim=0)
 
         return prototypes
+
+    def build_description_selection_text_dict(
+            self, target_class_idx: int, description: str,
+            device) -> Dict:
+        """Build the class prototype bank for one description candidate.
+
+        The target class is contextualized by its candidate description. All
+        other classes use their plain class names. Class-name subword features
+        are averaged before the standard text projection, matching the
+        fine-tuning prototype construction.
+        """
+        if not 0 <= target_class_idx < len(self.support_class_names):
+            raise IndexError(f'Invalid target class index: {target_class_idx}')
+
+        prompts = []
+        class_spans = []
+        for class_idx, class_name in enumerate(self.support_class_names):
+            class_description = description if class_idx == \
+                target_class_idx else ''
+            prompt, class_span = self._format_support_prompt(
+                class_name, class_description)
+            prompts.append(prompt)
+            class_spans.append(class_span)
+
+        tokenized = self._tokenize_support_prompts(prompts)
+        token_positions = self._find_class_name_token_positions(
+            tokenized['offset_mapping'], class_spans, prompts)
+        tokenizer_input = {
+            key: value.to(device)
+            for key, value in tokenized.items()
+            if key not in ('offset_mapping', 'special_tokens_mask')
+        }
+        tokenizer_input = {
+            'input_ids': tokenizer_input['input_ids'],
+            'attention_mask': tokenizer_input['attention_mask'],
+            'token_type_ids': tokenizer_input.get('token_type_ids', None)
+        }
+        hidden_states = self._encode_support_prompt_features(tokenizer_input)
+        prototypes = torch.stack([
+            hidden_states[prompt_idx, positions].mean(dim=0)
+            for prompt_idx, positions in enumerate(token_positions)
+        ])
+        prototypes = self.text_feat_map(prototypes).to(device)
+
+        num_tokens = prototypes.size(0)
+        max_text_len = self.bbox_head.cls_branches[
+            self.decoder.num_layers].max_text_len
+        if num_tokens > max_text_len:
+            raise RuntimeError(
+                f'Class text prototypes ({num_tokens}) exceed max_text_len '
+                f'({max_text_len}).')
+        return dict(
+            embedded=prototypes.unsqueeze(0),
+            text_token_mask=torch.ones(
+                1, num_tokens, dtype=torch.bool, device=device),
+            masks=torch.eye(
+                num_tokens, dtype=torch.bool, device=device).unsqueeze(0),
+            position_ids=torch.arange(
+                num_tokens, dtype=torch.long, device=device).unsqueeze(0))
+
+    @torch.no_grad()
+    def get_language_guided_query_selection(
+            self, img_feats: Tuple[Tensor], text_dict: Dict,
+            batch_data_samples: OptSampleList = None) -> Tuple[Tensor,
+                                                               Tensor]:
+        """Return selected proposal centers and their argmax text tokens."""
+        if self.num_queries != 900:
+            raise RuntimeError(
+                f'Description selection requires 900 queries, got '
+                f'{self.num_queries}.')
+
+        encoder_inputs_dict, _ = self.pre_transformer(
+            img_feats, batch_data_samples)
+        encoder_outputs = self.forward_encoder(
+            **encoder_inputs_dict, text_dict=text_dict)
+        output_memory, output_proposals = self.gen_encoder_output_proposals(
+            encoder_outputs['memory'], encoder_outputs['memory_mask'],
+            encoder_outputs['spatial_shapes'])
+        enc_outputs_class = self.bbox_head.cls_branches[
+            self.decoder.num_layers](
+                output_memory, encoder_outputs['memory_text'],
+                encoder_outputs['text_token_mask'])
+        enc_outputs_coord_unact = self.bbox_head.reg_branches[
+            self.decoder.num_layers](output_memory) + output_proposals
+
+        topk_indices = torch.topk(
+            enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+        argmax_text_tokens = enc_outputs_class.argmax(dim=-1)
+        topk_argmax_text_tokens = torch.gather(
+            argmax_text_tokens, 1, topk_indices)
+        topk_coords_unact = torch.gather(
+            enc_outputs_coord_unact, 1,
+            topk_indices.unsqueeze(-1).repeat(1, 1, 4))
+        topk_centers = topk_coords_unact.sigmoid()[..., :2]
+        return topk_centers, topk_argmax_text_tokens
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
         """Build text_dict from class-name-token averaged prototypes."""

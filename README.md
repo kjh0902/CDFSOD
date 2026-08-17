@@ -1,10 +1,11 @@
-# CDFSOD Grounding DINO class-name token prototype
+# CDFSOD Grounding DINO attribute-selected class-name token prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop들로
-생성한 common visual description을 BERT prompt로 사용하되, class name에 해당하는
-token feature만 선택하여 text prototype을 만듭니다. `[CLS]` token은 사용하지
-않습니다.
+학습 코드입니다. 클래스별 K-shot support instance의 GT bbox crop들로 5개
+attribute-wise visual description을 생성하고, pretrained Grounding DINO의
+Language-Guided Query Selection score로 Top-1을 offline 선택합니다. 학습에서는
+선택된 prompt의 class-name token feature만 평균하여 text prototype을 만듭니다.
+`[CLS]` token과 description token 자체는 prototype으로 사용하지 않습니다.
 
 ## 데이터 구조
 
@@ -16,7 +17,9 @@ DATASET_NAME/
     train.json
     test.json
     1_shot.json
+    1_shot_caption_candidates.json
     1_shot_captions.json
+    1_shot_caption_selection.log
     5_shot.json
     5_shot_captions.json
     10_shot.json
@@ -29,29 +32,52 @@ DATASET_NAME/
 `mmdetection/configs/_base_/datasets/CDFSOD_detection_few-shot.py`에 정의되어
 있습니다.
 
-## support visual description 생성
+## 1. Attribute-wise description 후보 생성
 
-기본 prototype 방식으로 학습하려면 먼저 클래스별 common visual description JSON을
-생성합니다. 스크립트는 같은 클래스의 K개 GT bbox crop과 class name을 하나의
-Qwen3-VL conversation에 입력하여 클래스당 description 하나를 생성합니다. bbox
-좌표와 원본 이미지 전체는 Qwen에 전달하지 않습니다. 다음 예시는 NEU-DET 1-shot
-description을 생성합니다.
+먼저 클래스별 Shape, Texture, Boundary, Internal Structure,
+Color/Intensity/Material description을 생성합니다. 각 attribute inference에는 같은
+클래스의 전체 K-shot GT bbox crop이 함께 입력됩니다. 원본 이미지와 bbox 좌표는
+Qwen에 전달되지 않습니다.
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
   --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
   --ann-file annotations/1_shot.json \
   --img-prefix train \
-  --output annotations/1_shot_captions.json
+  --output annotations/1_shot_caption_candidates.json
 ```
 
 생성 스크립트는 기본적으로 `Qwen/Qwen3-VL-8B-Instruct`를 사용하며, CUDA를 사용할
 수 없으면 CPU로 전환합니다. 다른 Qwen3-VL checkpoint나 장치를 사용하려면 각각
-`--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 common
-visual description은 기존 `captions` 배열의 `caption` 필드에 클래스당 하나씩
-저장됩니다.
+`--model-name`, `--device`로 지정할 수 있습니다. 각 출력은 한 문장이고 class name을
+직접 포함하지 않는지 검사한 뒤 `candidates`에 저장됩니다.
 
-## 학습과 평가
+## 2. Pretrained Grounding DINO description 선택
+
+Fine-tuning 전에 다음 명령을 한 번 실행합니다. 대상 class는 candidate description으로
+문맥화한 class-name token 평균 prototype을 사용하고, 나머지 class는 description 없는
+baseline prototype을 사용합니다. Top-900 proposal 중심이 support GT bbox 내부이면서
+image-text similarity의 argmax prototype이 대상 class인 query 수를 object별로 세고,
+K-shot GT object 평균이 가장 큰 description을 선택합니다.
+
+```bash
+cd mmdetection
+python tools/select_attribute_descriptions.py \
+  configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
+  https://download.openmmlab.com/mmdetection/v3.0/grounding_dino/groundingdino_swinb_cogcoor_mmdet-55949c9c.pth \
+  --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
+  --ann-file annotations/1_shot.json \
+  --img-prefix train \
+  --candidate-file annotations/1_shot_caption_candidates.json \
+  --output annotations/1_shot_captions.json
+```
+
+선택 결과 JSON에는 attribute별 `scores`, `selected_attribute`,
+`selected_description`과 기존 학습 호환용 `caption`이 저장됩니다. 기본 log 파일은
+`annotations/1_shot_caption_selection.log`입니다. 선택은 학습 loop와 분리되어 있어
+epoch마다 다시 실행되지 않습니다.
+
+## 3. 학습과 평가
 
 ```bash
 bash mmdetection/run_all_training.sh DATASET SHOT GPU_COUNT
@@ -105,7 +131,8 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - epochs: `30`
 - LR milestone: epoch `20`, gamma `0.1`
 - train annotation: `annotations/{SHOT}_shot.json`
-- support visual description: `annotations/{SHOT}_shot_captions.json`
+- support candidates: `annotations/{SHOT}_shot_caption_candidates.json`
+- selected visual description: `annotations/{SHOT}_shot_captions.json`
 - validation/test annotation: `annotations/test.json`
 
 상세 설정은
