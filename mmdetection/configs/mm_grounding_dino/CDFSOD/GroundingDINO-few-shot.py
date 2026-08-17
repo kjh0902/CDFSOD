@@ -18,6 +18,7 @@ model = dict(
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
+    use_bn_style_prompt=True,
     use_class_name_token_prototypes=_base_.use_class_name_token_prototypes,
     support_caption_file=support_caption_file,
     support_class_names=_base_.metainfo['classes'],
