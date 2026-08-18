@@ -51,4 +51,7 @@ Qwen3-VL은 같은 클래스의 K-shot GT bbox crop 전체와 class name을 하�
 BERT에는 `{class_name}: {visual_description}.` 전체 prompt가 들어가지만, 출력에서는 tokenizer `offset_mapping`을 이용해 class name 문자 범위와 겹치는 token feature만 선택합니다.
 
 JSON에 클래스당 prompt가 하나이므로 선택된 class-name token feature로 class당 1개 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
+같은 JSON의 `file_names`와 `bboxes`로 support object를 다시 읽고, 현재 backbone+neck의 첫 feature에서 object별 `7x7` RoIAlign token을 추출합니다. Shot 평균 없이 클래스별로 concatenate한 token을 text-conditioned Q-Former에 입력하고, query 출력 평균 `V`를 `T + alpha * V`로 기존 text prototype에 더합니다. `alpha`는 0으로 초기화되는 learnable scalar이므로 초기 출력은 기존 `T`와 같습니다.
+
+학습 중 support visual feature와 Q-Former 출력은 매 iteration 다시 계산됩니다. 평가 중에는 target support set으로 fused prototype을 최초 한 번만 생성해 detach/cache하고 모든 test image에서 재사용하며, test image는 prototype 생성에 사용되지 않습니다.
 baseline을 원하면 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`으로 실행하면 됩니다.
