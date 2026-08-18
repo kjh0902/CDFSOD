@@ -22,6 +22,13 @@ model = dict(
     support_caption_file=support_caption_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
+    support_image_root=os.path.join(_base_.data_root, 'train'),
+    support_image_batch_size=2,
+    support_image_scale=(800, 1333),
+    support_visual_fusion_cfg=dict(
+        hidden_dim=256,
+        num_heads=8,
+        dropout=0.0),
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -152,5 +159,7 @@ default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
         interval=max_epochs))
+
+custom_hooks = [dict(type='VisualGateHistoryHook')]
 
 auto_scale_lr = dict(base_batch_size=16)
