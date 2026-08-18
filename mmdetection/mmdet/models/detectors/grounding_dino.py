@@ -20,7 +20,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
-from ..utils import SupportQFormer, SupportVisualTokenizer
+from ..utils import SupportVisualCrossAttention, SupportVisualTokenizer
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -69,7 +69,7 @@ class GroundingDINO(DINO):
                  support_image_root: Optional[str] = None,
                  support_image_batch_size: int = 2,
                  support_image_scale: Tuple[int, int] = (800, 1333),
-                 support_qformer_cfg: Optional[ConfigType] = None,
+                 support_visual_fusion_cfg: Optional[ConfigType] = None,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -84,7 +84,8 @@ class GroundingDINO(DINO):
             raise ValueError('support_image_batch_size must be positive.')
         self.support_image_batch_size = support_image_batch_size
         self.support_image_scale = support_image_scale
-        self.support_qformer_cfg = copy.deepcopy(support_qformer_cfg or {})
+        self.support_visual_fusion_cfg = copy.deepcopy(
+            support_visual_fusion_cfg or {})
         self.support_prompt_bank = None
         self.support_prompt_labels = None
         self.support_prompt_texts = None
@@ -94,21 +95,23 @@ class GroundingDINO(DINO):
         self._cached_eval_support_prototypes = None
         super().__init__(*args, **kwargs)
         if self.use_class_name_token_prototypes:
-            qformer_hidden_dim = self.support_qformer_cfg.pop(
+            fusion_hidden_dim = self.support_visual_fusion_cfg.pop(
                 'hidden_dim', self.embed_dims)
-            if qformer_hidden_dim != self.embed_dims:
+            if fusion_hidden_dim != self.embed_dims:
                 raise ValueError(
-                    'Q-Former hidden_dim must match GroundingDINO embed_dims '
-                    f'({self.embed_dims}), got {qformer_hidden_dim}.')
+                    'Visual fusion hidden_dim must match GroundingDINO '
+                    f'embed_dims ({self.embed_dims}), got '
+                    f'{fusion_hidden_dim}.')
             self.support_visual_tokenizer = SupportVisualTokenizer(
                 hidden_dim=self.embed_dims)
-            self.support_qformer = SupportQFormer(
-                hidden_dim=qformer_hidden_dim, **self.support_qformer_cfg)
+            self.support_visual_fusion = SupportVisualCrossAttention(
+                hidden_dim=fusion_hidden_dim,
+                **self.support_visual_fusion_cfg)
             self.visual_gate = nn.Parameter(torch.tensor(0.0))
             self.build_support_prompt_bank()
         else:
             self.support_visual_tokenizer = None
-            self.support_qformer = None
+            self.support_visual_fusion = None
             self.register_parameter('visual_gate', None)
 
     def _init_layers(self) -> None:
@@ -598,7 +601,7 @@ class GroundingDINO(DINO):
             len(self.support_class_names))
 
     def compute_fused_support_prototypes(self, device) -> Tensor:
-        """Fuse Qwen/BERT text prototypes with Q-Former visual residuals."""
+        """Fuse text prototypes with one visual cross-attention residual."""
         text_prototypes = self.compute_class_text_prototypes()
         if self.text_feat_map is not None:
             text_prototypes = self.text_feat_map(text_prototypes)
@@ -607,9 +610,8 @@ class GroundingDINO(DINO):
             self.compute_support_visual_tokens()
         visual_tokens = visual_tokens.to(device)
         visual_padding_mask = visual_padding_mask.to(device)
-        query_outputs = self.support_qformer(
+        visual_representations = self.support_visual_fusion(
             text_prototypes, visual_tokens, visual_padding_mask)
-        visual_representations = query_outputs.mean(dim=1)
         return self.fuse_text_visual_prototypes(
             text_prototypes, visual_representations)
 

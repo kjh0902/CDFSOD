@@ -2,7 +2,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mmdet.models.utils import SupportQFormer, SupportVisualTokenizer
+from mmdet.models.utils import (SupportVisualCrossAttention,
+                                SupportVisualTokenizer)
 
 
 def test_support_visual_tokenizer_preserves_every_object_token():
@@ -21,7 +22,6 @@ def test_support_visual_tokenizer_preserves_every_object_token():
     assert tokens.shape == (2, 8, 8)
     assert padding_mask.tolist() == [[False] * 4 + [True] * 4,
                                      [False] * 8]
-    # Both class-1 objects remain as separate four-token blocks.
     assert not torch.equal(tokens[1, :4], tokens[1, 4:])
 
 
@@ -39,57 +39,48 @@ def test_support_visual_tokenizer_accepts_standard_shot_counts(shot_count):
     assert not padding_mask.any()
 
 
-def test_qformer_keeps_classes_isolated_and_ignores_padding():
+def test_cross_attention_keeps_classes_isolated_and_ignores_padding():
     torch.manual_seed(7)
-    qformer = SupportQFormer(
-        hidden_dim=8,
-        num_queries=3,
-        num_layers=2,
-        num_heads=2,
-        ffn_dim=16,
-        dropout=0.0).eval()
+    fusion = SupportVisualCrossAttention(
+        hidden_dim=8, num_heads=2, dropout=0.0).eval()
     text = torch.randn(2, 8)
     visual = torch.randn(2, 8, 8)
     padding_mask = torch.tensor([[False] * 4 + [True] * 4,
                                  [False] * 8])
 
-    original = qformer(text, visual, padding_mask)
-    assert original.shape == (2, 3, 8)
+    original = fusion(text, visual, padding_mask)
+    assert original.shape == (2, 8)
 
     changed_other_class = visual.clone()
     changed_other_class[1] += 100
-    isolated = qformer(text, changed_other_class, padding_mask)
+    isolated = fusion(text, changed_other_class, padding_mask)
     torch.testing.assert_close(original[0], isolated[0])
     assert not torch.allclose(original[1], isolated[1])
 
     changed_padding = visual.clone()
     changed_padding[0, 4:] += 1000
-    padding_ignored = qformer(text, changed_padding, padding_mask)
+    padding_ignored = fusion(text, changed_padding, padding_mask)
     torch.testing.assert_close(original, padding_ignored)
 
 
-def test_identity_gate_and_qformer_gradients():
-    torch.manual_seed(11)
-    qformer = SupportQFormer(
-        hidden_dim=8,
-        num_queries=4,
-        num_layers=2,
-        num_heads=2,
-        ffn_dim=16,
-        dropout=0.0)
+def test_cross_attention_has_only_expected_modules_and_receives_gradients():
+    fusion = SupportVisualCrossAttention(
+        hidden_dim=8, num_heads=2, dropout=0.0)
+    module_names = dict(fusion.named_modules())
+    parameter_names = dict(fusion.named_parameters())
+    assert all('query_attention' not in name for name in module_names)
+    assert all('ffn' not in name for name in module_names)
+    assert all('learnable_queries' not in name for name in parameter_names)
+
     text = torch.randn(3, 8, requires_grad=True)
     visual = torch.randn(3, 5, 8, requires_grad=True)
     padding_mask = torch.zeros(3, 5, dtype=torch.bool)
-    visual_representation = qformer(text, visual, padding_mask).mean(dim=1)
-
-    zero_gate = nn.Parameter(torch.tensor(0.0))
-    identity_output = text + zero_gate * visual_representation
-    assert torch.equal(identity_output, text)
-
-    trainable_gate = nn.Parameter(torch.tensor(0.5))
-    fused = text + trainable_gate * visual_representation
+    visual_representation = fusion(text, visual, padding_mask)
+    gate = nn.Parameter(torch.tensor(0.5))
+    fused = text + gate * visual_representation
     fused.square().mean().backward()
-    assert trainable_gate.grad is not None
+
+    assert gate.grad is not None
     assert visual.grad is not None and visual.grad.abs().sum() > 0
-    assert qformer.learnable_queries.grad is not None
-    assert qformer.learnable_queries.grad.abs().sum() > 0
+    assert fusion.cross_attention.in_proj_weight.grad is not None
+    assert fusion.cross_attention.in_proj_weight.grad.abs().sum() > 0

@@ -137,80 +137,21 @@ class SupportVisualTokenizer(nn.Module):
         return padded_tokens, padding_mask
 
 
-class SupportQFormerLayer(nn.Module):
-    """A pre-norm query self-attention/cross-attention/FFN block."""
+class SupportVisualCrossAttention(nn.Module):
+    """Attend from one class text prototype to its support visual tokens."""
 
     def __init__(self,
                  hidden_dim: int = 256,
                  num_heads: int = 8,
-                 ffn_dim: int = 1024,
                  dropout: float = 0.0) -> None:
         super().__init__()
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.cross_norm = nn.LayerNorm(hidden_dim)
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.query_attention = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.cross_attention = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, hidden_dim),
-        )
-        self.residual_dropout = nn.Dropout(dropout)
-
-    def forward(self, queries: Tensor, visual_tokens: Tensor,
-                visual_padding_mask: Tensor) -> Tensor:
-        normalized_queries = self.query_norm(queries)
-        attended_queries, _ = self.query_attention(
-            normalized_queries,
-            normalized_queries,
-            normalized_queries,
-            need_weights=False)
-        queries = queries + self.residual_dropout(attended_queries)
-
-        attended_visual, _ = self.cross_attention(
-            self.cross_norm(queries),
-            visual_tokens,
-            visual_tokens,
-            key_padding_mask=visual_padding_mask,
-            need_weights=False)
-        queries = queries + self.residual_dropout(attended_visual)
-        queries = queries + self.residual_dropout(
-            self.ffn(self.ffn_norm(queries)))
-        return queries
-
-
-class SupportQFormer(nn.Module):
-    """Extract one text-conditioned visual representation per class."""
-
-    def __init__(self,
-                 hidden_dim: int = 256,
-                 num_queries: int = 4,
-                 num_layers: int = 2,
-                 num_heads: int = 8,
-                 ffn_dim: int = 1024,
-                 dropout: float = 0.0) -> None:
-        super().__init__()
-        if hidden_dim <= 0 or num_queries <= 0 or num_layers <= 0:
-            raise ValueError(
-                'Q-Former dimensions and counts must be positive.')
+        if hidden_dim <= 0 or num_heads <= 0:
+            raise ValueError('hidden_dim and num_heads must be positive.')
         if hidden_dim % num_heads != 0:
             raise ValueError('hidden_dim must be divisible by num_heads.')
         self.hidden_dim = hidden_dim
-        self.num_queries = num_queries
-        self.learnable_queries = nn.Parameter(
-            torch.empty(num_queries, hidden_dim))
-        nn.init.normal_(self.learnable_queries, std=0.02)
-        self.layers = nn.ModuleList([
-            SupportQFormerLayer(
-                hidden_dim=hidden_dim,
-                num_heads=num_heads,
-                ffn_dim=ffn_dim,
-                dropout=dropout) for _ in range(num_layers)
-        ])
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True)
 
     def forward(self, text_prototypes: Tensor, visual_tokens: Tensor,
                 visual_padding_mask: Tensor) -> Tensor:
@@ -225,12 +166,15 @@ class SupportQFormer(nn.Module):
         if (text_prototypes.size(-1) != self.hidden_dim or
                 visual_tokens.size(-1) != self.hidden_dim):
             raise ValueError(
-                f'Q-Former inputs must have dimension {self.hidden_dim}.')
+                f'Cross-attention inputs must have dimension '
+                f'{self.hidden_dim}.')
         if visual_padding_mask.all(dim=1).any():
             raise ValueError('Every class must contain a visual token.')
 
-        queries = self.learnable_queries.unsqueeze(0) + \
-            text_prototypes.unsqueeze(1)
-        for layer in self.layers:
-            queries = layer(queries, visual_tokens, visual_padding_mask)
-        return queries
+        attended_visual, _ = self.cross_attention(
+            text_prototypes.unsqueeze(1),
+            visual_tokens,
+            visual_tokens,
+            key_padding_mask=visual_padding_mask,
+            need_weights=False)
+        return attended_visual.squeeze(1)

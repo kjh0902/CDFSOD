@@ -25,12 +25,9 @@ model = dict(
     support_image_root=os.path.join(_base_.data_root, 'train'),
     support_image_batch_size=2,
     support_image_scale=(800, 1333),
-    support_qformer_cfg=dict(
+    support_visual_fusion_cfg=dict(
         hidden_dim=256,
-        num_queries=4,
-        num_layers=2,
         num_heads=8,
-        ffn_dim=1024,
         dropout=0.0),
     data_preprocessor=dict(
         type='DetDataPreprocessor',
@@ -162,5 +159,7 @@ default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
         interval=max_epochs))
+
+custom_hooks = [dict(type='VisualGateHistoryHook')]
 
 auto_scale_lr = dict(base_batch_size=16)

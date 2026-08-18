@@ -4,8 +4,8 @@
 학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop들로
 생성한 common visual description을 BERT prompt로 사용하되, class name에 해당하는
 token feature만 선택하여 text prototype을 만듭니다. `[CLS]` token은 사용하지
-않습니다. 각 support GT RoI의 visual token은 text-conditioned Q-Former를 거쳐
-learnable residual로 이 text prototype에 추가됩니다.
+않습니다. 각 support GT RoI의 visual token은 text prototype을 query로 사용하는
+단일 cross-attention을 거쳐 learnable residual로 이 text prototype에 추가됩니다.
 
 ## 데이터 구조
 
@@ -50,27 +50,32 @@ python mmdetection/tools/generate_instance_captions.py \
 수 없으면 CPU로 전환합니다. 다른 Qwen3-VL checkpoint나 장치를 사용하려면 각각
 `--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 common
 visual description은 기존 `captions` 배열의 `caption` 필드에 클래스당 하나씩
-저장됩니다. 같은 entry의 `file_names`와 `bboxes` 배열은 Q-Former support visual
-token을 추출할 때 사용되므로 길이가 같아야 하며 모든 target class를 포함해야 합니다.
+저장됩니다. 같은 entry의 `file_names`와 `bboxes` 배열은 support visual token을
+추출할 때 사용되므로 길이가 같아야 하며 모든 target class를 포함해야 합니다.
 
-## Q-Former prototype fusion
+## Single cross-attention prototype fusion
 
 각 support 이미지는 현재 Grounding DINO backbone과 neck을 통과합니다. 첫 번째 neck
 feature에서 GT bbox마다 `7x7` RoIAlign을 적용하고, object별 49개 token을 평균하지
 않은 채 같은 클래스끼리 concatenate합니다. 2D positional encoding이 추가된 token은
-클래스별 Q-Former memory가 되며, 서로 다른 클래스는 attention batch가 분리됩니다.
+클래스별 key/value가 되며, 서로 다른 클래스는 attention batch가 분리됩니다.
 
-Q-Former는 4개의 learnable query에 기존 text prototype을 더해 초기 query를 만들고,
-2개 layer의 query self-attention, visual cross-attention, FFN을 수행합니다. query 출력
-평균 `V`는 `T + alpha * V`로 기존 text prototype `T`에 추가됩니다. `alpha`는 학습되는
+기존 text prototype `T [C,256]`를 `query=T.unsqueeze(1) [C,1,256]`로 사용하고,
+support visual token `[C,L,256]`을 key/value로 사용하는 단일 8-head cross-attention이
+`V [C,256]`를 만듭니다. Learnable query, query self-attention, FFN, query pooling은
+사용하지 않습니다. 최종 prototype은 정확히 `T + alpha * V`이며, `alpha`는 학습되는
 scalar이고 0으로 초기화되므로 학습 시작 시 출력은 기존 text-only prototype과 정확히
 같습니다. Fusion 앞뒤에는 별도의 LayerNorm을 사용하지 않습니다.
 
-학습에서는 support 원본 입력만 CPU에 보관하고 BERT, backbone/neck, Q-Former 출력을
+학습에서는 support 원본 입력만 CPU에 보관하고 BERT, backbone/neck, cross-attention 출력을
 매 iteration 다시 계산합니다. 평가에서는 checkpoint의 최종 parameter와 target K-shot
 support set으로 fused prototype을 첫 predict 시 한 번 생성해 detach/cache하며, 이후
 모든 test image에 같은 prototype을 사용합니다. Test image feature는 prototype 생성에
 사용되지 않습니다.
+
+매 training epoch가 끝나면 현재 `alpha` 값이 work directory의
+`visual_gate_history.json`에 1-based epoch와 함께 기록되고 logger에도 한 번 출력됩니다.
+Resume 또는 동일 epoch 재실행 시 기존 epoch entry를 교체합니다.
 
 ## 학습과 평가
 
@@ -127,7 +132,7 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - LR milestone: epoch `20`, gamma `0.1`
 - train annotation: `annotations/{SHOT}_shot.json`
 - support visual description: `annotations/{SHOT}_shot_captions.json`
-- Q-Former: hidden dim `256`, queries `4`, layers `2`, heads `8`
+- visual fusion: hidden dim `256`, cross-attention heads `8`, dropout `0`
 - support RoIAlign: first neck level, output `7x7`, support image batch size `2`
 - validation/test annotation: `annotations/test.json`
 
