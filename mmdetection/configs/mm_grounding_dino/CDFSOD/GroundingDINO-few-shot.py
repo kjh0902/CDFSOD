@@ -11,10 +11,9 @@ num_classes = len(_base_.metainfo['classes'])
 prototype_tokens_per_class = 32
 max_text_len = (max(256, num_classes * prototype_tokens_per_class)
                 if _base_.use_class_name_token_prototypes else 256)
-support_caption_file = _base_.instance_caption_file
-if not os.path.isabs(support_caption_file):
-    support_caption_file = os.path.join(_base_.data_root,
-                                        support_caption_file)
+support_ann_file = _base_.train_ann_file
+if not os.path.isabs(support_ann_file):
+    support_ann_file = os.path.join(_base_.data_root, support_ann_file)
 
 model = dict(
     type='GroundingDINO',
@@ -22,7 +21,7 @@ model = dict(
     with_box_refine=True,
     as_two_stage=True,
     use_class_name_token_prototypes=_base_.use_class_name_token_prototypes,
-    support_caption_file=support_caption_file,
+    support_ann_file=support_ann_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
     support_image_root=os.path.join(_base_.data_root, 'train'),

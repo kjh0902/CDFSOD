@@ -97,52 +97,96 @@ def test_all_32_tokens_map_to_their_class():
     assert token_map == {1: list(range(32)), 2: list(range(32, 64))}
 
 
-@pytest.mark.parametrize(
-    'caption_entry, expected_message', [
-        ({
-            'category_name': 'class_0',
-            'file_names': ['a.jpg'],
-            'bboxes': [],
-        }, 'file_names/bboxes lengths differ'),
-        ({
-            'category_name': 'class_0',
-            'file_names': ['a.jpg'],
-            'bboxes': [[0, 0, 0, 2]],
-        }, 'non-positive bbox size'),
-    ])
-def test_support_metadata_validation(tmp_path, caption_entry,
-                                     expected_message):
-    caption_file = tmp_path / 'captions.json'
-    caption_file.write_text(
+@pytest.mark.parametrize('bbox, expected_message', [
+    ([0, 0, 2], 'invalid xywh bbox'),
+    ([0, 0, 0, 2], 'non-positive bbox size'),
+])
+def test_support_annotation_validation(tmp_path, bbox, expected_message):
+    ann_file = tmp_path / '1_shot.json'
+    ann_file.write_text(
         json.dumps({
-            'img_prefix': 'train',
-            'captions': [caption_entry],
-        }),
-        encoding='utf-8')
+            'images': [{
+                'id': 17,
+                'file_name': 'a.jpg'
+            }],
+            'categories': [{
+                'id': 5,
+                'name': 'class_0'
+            }],
+            'annotations': [{
+                'id': 99,
+                'image_id': 17,
+                'category_id': 5,
+                'bbox': bbox,
+            }],
+        }), encoding='utf-8')
     detector = _make_detector_stub(num_classes=1)
-    detector.support_caption_entries = None
-    detector.support_caption_file = str(caption_file)
+    detector.support_entries = None
+    detector.support_ann_file = str(ann_file)
     detector.support_image_root = str(tmp_path / 'train')
 
     with pytest.raises(ValueError, match=expected_message):
         detector.build_support_object_bank()
 
 
-def test_support_metadata_requires_every_class(tmp_path):
-    caption_file = tmp_path / 'captions.json'
-    caption_file.write_text(
+def test_support_annotation_resolves_coco_ids_and_class_names(tmp_path):
+    ann_file = tmp_path / '1_shot.json'
+    ann_file.write_text(
         json.dumps({
-            'img_prefix': 'train',
-            'captions': [{
-                'category_name': 'class_0',
-                'file_names': ['a.jpg'],
-                'bboxes': [[0, 0, 2, 2]],
+            'images': [{
+                'id': 17,
+                'file_name': 'nested/a.jpg'
             }],
-        }),
-        encoding='utf-8')
+            'categories': [{
+                'id': 5,
+                'name': 'class_0'
+            }],
+            'annotations': [{
+                'id': 99,
+                'image_id': 17,
+                'category_id': 5,
+                'bbox': [1, 2, 3, 4],
+            }],
+        }), encoding='utf-8')
+    detector = _make_detector_stub(num_classes=1)
+    detector.support_entries = None
+    detector.support_ann_file = str(ann_file)
+    detector.support_image_root = str(tmp_path / 'train')
+
+    detector.build_support_object_bank()
+
+    assert detector.support_entries == [{
+        'file_name': 'nested/a.jpg',
+        'bbox': (1.0, 2.0, 3.0, 4.0),
+        'class_idx': 0,
+    }]
+
+
+def test_support_annotation_requires_every_class(tmp_path):
+    ann_file = tmp_path / '1_shot.json'
+    ann_file.write_text(
+        json.dumps({
+            'images': [{
+                'id': 17,
+                'file_name': 'a.jpg'
+            }],
+            'categories': [{
+                'id': 5,
+                'name': 'class_0'
+            }, {
+                'id': 9,
+                'name': 'class_1'
+            }],
+            'annotations': [{
+                'id': 99,
+                'image_id': 17,
+                'category_id': 5,
+                'bbox': [0, 0, 2, 2],
+            }],
+        }), encoding='utf-8')
     detector = _make_detector_stub(num_classes=2)
-    detector.support_caption_entries = None
-    detector.support_caption_file = str(caption_file)
+    detector.support_entries = None
+    detector.support_ann_file = str(ann_file)
     detector.support_image_root = str(tmp_path / 'train')
 
     with pytest.raises(ValueError, match='class_1'):

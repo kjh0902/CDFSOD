@@ -61,7 +61,7 @@ class GroundingDINO(DINO):
                  *args,
                  use_autocast=False,
                  use_class_name_token_prototypes: bool = False,
-                 support_caption_file: Optional[str] = None,
+                 support_ann_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
                  support_image_root: Optional[str] = None,
@@ -74,7 +74,7 @@ class GroundingDINO(DINO):
         self._special_tokens = '. '
         self.use_autocast = use_autocast
         self.use_class_name_token_prototypes = use_class_name_token_prototypes
-        self.support_caption_file = support_caption_file
+        self.support_ann_file = support_ann_file
         self.support_class_names = list(support_class_names or [])
         self.support_domain_attribute = support_domain_attribute
         self.support_image_root = support_image_root
@@ -83,7 +83,7 @@ class GroundingDINO(DINO):
         self.support_image_batch_size = support_image_batch_size
         self.blip2_model_name = blip2_model_name
         self.blip2_gradient_checkpointing = blip2_gradient_checkpointing
-        self.support_caption_entries = None
+        self.support_entries = None
         self._support_pixel_values = None
         self._support_pixel_labels = None
         self._cached_eval_support_prototypes = None
@@ -242,96 +242,122 @@ class GroundingDINO(DINO):
         return positive_map_label_to_token, positive_map
 
     def build_support_object_bank(self) -> None:
-        """Load only support object paths, GT boxes and class labels."""
-        if self.support_caption_entries is not None:
+        """Load support object paths, GT boxes and labels from COCO JSON."""
+        if self.support_entries is not None:
             return
-        if not self.support_caption_file:
-            raise ValueError('support_caption_file is required when BLIP-2 '
+        if not self.support_ann_file:
+            raise ValueError('support_ann_file is required when BLIP-2 '
                              'visual prototypes are enabled.')
 
-        with open(self.support_caption_file, 'r', encoding='utf-8') as f:
-            caption_data = json.load(f)
-        if isinstance(caption_data, dict):
-            entries = caption_data.get(
-                'captions', caption_data.get('annotations', caption_data))
-        else:
-            entries = caption_data
-        if isinstance(entries, dict):
-            iterable_entries = [
-                value for value in entries.values() if isinstance(value, dict)
-            ]
-        else:
-            iterable_entries = entries
-        if not isinstance(iterable_entries, (list, tuple)):
-            raise ValueError('Support caption entries must be a list or dict.')
+        with open(self.support_ann_file, 'r', encoding='utf-8') as f:
+            support_data = json.load(f)
+        if not isinstance(support_data, dict):
+            raise ValueError('Support annotation file must be a COCO JSON '
+                             'dictionary.')
+
+        images = support_data.get('images')
+        annotations = support_data.get('annotations')
+        categories = support_data.get('categories')
+        if not isinstance(images, list) or not isinstance(annotations, list) \
+                or not isinstance(categories, list):
+            raise ValueError('Support annotation file must contain COCO '
+                             'images, annotations and categories arrays.')
 
         class_to_idx = {
             name: idx
             for idx, name in enumerate(self.support_class_names)
         }
+        images_by_id = {}
+        category_names_by_id = {}
         support_entries = []
         validation_errors = []
-        for item_idx, item in enumerate(iterable_entries):
-            if not isinstance(item, dict):
+
+        for image_idx, image in enumerate(images):
+            if not isinstance(image, dict):
                 validation_errors.append(
-                    f'entry {item_idx} is not a dictionary')
+                    f'image {image_idx} is not a dictionary')
                 continue
-            class_name = item.get('category_name', item.get('class_name'))
-            if class_name not in class_to_idx:
+            image_id = image.get('id')
+            file_name = image.get('file_name')
+            if image_id is None:
                 validation_errors.append(
-                    f'entry {item_idx} has unknown class {class_name!r}')
+                    f'image {image_idx} has no id')
                 continue
-            if 'file_names' in item or 'bboxes' in item:
-                file_names = item.get('file_names')
-                bboxes = item.get('bboxes')
-            else:
-                file_name = item.get('file_name')
-                bbox = item.get('bbox')
-                file_names = [file_name] if file_name is not None else None
-                bboxes = [bbox] if bbox is not None else None
-            if not isinstance(file_names, (list, tuple)) or not isinstance(
-                    bboxes, (list, tuple)):
+            if image_id in images_by_id:
                 validation_errors.append(
-                    f'entry {item_idx} must contain file_names and bboxes '
-                    'arrays')
+                    f'duplicate image id {image_id!r}')
                 continue
-            if len(file_names) != len(bboxes):
+            if not isinstance(file_name, str) or not file_name:
                 validation_errors.append(
-                    f'entry {item_idx} file_names/bboxes lengths differ '
-                    f'({len(file_names)} != {len(bboxes)})')
+                    f'image {image_idx} has an invalid file_name')
                 continue
-            if not file_names:
+            images_by_id[image_id] = file_name
+
+        for category_idx, category in enumerate(categories):
+            if not isinstance(category, dict):
                 validation_errors.append(
-                    f'entry {item_idx} contains no support objects')
+                    f'category {category_idx} is not a dictionary')
+                continue
+            category_id = category.get('id')
+            category_name = category.get('name')
+            if category_id is None:
+                validation_errors.append(
+                    f'category {category_idx} has no id')
+                continue
+            if category_id in category_names_by_id:
+                validation_errors.append(
+                    f'duplicate category id {category_id!r}')
+                continue
+            if not isinstance(category_name, str) or not category_name:
+                validation_errors.append(
+                    f'category {category_idx} has an invalid name')
+                continue
+            category_names_by_id[category_id] = category_name
+
+        for ann_idx, annotation in enumerate(annotations):
+            if not isinstance(annotation, dict):
+                validation_errors.append(
+                    f'annotation {ann_idx} is not a dictionary')
+                continue
+            image_id = annotation.get('image_id')
+            category_id = annotation.get('category_id')
+            if image_id not in images_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown image id '
+                    f'{image_id!r}')
+                continue
+            if category_id not in category_names_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown category id '
+                    f'{category_id!r}')
+                continue
+            category_name = category_names_by_id[category_id]
+            if category_name not in class_to_idx:
+                validation_errors.append(
+                    f'annotation {ann_idx} has unknown class '
+                    f'{category_name!r}')
+                continue
+            bbox = annotation.get('bbox')
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                validation_errors.append(
+                    f'annotation {ann_idx} has an invalid xywh bbox')
+                continue
+            try:
+                x, y, width, height = [float(value) for value in bbox]
+            except (TypeError, ValueError):
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-numeric bbox')
+                continue
+            if width <= 0 or height <= 0:
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-positive bbox size')
                 continue
 
-            class_idx = class_to_idx[class_name]
-            for object_idx, (file_name, bbox) in enumerate(
-                    zip(file_names, bboxes)):
-                object_name = f'entry {item_idx} object {object_idx}'
-                if not isinstance(file_name, str) or not file_name:
-                    validation_errors.append(
-                        f'{object_name} has an invalid file name')
-                    continue
-                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                    validation_errors.append(
-                        f'{object_name} has an invalid xywh bbox')
-                    continue
-                try:
-                    x, y, width, height = [float(value) for value in bbox]
-                except (TypeError, ValueError):
-                    validation_errors.append(
-                        f'{object_name} has a non-numeric bbox')
-                    continue
-                if width <= 0 or height <= 0:
-                    validation_errors.append(
-                        f'{object_name} has a non-positive bbox size')
-                    continue
-                support_entries.append(
-                    dict(
-                        file_name=file_name,
-                        bbox=(x, y, width, height),
-                        class_idx=class_idx))
+            support_entries.append(
+                dict(
+                    file_name=images_by_id[image_id],
+                    bbox=(x, y, width, height),
+                    class_idx=class_to_idx[category_name]))
 
         support_counts = [0] * len(self.support_class_names)
         for entry in support_entries:
@@ -345,25 +371,13 @@ class GroundingDINO(DINO):
                 f'classes without support objects: {missing_classes}')
         if validation_errors:
             raise ValueError(
-                f'Invalid support caption file {self.support_caption_file}: '
+                f'Invalid support annotation file {self.support_ann_file}: '
                 + '; '.join(validation_errors))
 
         if self.support_image_root is None:
-            img_prefix = (caption_data.get('img_prefix')
-                          if isinstance(caption_data, dict) else None)
-            if not isinstance(img_prefix, str) or not img_prefix:
-                raise ValueError(
-                    'support_image_root or caption JSON img_prefix is '
-                    'required for support images.')
-            if os.path.isabs(img_prefix):
-                self.support_image_root = img_prefix
-            else:
-                dataset_root = os.path.dirname(
-                    os.path.dirname(os.path.abspath(
-                        self.support_caption_file)))
-                self.support_image_root = os.path.join(dataset_root,
-                                                       img_prefix)
-        self.support_caption_entries = support_entries
+            raise ValueError('support_image_root is required for support '
+                             'images referenced by the COCO annotation file.')
+        self.support_entries = support_entries
 
     def _prepare_support_image_inputs(self) -> None:
         """Crop and preprocess support objects once, retaining CPU pixels."""
@@ -373,7 +387,7 @@ class GroundingDINO(DINO):
         image_cache = {}
         crops = []
         labels = []
-        for entry in self.support_caption_entries:
+        for entry in self.support_entries:
             image_path = entry['file_name']
             if not os.path.isabs(image_path):
                 image_path = os.path.join(self.support_image_root, image_path)

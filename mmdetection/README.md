@@ -5,16 +5,6 @@
 
 ## 핵심 실행 명령어
 
-support object metadata 생성:
-
-```bash
-python mmdetection/tools/generate_instance_captions.py \
-  --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
-  --ann-file annotations/1_shot.json \
-  --img-prefix train \
-  --output annotations/1_shot_captions.json
-```
-
 BLIP-2 visual prototype 방식 학습:
 
 ```bash
@@ -37,6 +27,8 @@ CDFSOD_DEBUG_TEXT_TOKENS=1 bash mmdetection/run_all_training.sh NEU-DET 1 1
 
 ```bash
 cd mmdetection
+CDFSOD_DATASET=NEU-DET \
+CDFSOD_TRAIN_ANN=annotations/1_shot.json \
 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
   work_dirs/NEU-DET_1shot_blip2_visual_prototype/epoch_30.pth \
@@ -47,9 +39,10 @@ python tools/test.py \
 
 기본값은 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1`입니다.
 
-Caption JSON의 `file_names`와 `bboxes`로 K-shot train support object를 crop하고,
+별도 caption JSON 없이 `annotations/{SHOT}_shot.json`의 표준 COCO `images`,
+`categories`, `annotations`를 직접 연결해 K-shot train support object를 crop하고,
 `Salesforce/blip2-itm-vit-g`의 pretrained image processor, ViT-G Image Encoder,
-Q-Former를 적용합니다. Caption text와 BERT는 이 prototype 경로에서 사용하지 않습니다.
+Q-Former를 적용합니다. BERT는 이 prototype 경로에서 사용하지 않습니다.
 
 각 object의 32개 Q-Former query token을 같은 class의 shot dimension에서만 평균한 뒤,
 Grounding DINO checkpoint의 기존 `text_feat_map`으로 768→256 projection합니다. Class당

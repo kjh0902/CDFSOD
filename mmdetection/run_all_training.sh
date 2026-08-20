@@ -12,7 +12,6 @@ export CDFSOD_DATA_ROOT="${CDFSOD_DATA_ROOT:-/home/aislab5090/CDFSOD/junhyung/da
 export CDFSOD_DATASET="$DATASET"
 export CDFSOD_TRAIN_ANN="annotations/${SHOT}_shot.json"
 export CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES="${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES:-1}"
-export CDFSOD_CAPTION_FILE="${CDFSOD_CAPTION_FILE:-annotations/${SHOT}_shot_captions.json}"
 
 CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py"
 TEXT_TAG="blip2_visual_prototype"
@@ -25,7 +24,7 @@ echo "dataset: ${DATASET}"
 echo "shot: ${SHOT}"
 echo "data root: ${CDFSOD_DATA_ROOT}/${DATASET}"
 echo "BLIP-2 visual prototypes: ${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES}"
-echo "caption file: ${CDFSOD_CAPTION_FILE}"
+echo "support annotation: ${CDFSOD_TRAIN_ANN}"
 echo "config: ${CONFIG}"
 echo "work dir: ${WORK_DIR}"
 
