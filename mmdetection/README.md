@@ -5,7 +5,7 @@
 
 ## 핵심 실행 명령어
 
-support visual description 생성:
+support object metadata 생성:
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
@@ -15,7 +15,7 @@ python mmdetection/tools/generate_instance_captions.py \
   --output annotations/1_shot_captions.json
 ```
 
-class-name token prototype 방식 학습:
+BLIP-2 visual prototype 방식 학습:
 
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1 1
@@ -39,19 +39,21 @@ CDFSOD_DEBUG_TEXT_TOKENS=1 bash mmdetection/run_all_training.sh NEU-DET 1 1
 cd mmdetection
 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_class_name_token_prototype/epoch_30.pth \
-  --work-dir work_dirs/NEU-DET_1shot_class_name_token_prototype
+  work_dirs/NEU-DET_1shot_blip2_visual_prototype/epoch_30.pth \
+  --work-dir work_dirs/NEU-DET_1shot_blip2_visual_prototype
 ```
 
 ## 현재 기본 동작
 
 기본값은 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1`입니다.
 
-Qwen3-VL은 같은 클래스의 K-shot GT bbox crop 전체와 class name을 하나의 conversation으로 입력받아 클래스당 common visual description 하나를 생성합니다. 원본 이미지 전체와 bbox 좌표는 Qwen에 전달하지 않으며, instance별 description을 생성하거나 평균하지 않습니다. 학습 중 이 JSON을 한 번 읽어서 class별 prompt bank를 만들고, 매 iteration마다 현재 BERT로 class-level enriched prompt를 다시 encoding합니다.
-BERT에는 `{class_name}: {visual_description}.` 전체 prompt가 들어가지만, 출력에서는 tokenizer `offset_mapping`을 이용해 class name 문자 범위와 겹치는 token feature만 선택합니다.
+Caption JSON의 `file_names`와 `bboxes`로 K-shot train support object를 crop하고,
+`Salesforce/blip2-itm-vit-g`의 pretrained image processor, ViT-G Image Encoder,
+Q-Former를 적용합니다. Caption text와 BERT는 이 prototype 경로에서 사용하지 않습니다.
 
-JSON에 클래스당 prompt가 하나이므로 선택된 class-name token feature로 class당 1개 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
-같은 JSON의 `file_names`와 `bboxes`로 support object를 다시 읽고, 현재 backbone+neck의 첫 feature에서 object별 `7x7` RoIAlign token을 추출합니다. Shot 평균 없이 클래스별로 concatenate한 token을 key/value로, text prototype `T [C,256]`를 query `T.unsqueeze(1) [C,1,256]`로 사용하는 단일 8-head cross-attention이 `V [C,256]`를 만듭니다. 최종 prototype은 정규화 없이 정확히 `T + alpha * V`이며, `alpha`는 0으로 초기화되는 learnable scalar이므로 초기 출력은 기존 `T`와 같습니다.
-
-학습 중 support visual feature와 cross-attention 출력은 매 iteration 다시 계산됩니다. 매 epoch 종료 후 `visual_gate_history.json`에 1-based epoch와 현재 `alpha`가 기록됩니다. 평가 중에는 target support set으로 fused prototype을 최초 한 번만 생성해 detach/cache하고 모든 test image에서 재사용하며, test image는 prototype 생성에 사용되지 않습니다.
+각 object의 32개 Q-Former query token을 같은 class의 shot dimension에서만 평균한 뒤,
+Grounding DINO checkpoint의 기존 `text_feat_map`으로 768→256 projection합니다. Class당
+32개 token 전체가 positive prototype으로 유지됩니다. 학습 중 Image Encoder와 Q-Former
+출력은 매 iteration 다시 계산되고, 평가 중에는 마지막 checkpoint로 최초 한 번 계산해
+detach/cache합니다. Test image와 test GT는 prototype 생성에 사용되지 않습니다.
 baseline을 원하면 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`으로 실행하면 됩니다.

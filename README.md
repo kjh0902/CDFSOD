@@ -1,11 +1,10 @@
-# CDFSOD Grounding DINO class-name token prototype
+# CDFSOD Grounding DINO BLIP-2 visual prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop들로
-생성한 common visual description을 BERT prompt로 사용하되, class name에 해당하는
-token feature만 선택하여 text prototype을 만듭니다. `[CLS]` token은 사용하지
-않습니다. 각 support GT RoI의 visual token은 text prototype을 query로 사용하는
-단일 cross-attention을 거쳐 learnable residual로 이 text prototype에 추가됩니다.
+학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop을
+pretrained BLIP-2 Image Encoder와 Q-Former에 입력하여 class당 32개 visual prototype
+token을 만듭니다. CDFSOD prototype 생성 경로에서는 BERT를 사용하지 않으며, 일반
+Grounding DINO text prompt 경로는 그대로 유지합니다.
 
 ## 데이터 구조
 
@@ -30,13 +29,11 @@ DATASET_NAME/
 `mmdetection/configs/_base_/datasets/CDFSOD_detection_few-shot.py`에 정의되어
 있습니다.
 
-## support visual description 생성
+## support object metadata
 
-기본 prototype 방식으로 학습하려면 먼저 클래스별 common visual description JSON을
-생성합니다. 스크립트는 같은 클래스의 K개 GT bbox crop과 class name을 하나의
-Qwen3-VL conversation에 입력하여 클래스당 description 하나를 생성합니다. bbox
-좌표와 원본 이미지 전체는 Qwen에 전달하지 않습니다. 다음 예시는 NEU-DET 1-shot
-description을 생성합니다.
+기본 prototype 방식은 기존 caption JSON의 `category_name`, `file_names`, `bboxes`를
+support object 목록으로 사용합니다. `caption` 문장은 BLIP-2 prototype 생성에 사용하지
+않습니다. 다음 기존 스크립트로 호환되는 metadata JSON을 만들 수 있습니다.
 
 ```bash
 python mmdetection/tools/generate_instance_captions.py \
@@ -46,36 +43,27 @@ python mmdetection/tools/generate_instance_captions.py \
   --output annotations/1_shot_captions.json
 ```
 
-생성 스크립트는 기본적으로 `Qwen/Qwen3-VL-8B-Instruct`를 사용하며, CUDA를 사용할
-수 없으면 CPU로 전환합니다. 다른 Qwen3-VL checkpoint나 장치를 사용하려면 각각
-`--model-name`, `--device`로 지정할 수 있습니다. JSON 호환성을 위해 생성된 common
-visual description은 기존 `captions` 배열의 `caption` 필드에 클래스당 하나씩
-저장됩니다. 같은 entry의 `file_names`와 `bboxes` 배열은 support visual token을
-추출할 때 사용되므로 길이가 같아야 하며 모든 target class를 포함해야 합니다.
+각 entry의 `file_names`와 `bboxes` 길이는 같아야 하고 모든 target class가 최소 한 개의
+support object를 가져야 합니다. Prototype loader는 `support_image_root` 아래의 train
+image만 읽으며 test image와 test GT는 사용하지 않습니다.
 
-## Single cross-attention prototype fusion
+## BLIP-2 visual prototype
 
-각 support 이미지는 현재 Grounding DINO backbone과 neck을 통과합니다. 첫 번째 neck
-feature에서 GT bbox마다 `7x7` RoIAlign을 적용하고, object별 49개 token을 평균하지
-않은 채 같은 클래스끼리 concatenate합니다. 2D positional encoding이 추가된 token은
-클래스별 key/value가 되며, 서로 다른 클래스는 attention batch가 분리됩니다.
+기본 checkpoint는 `Salesforce/blip2-itm-vit-g`입니다. 이 checkpoint의 pretrained
+ViT-G Image Encoder, pretrained Q-Former, pretrained 32 query tokens만 사용하며 language
+model과 BLIP-2 projection은 사용하지 않습니다. 다른 Hugging Face model id 또는 로컬
+checkpoint 경로는 `CDFSOD_BLIP2_MODEL`로 지정할 수 있습니다.
 
-기존 text prototype `T [C,256]`를 `query=T.unsqueeze(1) [C,1,256]`로 사용하고,
-support visual token `[C,L,256]`을 key/value로 사용하는 단일 8-head cross-attention이
-`V [C,256]`를 만듭니다. Learnable query, query self-attention, FFN, query pooling은
-사용하지 않습니다. 최종 prototype은 정확히 `T + alpha * V`이며, `alpha`는 학습되는
-scalar이고 0으로 초기화되므로 학습 시작 시 출력은 기존 text-only prototype과 정확히
-같습니다. Fusion 앞뒤에는 별도의 LayerNorm을 사용하지 않습니다.
+GT bbox crop은 BLIP-2 checkpoint의 image processor로 resize/normalize됩니다. Object별
+Q-Former 출력은 `[32,768]`이며 같은 class의 K-shot 출력 `[K,32,768]`은 shot dimension만
+평균합니다. 32 query token은 평균하지 않습니다. 결과 `[C,32,768]`은 Grounding DINO
+checkpoint의 기존 pretrained `text_feat_map`으로 `[C,32,256]`에 투영됩니다. 새 projection
+layer는 만들지 않습니다.
 
-학습에서는 support 원본 입력만 CPU에 보관하고 BERT, backbone/neck, cross-attention 출력을
-매 iteration 다시 계산합니다. 평가에서는 checkpoint의 최종 parameter와 target K-shot
-support set으로 fused prototype을 첫 predict 시 한 번 생성해 detach/cache하며, 이후
-모든 test image에 같은 prototype을 사용합니다. Test image feature는 prototype 생성에
-사용되지 않습니다.
-
-매 training epoch가 끝나면 현재 `alpha` 값이 work directory의
-`visual_gate_history.json`에 1-based epoch와 함께 기록되고 logger에도 한 번 출력됩니다.
-Resume 또는 동일 epoch 재실행 시 기존 epoch entry를 교체합니다.
+학습에서는 BLIP-2 전처리 pixel tensor만 CPU에 보관하고 Image Encoder와 Q-Former 출력을
+매 iteration 다시 계산합니다. Image Encoder, Q-Former, query tokens, `text_feat_map` 모두
+fine-tuning됩니다. 평가에서는 마지막 checkpoint의 parameter와 target support set으로
+prototype을 첫 predict 시 다시 생성해 detach/cache합니다.
 
 ## 학습과 평가
 
@@ -98,7 +86,7 @@ CDFSOD_DATA_ROOT=/other/datasets \
   bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
-기본 visual description 파일은 `annotations/{SHOT}_shot_captions.json`입니다. 다른
+기본 support metadata 파일은 `annotations/{SHOT}_shot_captions.json`입니다. 다른
 파일을 사용하려면 다음과 같이 지정합니다.
 
 ```bash
@@ -107,10 +95,10 @@ CDFSOD_CAPTION_FILE=annotations/custom_captions.json \
 ```
 
 기본 실험 결과는
-`mmdetection/work_dirs/{DATASET}_{SHOT}shot_class_name_token_prototype`에 저장됩니다.
+`mmdetection/work_dirs/{DATASET}_{SHOT}shot_blip2_visual_prototype`에 저장됩니다.
 스크립트는 30 epoch 학습 후 `epoch_30.pth`를 평가합니다.
 
-visual-description prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은
+BLIP-2 visual prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은
 다음과 같이 실행합니다. 결과 경로에는 `_class_name` suffix가 붙습니다.
 
 ```bash
@@ -125,15 +113,17 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - 모델: Grounding DINO Swin-B
 - pretrained checkpoint: OpenMMLab Grounding DINO Swin-B checkpoint
 - optimizer: AdamW
-- learning rate: `1e-4` (backbone multiplier `0.1`)
+- learning rate: `1e-4` (backbone `0.1`, BLIP-2 ViT-G `0.01`, Q-Former와
+  query tokens `0.1`, `text_feat_map` `0.1` multiplier)
 - weight decay: `1e-4`
 - batch size: GPU당 `2`
 - epochs: `30`
 - LR milestone: epoch `20`, gamma `0.1`
 - train annotation: `annotations/{SHOT}_shot.json`
-- support visual description: `annotations/{SHOT}_shot_captions.json`
-- visual fusion: hidden dim `256`, cross-attention heads `8`, dropout `0`
-- support RoIAlign: first neck level, output `7x7`, support image batch size `2`
+- support object metadata: `annotations/{SHOT}_shot_captions.json`
+- BLIP-2: `Salesforce/blip2-itm-vit-g`, 32 queries, hidden dim `768`
+- support crop batch size: `2`, pretrained image processor 사용
+- prototype tokens: class당 `32`, `max_text_len=max(256, classes*32)`
 - validation/test annotation: `annotations/test.json`
 
 상세 설정은
@@ -149,6 +139,6 @@ CDFSOD_TRAIN_ANN=annotations/1_shot.json \
 CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_class_name_token_prototype/epoch_30.pth \
-  --work-dir work_dirs/NEU-DET_1shot_class_name_token_prototype
+  work_dirs/NEU-DET_1shot_blip2_visual_prototype/epoch_30.pth \
+  --work-dir work_dirs/NEU-DET_1shot_blip2_visual_prototype
 ```

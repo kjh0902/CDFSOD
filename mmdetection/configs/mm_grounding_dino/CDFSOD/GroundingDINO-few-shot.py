@@ -8,6 +8,9 @@ import os
 
 lang_model_name = 'bert-base-uncased'
 num_classes = len(_base_.metainfo['classes'])
+prototype_tokens_per_class = 32
+max_text_len = (max(256, num_classes * prototype_tokens_per_class)
+                if _base_.use_class_name_token_prototypes else 256)
 support_caption_file = _base_.instance_caption_file
 if not os.path.isabs(support_caption_file):
     support_caption_file = os.path.join(_base_.data_root,
@@ -24,11 +27,9 @@ model = dict(
     support_domain_attribute=_base_.domain_attribute,
     support_image_root=os.path.join(_base_.data_root, 'train'),
     support_image_batch_size=2,
-    support_image_scale=(800, 1333),
-    support_visual_fusion_cfg=dict(
-        hidden_dim=256,
-        num_heads=8,
-        dropout=0.0),
+    blip2_model_name=os.getenv(
+        'CDFSOD_BLIP2_MODEL', 'Salesforce/blip2-itm-vit-g'),
+    blip2_gradient_checkpointing=True,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -105,7 +106,8 @@ model = dict(
         type='GroundingDINOHead',
         num_classes=num_classes,
         sync_cls_avg_factor=True,
-        contrastive_cfg=dict(max_text_len=256, log_scale=0.0, bias=False),
+        contrastive_cfg=dict(
+            max_text_len=max_text_len, log_scale=0.0, bias=False),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
@@ -135,7 +137,11 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
-        'backbone': dict(lr_mult=0.1)
+        'backbone': dict(lr_mult=0.1),
+        'support_blip2_encoder.vision_model': dict(lr_mult=0.01),
+        'support_blip2_encoder.qformer': dict(lr_mult=0.1),
+        'support_blip2_encoder.query_tokens': dict(lr_mult=0.1),
+        'text_feat_map': dict(lr_mult=0.1),
     }))
 
 max_epochs = 30
@@ -159,7 +165,5 @@ default_hooks = dict(
     checkpoint=dict(
         by_epoch=True,
         interval=max_epochs))
-
-custom_hooks = [dict(type='VisualGateHistoryHook')]
 
 auto_scale_lr = dict(base_batch_size=16)

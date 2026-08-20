@@ -7,7 +7,6 @@ from .pipeline_switch_hook import PipelineSwitchHook
 from .set_epoch_info_hook import SetEpochInfoHook
 from .sync_norm_hook import SyncNormHook
 from .utils import trigger_visualization_hook
-from .visual_gate_history_hook import VisualGateHistoryHook
 from .visualization_hook import (DetVisualizationHook,
                                  GroundingVisualizationHook,
                                  TrackVisualizationHook)
@@ -18,5 +17,5 @@ __all__ = [
     'SetEpochInfoHook', 'MemoryProfilerHook', 'DetVisualizationHook',
     'NumClassCheckHook', 'MeanTeacherHook', 'trigger_visualization_hook',
     'PipelineSwitchHook', 'TrackVisualizationHook',
-    'GroundingVisualizationHook', 'VisualGateHistoryHook'
+    'GroundingVisualizationHook'
 ]

@@ -15,7 +15,7 @@ export CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES="${CDFSOD_USE_CLASS_NAME_TOKEN_PRO
 export CDFSOD_CAPTION_FILE="${CDFSOD_CAPTION_FILE:-annotations/${SHOT}_shot_captions.json}"
 
 CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py"
-TEXT_TAG="class_name_token_prototype"
+TEXT_TAG="blip2_visual_prototype"
 if [ "$CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES" = "0" ]; then
   TEXT_TAG="class_name"
 fi
@@ -24,7 +24,7 @@ WORK_DIR="work_dirs/${DATASET}_${SHOT}shot_${TEXT_TAG}"
 echo "dataset: ${DATASET}"
 echo "shot: ${SHOT}"
 echo "data root: ${CDFSOD_DATA_ROOT}/${DATASET}"
-echo "class-name token prototypes: ${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES}"
+echo "BLIP-2 visual prototypes: ${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES}"
 echo "caption file: ${CDFSOD_CAPTION_FILE}"
 echo "config: ${CONFIG}"
 echo "work dir: ${WORK_DIR}"
