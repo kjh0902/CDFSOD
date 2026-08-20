@@ -136,6 +136,11 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
+        'backbone': dict(lr_mult=0.1),
+        'support_blip2_encoder.vision_model': dict(lr_mult=0.01),
+        'support_blip2_encoder.qformer': dict(lr_mult=0.1),
+        'support_blip2_encoder.query_tokens': dict(lr_mult=0.1),
+        'text_feat_map': dict(lr_mult=0.1),
     }))
 
 max_epochs = 30
