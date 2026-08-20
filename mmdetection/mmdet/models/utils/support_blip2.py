@@ -5,8 +5,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch import Tensor
-from transformers import (Blip2ImageProcessor,
-                          Blip2VisionModelWithProjection)
+from transformers import Blip2VisionModelWithProjection, BlipImageProcessor
 
 
 class SupportBlip2Encoder(nn.Module):
@@ -22,7 +21,7 @@ class SupportBlip2Encoder(nn.Module):
                  gradient_checkpointing: bool = True) -> None:
         super().__init__()
         pretrained = Blip2VisionModelWithProjection.from_pretrained(model_name)
-        self.image_processor = Blip2ImageProcessor.from_pretrained(model_name)
+        self.image_processor = BlipImageProcessor.from_pretrained(model_name)
         self.vision_model = pretrained.vision_model
         self.qformer = pretrained.qformer
         self.query_tokens = pretrained.query_tokens

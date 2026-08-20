@@ -57,7 +57,7 @@ def _build_encoder():
             'Blip2VisionModelWithProjection.from_pretrained',
             return_value=pretrained) as model_loader, patch(
                 'mmdet.models.utils.support_blip2.'
-                'Blip2ImageProcessor.from_pretrained',
+                'BlipImageProcessor.from_pretrained',
                 return_value=_FakeProcessor()) as processor_loader:
         encoder = SupportBlip2Encoder('fake/blip2')
     model_loader.assert_called_once_with('fake/blip2')
