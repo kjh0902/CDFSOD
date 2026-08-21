@@ -76,6 +76,7 @@ class _FakeTokenizer:
 
     def __init__(self):
         self.unk_token_id = 1
+        self.bos_token_id = None
         self._vocab = {
             '[PAD]': 0,
             '[UNK]': 1,
@@ -87,9 +88,23 @@ class _FakeTokenizer:
             ':': 7,
             'class': 8,
             'token': 9,
-            '[DEC]': 10,
-            '[ENC]': 11,
         }
+
+    def add_special_tokens(self, special_tokens_dict):
+        tokens = []
+        bos_token = special_tokens_dict.get('bos_token')
+        if bos_token is not None:
+            tokens.append(bos_token)
+        tokens.extend(special_tokens_dict.get(
+            'additional_special_tokens', []))
+        added = 0
+        for token in tokens:
+            if token not in self._vocab:
+                self._vocab[token] = len(self._vocab)
+                added += 1
+        if bos_token is not None:
+            self.bos_token_id = self._vocab[bos_token]
+        return added
 
     def convert_tokens_to_ids(self, token):
         return self._vocab.get(token, self.unk_token_id)
@@ -130,6 +145,8 @@ def test_pretrained_caption_components_are_preserved_and_trainable():
 
     assert captioner.hidden_size == 768
     assert captioner.max_length == 20
+    assert captioner.tokenizer.bos_token_id == 10
+    assert captioner.enc_token_id == 11
     assert all(parameter.requires_grad for parameter in captioner.parameters())
     assert captioner.vision_model.checkpointing_enabled
     assert captioner.text_decoder.checkpointing_enabled

@@ -34,6 +34,9 @@ class SupportBlipCaptioner(nn.Module):
         self.bos_token_id = pretrained.config.text_config.bos_token_id
         self.sep_token_id = pretrained.config.text_config.sep_token_id
         self.pad_token_id = pretrained.config.text_config.pad_token_id
+        self.tokenizer.add_special_tokens({'bos_token': '[DEC]'})
+        self.tokenizer.add_special_tokens(
+            {'additional_special_tokens': ['[ENC]']})
         self.enc_token_id = self.tokenizer.convert_tokens_to_ids('[ENC]')
 
         if self.hidden_size != 768:
@@ -50,9 +53,17 @@ class SupportBlipCaptioner(nn.Module):
         if self.enc_token_id == self.tokenizer.unk_token_id:
             raise ValueError('BLIP tokenizer must contain the pretrained '
                              '[ENC] token.')
-        if max(self.bos_token_id, self.enc_token_id) >= self.vocab_size:
+        if self.tokenizer.bos_token_id != self.bos_token_id:
             raise ValueError(
-                'BLIP special token ids exceed decoder vocabulary.')
+                'BLIP tokenizer [DEC] id must match the pretrained decoder '
+                f'BOS id, got {self.tokenizer.bos_token_id} and '
+                f'{self.bos_token_id}.')
+        if self.bos_token_id != self.vocab_size - 2 or \
+                self.enc_token_id != self.vocab_size - 1:
+            raise ValueError(
+                'BLIP pretrained [DEC]/[ENC] ids must occupy the final two '
+                f'decoder vocabulary rows, got {self.bos_token_id} and '
+                f'{self.enc_token_id} for vocab_size={self.vocab_size}.')
 
         input_embeddings = self.text_decoder.get_input_embeddings()
         if input_embeddings.num_embeddings != self.vocab_size:
