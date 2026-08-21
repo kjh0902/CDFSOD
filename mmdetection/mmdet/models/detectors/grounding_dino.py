@@ -68,7 +68,7 @@ class GroundingDINO(DINO):
                  support_image_batch_size: int = 2,
                  blip_model_name: str = 'Salesforce/blip-itm-base-coco',
                  blip_gradient_checkpointing: bool = True,
-                 blip_prototype_mode: str = 'class_avg',
+                 blip_positive_map_mode: str = 'class_only',
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
@@ -84,12 +84,12 @@ class GroundingDINO(DINO):
         self.support_image_batch_size = support_image_batch_size
         self.blip_model_name = blip_model_name
         self.blip_gradient_checkpointing = blip_gradient_checkpointing
-        prototype_modes = ('class_avg', 'class_tokens', 'all_tokens')
-        if blip_prototype_mode not in prototype_modes:
+        positive_map_modes = ('all', 'class_only')
+        if blip_positive_map_mode not in positive_map_modes:
             raise ValueError(
-                f'blip_prototype_mode must be one of {prototype_modes}, '
-                f'got {blip_prototype_mode!r}.')
-        self.blip_prototype_mode = blip_prototype_mode
+                'blip_positive_map_mode must be one of '
+                f'{positive_map_modes}, got {blip_positive_map_mode!r}.')
+        self.blip_positive_map_mode = blip_positive_map_mode
         self.support_entries = None
         self._support_pixel_values = None
         self._support_input_ids = None
@@ -97,7 +97,9 @@ class GroundingDINO(DINO):
         self._support_special_tokens_mask = None
         self._support_pixel_labels = None
         self._prototype_token_counts = None
+        self._prototype_class_token_masks = None
         self._cached_eval_support_prototypes = None
+        self._cached_eval_support_class_token_masks = None
         super().__init__(*args, **kwargs)
         if self.use_blip_prototypes:
             self.support_blip_encoder = SupportBlipEncoder(
@@ -143,6 +145,7 @@ class GroundingDINO(DINO):
         super().train(mode)
         if mode:
             self._cached_eval_support_prototypes = None
+            self._cached_eval_support_class_token_masks = None
         return self
 
     def init_weights(self) -> None:
@@ -436,8 +439,8 @@ class GroundingDINO(DINO):
     def aggregate_support_multimodal_tokens(
             object_tokens: Tensor, object_labels: Tensor,
             attention_mask: Tensor, special_tokens_mask: Tensor,
-            num_classes: int, mode: str) -> List[Tensor]:
-        """Aggregate independently encoded support pairs by class."""
+            num_classes: int) -> Tuple[List[Tensor], List[Tensor]]:
+        """Average support pairs by class while retaining all valid tokens."""
         if object_tokens.dim() != 3:
             raise ValueError(
                 'object_tokens must have shape [N, text_tokens, hidden].')
@@ -451,13 +454,9 @@ class GroundingDINO(DINO):
             raise ValueError('num_classes must be positive.')
         if ((object_labels < 0) | (object_labels >= num_classes)).any():
             raise ValueError('Support labels are outside the class range.')
-        prototype_modes = ('class_avg', 'class_tokens', 'all_tokens')
-        if mode not in prototype_modes:
-            raise ValueError(
-                f'Prototype mode must be one of {prototype_modes}, '
-                f'got {mode!r}.')
 
         class_prototypes = []
+        class_token_masks = []
         missing_classes = []
         for class_idx in range(num_classes):
             class_mask = object_labels == class_idx
@@ -482,27 +481,22 @@ class GroundingDINO(DINO):
                     f'Class {class_idx} support texts have different special '
                     'token masks.')
 
-            if mode == 'all_tokens':
-                selected_mask = class_attention_mask[0]
-            else:
-                selected_mask = class_attention_mask[0] & \
-                    ~class_special_tokens_mask[0]
-            if not selected_mask.any():
+            valid_token_mask = class_attention_mask[0]
+            if not valid_token_mask.any():
                 raise ValueError(
-                    f'Class {class_idx} has no tokens for mode {mode!r}.')
+                    f'Class {class_idx} has no valid text tokens.')
 
-            selected_tokens = class_tokens[:, selected_mask, :]
-            if mode == 'class_avg':
-                averaged_tokens = selected_tokens.mean(dim=(0, 1))
-                class_prototypes.append(averaged_tokens.unsqueeze(0))
-            else:
-                class_prototypes.append(selected_tokens.mean(dim=0))
+            selected_tokens = class_tokens[:, valid_token_mask, :]
+            class_prototypes.append(selected_tokens.mean(dim=0))
+            class_token_masks.append(
+                ~class_special_tokens_mask[0, valid_token_mask])
         if missing_classes:
             raise ValueError('No support object found for class indices: '
                              f'{missing_classes}.')
-        return class_prototypes
+        return class_prototypes, class_token_masks
 
-    def compute_support_multimodal_tokens(self, device) -> List[Tensor]:
+    def compute_support_multimodal_tokens(
+            self, device) -> Tuple[List[Tensor], List[Tensor]]:
         """Recompute BLIP vision and multimodal text encoder outputs."""
         self._prepare_support_image_inputs()
         object_tokens = []
@@ -524,37 +518,55 @@ class GroundingDINO(DINO):
         special_tokens_mask = self._support_special_tokens_mask.to(device)
         return self.aggregate_support_multimodal_tokens(
             multimodal_tokens, labels, attention_mask, special_tokens_mask,
-            len(self.support_class_names), self.blip_prototype_mode)
+            len(self.support_class_names))
 
-    def compute_visual_support_prototypes(self, device) -> List[Tensor]:
+    def compute_visual_support_prototypes(
+            self, device) -> Tuple[List[Tensor], List[Tensor]]:
         """Build variable-length 256-D BLIP prototypes for every class."""
-        multimodal_prototypes = self.compute_support_multimodal_tokens(device)
+        multimodal_prototypes, class_token_masks = \
+            self.compute_support_multimodal_tokens(device)
         for prototype in multimodal_prototypes:
             if prototype.dim() != 2 or \
                     prototype.size(1) != self.text_feat_map.in_features:
                 raise RuntimeError(
                     'Unexpected aggregated BLIP prototype shape: '
                     f'{tuple(prototype.shape)}.')
-        return [self.text_feat_map(prototype)
-                for prototype in multimodal_prototypes]
+        projected_prototypes = [
+            self.text_feat_map(prototype)
+            for prototype in multimodal_prototypes
+        ]
+        return projected_prototypes, class_token_masks
 
     def _prototypes_to_text_dict(self, prototypes: Sequence[Tensor],
+                                 class_token_masks: Sequence[Tensor],
                                  batch_size: int) -> Dict:
         """Flatten class-major variable-length prototypes at the boundary."""
         if len(prototypes) != len(self.support_class_names):
             raise ValueError('Visual prototype class count is inconsistent.')
         if not prototypes:
             raise ValueError('At least one visual prototype is required.')
-        for prototype in prototypes:
+        if len(class_token_masks) != len(prototypes):
+            raise ValueError(
+                'Prototype class-token mask count is inconsistent.')
+        for prototype, class_token_mask in zip(
+                prototypes, class_token_masks):
             if prototype.dim() != 2 or prototype.size(0) <= 0 or \
                     prototype.size(1) != self.embed_dims:
                 raise ValueError(
                     'Each visual prototype must have shape [tokens, hidden].')
+            if class_token_mask.dim() != 1 or \
+                    class_token_mask.numel() != prototype.size(0):
+                raise ValueError(
+                    'Each class-token mask must match its prototype length.')
         device = prototypes[0].device
         if any(prototype.device != device for prototype in prototypes):
             raise ValueError('All visual prototypes must use the same device.')
         self._prototype_token_counts = [
             prototype.size(0) for prototype in prototypes
+        ]
+        self._prototype_class_token_masks = [
+            class_token_mask.detach().bool().cpu()
+            for class_token_mask in class_token_masks
         ]
         flattened_prototypes = torch.cat(list(prototypes), dim=0)
         num_tokens = flattened_prototypes.size(0)
@@ -586,18 +598,32 @@ class GroundingDINO(DINO):
         """Build text_dict from BLIP multimodal support prototypes."""
         if (not self.training and
                 self._cached_eval_support_prototypes is not None):
+            if self._cached_eval_support_class_token_masks is None:
+                raise RuntimeError(
+                    'Cached BLIP prototypes are missing class-token masks.')
             prototypes = [
                 prototype.to(device)
                 for prototype in self._cached_eval_support_prototypes
             ]
-            return self._prototypes_to_text_dict(prototypes, batch_size)
+            class_token_masks = [
+                class_token_mask.to(device)
+                for class_token_mask in
+                self._cached_eval_support_class_token_masks
+            ]
+            return self._prototypes_to_text_dict(
+                prototypes, class_token_masks, batch_size)
 
-        prototypes = self.compute_visual_support_prototypes(device)
+        prototypes, class_token_masks = \
+            self.compute_visual_support_prototypes(device)
         if not self.training:
             prototypes = [prototype.detach() for prototype in prototypes]
             self._cached_eval_support_prototypes = tuple(
                 prototype.cpu() for prototype in prototypes)
-        return self._prototypes_to_text_dict(prototypes, batch_size)
+            self._cached_eval_support_class_token_masks = tuple(
+                class_token_mask.detach().bool().cpu()
+                for class_token_mask in class_token_masks)
+        return self._prototypes_to_text_dict(
+            prototypes, class_token_masks, batch_size)
 
     def _prototype_token_ranges(self) -> List[Tuple[int, int]]:
         """Return class-major token ranges for the current prototypes."""
@@ -614,34 +640,63 @@ class GroundingDINO(DINO):
             start = end
         return ranges
 
+    def _prototype_positive_token_indices(self) -> List[List[int]]:
+        """Return the configured positive positions for every class."""
+        token_ranges = self._prototype_token_ranges()
+        if self.blip_positive_map_mode == 'all':
+            return [list(range(start, end)) for start, end in token_ranges]
+        if self._prototype_class_token_masks is None or \
+                len(self._prototype_class_token_masks) != \
+                len(token_ranges):
+            raise RuntimeError(
+                'Prototype class-token masks must be built before positive '
+                'maps.')
+
+        positive_indices = []
+        for class_idx, ((start, end), class_token_mask) in enumerate(zip(
+                token_ranges, self._prototype_class_token_masks)):
+            if class_token_mask.numel() != end - start:
+                raise RuntimeError(
+                    f'Class {class_idx} token mask does not match its '
+                    'prototype length.')
+            class_indices = (
+                class_token_mask.nonzero(as_tuple=False).flatten() + start
+            ).tolist()
+            if not class_indices:
+                raise ValueError(
+                    f'Class {class_idx} has no lexical tokens for '
+                    'class_only positive mapping.')
+            positive_indices.append(class_indices)
+        return positive_indices
+
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Mark all BLIP prototype tokens belonging to each class positive."""
+        """Build class targets from the configured prototype positions."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
-        token_ranges = self._prototype_token_ranges()
+        positive_token_indices = self._prototype_positive_token_indices()
         positive_maps = []
         for labels in gt_labels:
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                if label < 0 or label >= len(token_ranges):
+                if label < 0 or label >= len(positive_token_indices):
                     raise ValueError(
                         f'Class label {label} exceeds prototype token range.')
-                start, end = token_ranges[label]
-                if end > max_text_len:
+                token_indices = positive_token_indices[label]
+                if token_indices[-1] >= max_text_len:
                     raise ValueError(
                         f'Class label {label} exceeds max_text_len.')
-                positive_map[row_idx, start:end] = 1.0
+                positive_map[row_idx, token_indices] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map each class to all of its BLIP prototype token positions."""
+        """Map classes to configured BLIP prototype token positions."""
         return {
-            class_idx + 1: list(range(start, end))
-            for class_idx, (start, end) in enumerate(
-                self._prototype_token_ranges())
+            class_idx + 1: token_indices
+            for class_idx, token_indices in enumerate(
+                self._prototype_positive_token_indices())
         }
 
     def get_tokens_positive_and_prompts(

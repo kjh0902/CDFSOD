@@ -3,9 +3,9 @@
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
 학습 코드입니다. 기본 설정은 class name과 클래스별 K-shot support instance의 GT bbox
 crop을 pretrained BLIP-1 multimodal encoder에 독립적인 image-text pair로 입력합니다.
-BLIP text output을 선택한 aggregation mode로 결합한 뒤 Grounding DINO text prototype으로
-사용합니다. 이 prototype 경로에서는 BERT를 사용하지 않으며 일반 Grounding DINO text
-prompt 경로는 그대로 유지합니다.
+BLIP text output의 모든 non-padding token을 shot 차원에서 평균한 뒤 Grounding DINO text
+prototype으로 사용합니다. 이 prototype 경로에서는 BERT를 사용하지 않으며 일반
+Grounding DINO text prompt 경로는 그대로 유지합니다.
 
 ## 데이터 구조
 
@@ -44,17 +44,21 @@ head와 BLIP projection은 사용하지 않습니다. 다른 Hugging Face model 
 checkpoint 경로는 `CDFSOD_BLIP_MODEL`로 지정할 수 있습니다.
 
 각 support crop은 정규화된 class name과 독립적인 pair로 encoding되어 `[L,768]` text
-output을 만듭니다. 같은 클래스의 K-shot 결과는 `[K,L,768]`로 stack된 뒤 다음 mode 중
-하나로 aggregation됩니다.
-
-- `class_avg`: class-name token만 선택하고 shot과 token 차원을 모두 평균해 `[1,768]`.
-- `class_tokens`: class-name token을 선택하고 shot 차원만 평균해 `[S,768]`.
-- `all_tokens`: padding을 제외한 `[CLS]`, `[SEP]` 포함 전체 token을 위치별 shot 평균해
-  `[L_valid,768]`.
+output을 만듭니다. 같은 클래스의 K-shot 결과는 `[K,L,768]`로 stack됩니다. Padding을
+제외한 `[CLS]`, class-name token, `[SEP]` 전체를 위치별로 shot 평균하여
+`[L_valid,768]` prototype을 만듭니다.
 
 결과는 Grounding DINO checkpoint의 기존 pretrained `text_feat_map`으로 768→256
 projection됩니다. 새 projection layer는 만들지 않습니다. 전체 class prototype token
 수는 Grounding DINO `max_text_len=256`을 넘을 수 없습니다.
+
+Transformer에는 모든 prototype token이 입력됩니다. Positive mapping은 다음 두 mode를
+지원합니다.
+
+- `all`: `[CLS]`, class-name token, `[SEP]`를 포함한 클래스 prototype 전체를 positive로
+  사용합니다.
+- `class_only`: prototype 전체는 transformer에 유지하되 class-name lexical token만
+  training positive map과 inference class score에 사용합니다.
 
 학습에서는 BLIP 전처리 image/text tensor만 CPU에 보관하고 vision encoder와 multimodal
 text encoder 출력을 매 iteration 다시 계산합니다. 두 encoder와 `text_feat_map`을 모두
@@ -65,21 +69,19 @@ fine-tuning합니다. 평가에서는 마지막 checkpoint와 target support set
 
 ```bash
 bash mmdetection/run_all_training.sh DATASET SHOT GPU_COUNT \
-  --blip-prototype-mode class_avg
+  --blip-positive-map-mode class_only
 ```
 
-`--blip-prototype-mode` 허용 값은 `class_avg`, `class_tokens`, `all_tokens`이며 기본값은
-`class_avg`입니다.
+`--blip-positive-map-mode` 허용 값은 `all`, `class_only`이며 기본값은
+`class_only`입니다.
 
 예시:
 
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1 1 \
-  --blip-prototype-mode class_avg
+  --blip-positive-map-mode class_only
 bash mmdetection/run_all_training.sh clipart1k 5 4 \
-  --blip-prototype-mode class_tokens
-bash mmdetection/run_all_training.sh UODD 10 4 \
-  --blip-prototype-mode all_tokens
+  --blip-positive-map-mode all
 ```
 
 데이터 루트가 다르면 환경 변수로 지정합니다.
@@ -87,13 +89,13 @@ bash mmdetection/run_all_training.sh UODD 10 4 \
 ```bash
 CDFSOD_DATA_ROOT=/other/datasets \
   bash mmdetection/run_all_training.sh NEU-DET 1 1 \
-  --blip-prototype-mode class_avg
+  --blip-positive-map-mode class_only
 ```
 
 학습 annotation과 BLIP support annotation은 동일한
 `CDFSOD_TRAIN_ANN=annotations/{SHOT}_shot.json`입니다. 기본 실험 결과는
-`mmdetection/work_dirs/{DATASET}_{SHOT}shot_blip1_{MODE}_prototype`에 저장됩니다.
-스크립트는 30 epoch 학습 후 같은 mode로 `epoch_30.pth`를 평가합니다.
+`mmdetection/work_dirs/{DATASET}_{SHOT}shot_blip1_{MODE}_positive_map`에 저장됩니다.
+스크립트는 30 epoch 학습 후 같은 positive-map mode로 `epoch_30.pth`를 평가합니다.
 
 BLIP prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은 다음과
 같이 실행합니다. 이전 환경변수 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`도 fallback으로
@@ -120,7 +122,8 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - train/support annotation: `annotations/{SHOT}_shot.json`
 - BLIP-1: `Salesforce/blip-itm-base-coco`, hidden dim `768`
 - support pair batch size: `2`, pretrained processor 사용
-- prototype mode: `class_avg`
+- prototype generation: all non-padding BLIP text tokens
+- positive map mode: `class_only`
 - maximum total prototype tokens: `256`
 - validation/test annotation: `annotations/test.json`
 
@@ -128,7 +131,7 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 `mmdetection/configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot.py`와
 `GroundingDINO-few-shot-SwinB.py`에서 확인할 수 있습니다.
 
-직접 평가할 때는 학습 때 사용한 환경 변수와 prototype mode를 동일하게 지정합니다.
+직접 평가할 때는 학습 때 사용한 환경 변수와 positive-map mode를 동일하게 지정합니다.
 
 ```bash
 cd mmdetection
@@ -136,7 +139,7 @@ CDFSOD_DATASET=NEU-DET \
 CDFSOD_TRAIN_ANN=annotations/1_shot.json \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_blip1_class_avg_prototype/epoch_30.pth \
-  --work-dir work_dirs/NEU-DET_1shot_blip1_class_avg_prototype \
-  --blip-prototype-mode class_avg
+  work_dirs/NEU-DET_1shot_blip1_class_only_positive_map/epoch_30.pth \
+  --work-dir work_dirs/NEU-DET_1shot_blip1_class_only_positive_map \
+  --blip-positive-map-mode class_only
 ```
