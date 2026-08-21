@@ -25,6 +25,11 @@ def parse_args():
         action='store_true',
         help='enable automatically scaling LR.')
     parser.add_argument(
+        '--blip-prototype-mode',
+        choices=['class_avg', 'class_tokens', 'all_tokens'],
+        default='class_avg',
+        help='aggregation mode for BLIP multimodal support prototypes')
+    parser.add_argument(
         '--resume',
         nargs='?',
         type=str,
@@ -80,6 +85,7 @@ def main():
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    cfg.model.blip_prototype_mode = args.blip_prototype_mode
 
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:

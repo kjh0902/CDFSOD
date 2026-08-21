@@ -18,7 +18,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
-from ..utils import SupportBlip2Encoder
+from ..utils import SupportBlipEncoder
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -60,20 +60,21 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
-                 use_class_name_token_prototypes: bool = False,
+                 use_blip_prototypes: bool = False,
                  support_ann_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
                  support_image_root: Optional[str] = None,
                  support_image_batch_size: int = 2,
-                 blip2_model_name: str = 'Salesforce/blip2-itm-vit-g',
-                 blip2_gradient_checkpointing: bool = True,
+                 blip_model_name: str = 'Salesforce/blip-itm-base-coco',
+                 blip_gradient_checkpointing: bool = True,
+                 blip_prototype_mode: str = 'class_avg',
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
-        self.use_class_name_token_prototypes = use_class_name_token_prototypes
+        self.use_blip_prototypes = use_blip_prototypes
         self.support_ann_file = support_ann_file
         self.support_class_names = list(support_class_names or [])
         self.support_domain_attribute = support_domain_attribute
@@ -81,29 +82,36 @@ class GroundingDINO(DINO):
         if support_image_batch_size <= 0:
             raise ValueError('support_image_batch_size must be positive.')
         self.support_image_batch_size = support_image_batch_size
-        self.blip2_model_name = blip2_model_name
-        self.blip2_gradient_checkpointing = blip2_gradient_checkpointing
+        self.blip_model_name = blip_model_name
+        self.blip_gradient_checkpointing = blip_gradient_checkpointing
+        prototype_modes = ('class_avg', 'class_tokens', 'all_tokens')
+        if blip_prototype_mode not in prototype_modes:
+            raise ValueError(
+                f'blip_prototype_mode must be one of {prototype_modes}, '
+                f'got {blip_prototype_mode!r}.')
+        self.blip_prototype_mode = blip_prototype_mode
         self.support_entries = None
         self._support_pixel_values = None
+        self._support_input_ids = None
+        self._support_attention_mask = None
+        self._support_special_tokens_mask = None
         self._support_pixel_labels = None
+        self._prototype_token_counts = None
         self._cached_eval_support_prototypes = None
         super().__init__(*args, **kwargs)
-        if self.use_class_name_token_prototypes:
-            self.support_blip2_encoder = SupportBlip2Encoder(
-                model_name=self.blip2_model_name,
-                gradient_checkpointing=self.blip2_gradient_checkpointing)
-            self.prototype_tokens_per_class = \
-                self.support_blip2_encoder.num_query_tokens
+        if self.use_blip_prototypes:
+            self.support_blip_encoder = SupportBlipEncoder(
+                model_name=self.blip_model_name,
+                gradient_checkpointing=self.blip_gradient_checkpointing)
             if self.text_feat_map.in_features != \
-                    self.support_blip2_encoder.hidden_size:
+                    self.support_blip_encoder.hidden_size:
                 raise ValueError(
                     'Grounding DINO text_feat_map input dimension must match '
-                    'the BLIP-2 Q-Former hidden size.')
+                    'the BLIP multimodal text hidden size.')
             self.language_model.requires_grad_(False)
             self.build_support_object_bank()
         else:
-            self.support_blip2_encoder = None
-            self.prototype_tokens_per_class = 1
+            self.support_blip_encoder = None
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -246,8 +254,8 @@ class GroundingDINO(DINO):
         if self.support_entries is not None:
             return
         if not self.support_ann_file:
-            raise ValueError('support_ann_file is required when BLIP-2 '
-                             'visual prototypes are enabled.')
+            raise ValueError('support_ann_file is required when BLIP '
+                             'multimodal prototypes are enabled.')
 
         with open(self.support_ann_file, 'r', encoding='utf-8') as f:
             support_data = json.load(f)
@@ -386,6 +394,7 @@ class GroundingDINO(DINO):
         self.build_support_object_bank()
         image_cache = {}
         crops = []
+        texts = []
         labels = []
         for entry in self.support_entries:
             image_path = entry['file_name']
@@ -396,8 +405,8 @@ class GroundingDINO(DINO):
                     image_cache[image_path] = Image.open(image_path).convert(
                         'RGB')
                 except (OSError, ValueError) as error:
-                    raise FileNotFoundError(
-                        f'Unable to read support image: {image_path}') from error
+                    message = f'Unable to read support image: {image_path}'
+                    raise FileNotFoundError(message) from error
             image = image_cache[image_path]
             x, y, width, height = entry['bbox']
             left = max(0, int(round(x)))
@@ -408,80 +417,147 @@ class GroundingDINO(DINO):
                 raise ValueError(
                     f'Support bbox becomes empty after clipping: '
                     f'{entry["bbox"]} in {image_path}')
-            crops.append(image.crop((left, top, right, bottom)).convert('RGB'))
-            labels.append(entry['class_idx'])
+            crops.append(
+                image.crop((left, top, right, bottom)).convert('RGB'))
+            class_idx = entry['class_idx']
+            texts.append(clean_label_name(self.support_class_names[class_idx]))
+            labels.append(class_idx)
 
-        self._support_pixel_values = \
-            self.support_blip2_encoder.preprocess_images(crops)
+        support_inputs = self.support_blip_encoder.preprocess_pairs(
+            crops, texts)
+        self._support_pixel_values = support_inputs['pixel_values']
+        self._support_input_ids = support_inputs['input_ids']
+        self._support_attention_mask = support_inputs['attention_mask']
+        self._support_special_tokens_mask = \
+            support_inputs['special_tokens_mask']
         self._support_pixel_labels = torch.tensor(labels, dtype=torch.long)
 
     @staticmethod
-    def aggregate_support_query_tokens(object_queries: Tensor,
-                                       object_labels: Tensor,
-                                       num_classes: int) -> Tensor:
-        """Mean K shots at each query index without pooling query tokens."""
-        if object_queries.dim() != 3:
+    def aggregate_support_multimodal_tokens(
+            object_tokens: Tensor, object_labels: Tensor,
+            attention_mask: Tensor, special_tokens_mask: Tensor,
+            num_classes: int, mode: str) -> List[Tensor]:
+        """Aggregate independently encoded support pairs by class."""
+        if object_tokens.dim() != 3:
             raise ValueError(
-                'object_queries must have shape [K, num_queries, hidden].')
-        if object_queries.size(0) != object_labels.numel():
-            raise ValueError('Support query and label counts must match.')
+                'object_tokens must have shape [N, text_tokens, hidden].')
+        if object_tokens.size(0) != object_labels.numel():
+            raise ValueError('Support token and label counts must match.')
+        expected_mask_shape = object_tokens.shape[:2]
+        if tuple(attention_mask.shape) != expected_mask_shape or \
+                tuple(special_tokens_mask.shape) != expected_mask_shape:
+            raise ValueError('Support text masks must match token dimensions.')
         if num_classes <= 0:
             raise ValueError('num_classes must be positive.')
         if ((object_labels < 0) | (object_labels >= num_classes)).any():
             raise ValueError('Support labels are outside the class range.')
+        prototype_modes = ('class_avg', 'class_tokens', 'all_tokens')
+        if mode not in prototype_modes:
+            raise ValueError(
+                f'Prototype mode must be one of {prototype_modes}, '
+                f'got {mode!r}.')
 
-        class_queries = []
+        class_prototypes = []
         missing_classes = []
         for class_idx in range(num_classes):
             class_mask = object_labels == class_idx
             if not class_mask.any():
                 missing_classes.append(class_idx)
+                continue
+
+            class_tokens = object_tokens[class_mask]
+            class_attention_mask = attention_mask[class_mask].bool()
+            class_special_tokens_mask = special_tokens_mask[class_mask].bool()
+            if not torch.equal(
+                    class_attention_mask,
+                    class_attention_mask[:1].expand_as(class_attention_mask)):
+                raise ValueError(
+                    f'Class {class_idx} support texts have different token '
+                    'attention masks.')
+            if not torch.equal(
+                    class_special_tokens_mask,
+                    class_special_tokens_mask[:1].expand_as(
+                        class_special_tokens_mask)):
+                raise ValueError(
+                    f'Class {class_idx} support texts have different special '
+                    'token masks.')
+
+            if mode == 'all_tokens':
+                selected_mask = class_attention_mask[0]
             else:
-                class_queries.append(object_queries[class_mask].mean(dim=0))
+                selected_mask = class_attention_mask[0] & \
+                    ~class_special_tokens_mask[0]
+            if not selected_mask.any():
+                raise ValueError(
+                    f'Class {class_idx} has no tokens for mode {mode!r}.')
+
+            selected_tokens = class_tokens[:, selected_mask, :]
+            if mode == 'class_avg':
+                averaged_tokens = selected_tokens.mean(dim=(0, 1))
+                class_prototypes.append(averaged_tokens.unsqueeze(0))
+            else:
+                class_prototypes.append(selected_tokens.mean(dim=0))
         if missing_classes:
             raise ValueError('No support object found for class indices: '
                              f'{missing_classes}.')
-        return torch.stack(class_queries, dim=0)
+        return class_prototypes
 
-    def compute_support_query_tokens(self, device) -> Tensor:
-        """Recompute BLIP-2 Image Encoder and Q-Former outputs."""
+    def compute_support_multimodal_tokens(self, device) -> List[Tensor]:
+        """Recompute BLIP vision and multimodal text encoder outputs."""
         self._prepare_support_image_inputs()
-        object_queries = []
+        object_tokens = []
         for start_idx in range(0, self._support_pixel_values.size(0),
                                self.support_image_batch_size):
-            pixel_values = self._support_pixel_values[
-                start_idx:start_idx + self.support_image_batch_size].to(
-                    device, non_blocking=True)
-            object_queries.append(self.support_blip2_encoder(pixel_values))
-        queries = torch.cat(object_queries, dim=0)
+            end_idx = start_idx + self.support_image_batch_size
+            pixel_values = self._support_pixel_values[start_idx:end_idx].to(
+                device, non_blocking=True)
+            input_ids = self._support_input_ids[start_idx:end_idx].to(
+                device, non_blocking=True)
+            attention_mask = self._support_attention_mask[
+                start_idx:end_idx].to(device, non_blocking=True)
+            object_tokens.append(
+                self.support_blip_encoder(
+                    pixel_values, input_ids, attention_mask))
+        multimodal_tokens = torch.cat(object_tokens, dim=0)
         labels = self._support_pixel_labels.to(device)
-        return self.aggregate_support_query_tokens(
-            queries, labels, len(self.support_class_names))
+        attention_mask = self._support_attention_mask.to(device)
+        special_tokens_mask = self._support_special_tokens_mask.to(device)
+        return self.aggregate_support_multimodal_tokens(
+            multimodal_tokens, labels, attention_mask, special_tokens_mask,
+            len(self.support_class_names), self.blip_prototype_mode)
 
-    def compute_visual_support_prototypes(self, device) -> Tensor:
-        """Build [class, 32, 256] prototypes with text_feat_map."""
-        qformer_prototypes = self.compute_support_query_tokens(device)
-        if qformer_prototypes.shape[1:] != (
-                self.prototype_tokens_per_class,
-                self.text_feat_map.in_features):
-            raise RuntimeError(
-                'Unexpected aggregated Q-Former prototype shape: '
-                f'{tuple(qformer_prototypes.shape)}.')
-        return self.text_feat_map(qformer_prototypes)
+    def compute_visual_support_prototypes(self, device) -> List[Tensor]:
+        """Build variable-length 256-D BLIP prototypes for every class."""
+        multimodal_prototypes = self.compute_support_multimodal_tokens(device)
+        for prototype in multimodal_prototypes:
+            if prototype.dim() != 2 or \
+                    prototype.size(1) != self.text_feat_map.in_features:
+                raise RuntimeError(
+                    'Unexpected aggregated BLIP prototype shape: '
+                    f'{tuple(prototype.shape)}.')
+        return [self.text_feat_map(prototype)
+                for prototype in multimodal_prototypes]
 
-    def _prototypes_to_text_dict(self, prototypes: Tensor,
+    def _prototypes_to_text_dict(self, prototypes: Sequence[Tensor],
                                  batch_size: int) -> Dict:
-        """Flatten [C, 32, 256] only at the Grounding DINO boundary."""
-        if prototypes.dim() != 3:
-            raise ValueError(
-                'Visual prototypes must have shape [class, query, hidden].')
-        if prototypes.size(0) != len(self.support_class_names):
+        """Flatten class-major variable-length prototypes at the boundary."""
+        if len(prototypes) != len(self.support_class_names):
             raise ValueError('Visual prototype class count is inconsistent.')
-        if prototypes.size(1) != self.prototype_tokens_per_class:
-            raise ValueError('Visual prototype query count is inconsistent.')
-        device = prototypes.device
-        prototypes = prototypes.flatten(0, 1)
-        num_tokens = prototypes.size(0)
+        if not prototypes:
+            raise ValueError('At least one visual prototype is required.')
+        for prototype in prototypes:
+            if prototype.dim() != 2 or prototype.size(0) <= 0 or \
+                    prototype.size(1) != self.embed_dims:
+                raise ValueError(
+                    'Each visual prototype must have shape [tokens, hidden].')
+        device = prototypes[0].device
+        if any(prototype.device != device for prototype in prototypes):
+            raise ValueError('All visual prototypes must use the same device.')
+        self._prototype_token_counts = [
+            prototype.size(0) for prototype in prototypes
+        ]
+        flattened_prototypes = torch.cat(list(prototypes), dim=0)
+        num_tokens = flattened_prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         if num_tokens > max_text_len:
@@ -489,7 +565,8 @@ class GroundingDINO(DINO):
                 f'Class text prototypes ({num_tokens}) exceed max_text_len '
                 f'({max_text_len}).')
 
-        embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
+        embedded = flattened_prototypes.unsqueeze(0).expand(
+            batch_size, -1, -1)
         text_token_mask = torch.ones(
             batch_size, num_tokens, dtype=torch.bool, device=device)
         text_self_attention_masks = torch.eye(
@@ -506,44 +583,65 @@ class GroundingDINO(DINO):
         return text_dict
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from BLIP-2 support visual prototypes."""
+        """Build text_dict from BLIP multimodal support prototypes."""
         if (not self.training and
                 self._cached_eval_support_prototypes is not None):
-            prototypes = self._cached_eval_support_prototypes.to(device)
+            prototypes = [
+                prototype.to(device)
+                for prototype in self._cached_eval_support_prototypes
+            ]
             return self._prototypes_to_text_dict(prototypes, batch_size)
 
         prototypes = self.compute_visual_support_prototypes(device)
         if not self.training:
-            prototypes = prototypes.detach()
-            self._cached_eval_support_prototypes = prototypes.cpu()
+            prototypes = [prototype.detach() for prototype in prototypes]
+            self._cached_eval_support_prototypes = tuple(
+                prototype.cpu() for prototype in prototypes)
         return self._prototypes_to_text_dict(prototypes, batch_size)
+
+    def _prototype_token_ranges(self) -> List[Tuple[int, int]]:
+        """Return class-major token ranges for the current prototypes."""
+        if self._prototype_token_counts is None or \
+                len(self._prototype_token_counts) != \
+                len(self.support_class_names):
+            raise RuntimeError(
+                'Prototype token counts must be built before positive maps.')
+        ranges = []
+        start = 0
+        for count in self._prototype_token_counts:
+            end = start + count
+            ranges.append((start, end))
+            start = end
+        return ranges
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Mark all 32 query tokens belonging to each GT class positive."""
+        """Mark all BLIP prototype tokens belonging to each class positive."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
+        token_ranges = self._prototype_token_ranges()
         positive_maps = []
         for labels in gt_labels:
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                start = label * self.prototype_tokens_per_class
-                end = start + self.prototype_tokens_per_class
-                if start < 0 or end > max_text_len:
+                if label < 0 or label >= len(token_ranges):
                     raise ValueError(
                         f'Class label {label} exceeds prototype token range.')
+                start, end = token_ranges[label]
+                if end > max_text_len:
+                    raise ValueError(
+                        f'Class label {label} exceeds max_text_len.')
                 positive_map[row_idx, start:end] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map each class to all of its 32 prototype token positions."""
+        """Map each class to all of its BLIP prototype token positions."""
         return {
-            class_idx + 1: list(range(
-                class_idx * self.prototype_tokens_per_class,
-                (class_idx + 1) * self.prototype_tokens_per_class))
-            for class_idx in range(len(self.support_class_names))
+            class_idx + 1: list(range(start, end))
+            for class_idx, (start, end) in enumerate(
+                self._prototype_token_ranges())
         }
 
     def get_tokens_positive_and_prompts(
@@ -781,7 +879,7 @@ class GroundingDINO(DINO):
             for data_samples in batch_data_samples
         ]
 
-        if self.use_class_name_token_prototypes:
+        if self.use_blip_prototypes:
             text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
             positive_maps = self.build_prototype_positive_maps(
@@ -880,7 +978,7 @@ class GroundingDINO(DINO):
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
-        if self.use_class_name_token_prototypes:
+        if self.use_blip_prototypes:
             text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
             visual_feats = self.extract_feat(batch_inputs)

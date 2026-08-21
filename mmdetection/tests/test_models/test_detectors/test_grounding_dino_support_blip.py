@@ -8,93 +8,159 @@ import torch.nn as nn
 from mmdet.models.detectors.grounding_dino import GroundingDINO
 
 
-def _make_detector_stub(num_classes=2, hidden_size=8):
+def _make_detector_stub(num_classes=2, hidden_size=8, max_text_len=256):
     detector = GroundingDINO.__new__(GroundingDINO)
     nn.Module.__init__(detector)
     detector._cached_eval_support_prototypes = None
-    detector.prototype_tokens_per_class = 32
+    detector._prototype_token_counts = None
     detector.support_class_names = [
         f'class_{idx}' for idx in range(num_classes)
     ]
     detector.decoder = SimpleNamespace(num_layers=0)
     detector.bbox_head = SimpleNamespace(
-        cls_branches=[SimpleNamespace(max_text_len=max(
-            256, num_classes * 32))])
+        cls_branches=[SimpleNamespace(max_text_len=max_text_len)])
+    detector.embed_dims = hidden_size
     detector.text_feat_map = nn.Linear(768, hidden_size)
     return detector
 
 
-def test_eval_visual_prototype_is_detached_and_cached():
+def test_eval_blip_prototype_is_detached_and_cached():
     detector = _make_detector_stub().eval()
     calls = []
 
     def compute(self, device):
         calls.append(device)
-        return torch.arange(
-            2 * 32 * 8,
-            dtype=torch.float32,
-            device=device,
-            requires_grad=True).reshape(2, 32, 8)
+        return [
+            torch.arange(
+                8, dtype=torch.float32, device=device,
+                requires_grad=True).reshape(1, 8),
+            torch.arange(
+                16, dtype=torch.float32, device=device,
+                requires_grad=True).reshape(2, 8),
+        ]
 
     detector.compute_visual_support_prototypes = MethodType(compute, detector)
     first = detector.build_prototype_text_dict(1, torch.device('cpu'))
     second = detector.build_prototype_text_dict(4, torch.device('cpu'))
 
     assert len(calls) == 1
-    assert detector._cached_eval_support_prototypes.shape == (2, 32, 8)
-    assert not detector._cached_eval_support_prototypes.requires_grad
+    assert [item.shape for item in detector._cached_eval_support_prototypes] \
+        == [(1, 8), (2, 8)]
+    assert all(not item.requires_grad
+               for item in detector._cached_eval_support_prototypes)
     assert not first['embedded'].requires_grad
-    assert first['embedded'].shape == (1, 64, 8)
-    assert second['embedded'].shape == (4, 64, 8)
+    assert first['embedded'].shape == (1, 3, 8)
+    assert second['embedded'].shape == (4, 3, 8)
     torch.testing.assert_close(first['embedded'][0], second['embedded'][0])
+    assert detector._prototype_token_counts == [1, 2]
 
 
-def test_training_recomputes_visual_prototypes_and_clears_eval_cache():
+def test_training_recomputes_blip_prototypes_and_clears_eval_cache():
     detector = _make_detector_stub().train()
     calls = []
 
     def compute(self, device):
         calls.append(device)
-        return torch.ones(2, 32, 8, requires_grad=True)
+        return [
+            torch.ones(1, 8, requires_grad=True),
+            torch.ones(2, 8, requires_grad=True),
+        ]
 
     detector.compute_visual_support_prototypes = MethodType(compute, detector)
     detector.build_prototype_text_dict(1, torch.device('cpu'))
     detector.build_prototype_text_dict(1, torch.device('cpu'))
     assert len(calls) == 2
 
-    detector._cached_eval_support_prototypes = torch.ones(2, 32, 8)
+    detector._cached_eval_support_prototypes = (torch.ones(1, 8), )
     detector.train(True)
     assert detector._cached_eval_support_prototypes is None
 
 
-def test_k_shot_aggregation_preserves_query_indices():
-    queries = torch.stack([
-        torch.arange(32 * 3).reshape(32, 3),
-        torch.arange(32 * 3).reshape(32, 3) + 2,
-        torch.arange(32 * 3).reshape(32, 3) + 100,
-    ]).float()
+def _support_token_inputs():
+    tokens = torch.tensor([
+        [[0., 0.], [1., 2.], [3., 4.], [5., 6.], [0., 0.]],
+        [[2., 2.], [3., 4.], [5., 6.], [7., 8.], [0., 0.]],
+        [[10., 10.], [20., 20.], [30., 30.], [0., 0.], [0., 0.]],
+    ])
     labels = torch.tensor([0, 0, 1])
+    attention_mask = torch.tensor([
+        [1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 0],
+        [1, 1, 1, 0, 0],
+    ])
+    special_tokens_mask = torch.tensor([
+        [1, 0, 0, 1, 1],
+        [1, 0, 0, 1, 1],
+        [1, 0, 1, 1, 1],
+    ])
+    return tokens, labels, attention_mask, special_tokens_mask
 
-    aggregated = GroundingDINO.aggregate_support_query_tokens(
-        queries, labels, num_classes=2)
 
-    assert aggregated.shape == (2, 32, 3)
-    torch.testing.assert_close(aggregated[0], (queries[0] + queries[1]) / 2)
-    torch.testing.assert_close(aggregated[1], queries[2])
+def test_class_avg_averages_shots_and_class_tokens():
+    inputs = _support_token_inputs()
+
+    prototypes = GroundingDINO.aggregate_support_multimodal_tokens(
+        *inputs, num_classes=2, mode='class_avg')
+
+    assert [prototype.shape for prototype in prototypes] == [(1, 2), (1, 2)]
+    torch.testing.assert_close(prototypes[0], torch.tensor([[3., 4.]]))
+    torch.testing.assert_close(prototypes[1], torch.tensor([[20., 20.]]))
 
 
-def test_all_32_tokens_map_to_their_class():
+def test_class_tokens_preserves_original_token_count():
+    inputs = _support_token_inputs()
+
+    prototypes = GroundingDINO.aggregate_support_multimodal_tokens(
+        *inputs, num_classes=2, mode='class_tokens')
+
+    assert [prototype.shape for prototype in prototypes] == [(2, 2), (1, 2)]
+    torch.testing.assert_close(
+        prototypes[0], torch.tensor([[2., 3.], [4., 5.]]))
+    torch.testing.assert_close(prototypes[1], torch.tensor([[20., 20.]]))
+
+
+def test_all_tokens_includes_special_tokens_and_excludes_padding():
+    inputs = _support_token_inputs()
+
+    prototypes = GroundingDINO.aggregate_support_multimodal_tokens(
+        *inputs, num_classes=2, mode='all_tokens')
+
+    assert [prototype.shape for prototype in prototypes] == [(4, 2), (3, 2)]
+    torch.testing.assert_close(
+        prototypes[0],
+        torch.tensor([[1., 1.], [2., 3.], [4., 5.], [6., 7.]]))
+    torch.testing.assert_close(
+        prototypes[1], _support_token_inputs()[0][2, :3])
+
+
+def test_invalid_prototype_mode_is_rejected():
+    inputs = _support_token_inputs()
+
+    with pytest.raises(ValueError, match='Prototype mode'):
+        GroundingDINO.aggregate_support_multimodal_tokens(
+            *inputs, num_classes=2, mode='invalid')
+
+
+def test_variable_token_ranges_map_to_their_class():
     detector = _make_detector_stub()
+    detector._prototype_token_counts = [1, 3]
     labels = [torch.tensor([0, 1])]
 
     positive_map = detector.build_prototype_positive_maps(
         labels, torch.device('cpu'))[0]
     token_map = detector.build_prototype_token_positive_map()
 
-    assert positive_map[0, :32].all() and not positive_map[0, 32:].any()
-    assert positive_map[1, 32:64].all()
-    assert positive_map[1, :32].sum() == 0
-    assert token_map == {1: list(range(32)), 2: list(range(32, 64))}
+    assert positive_map[0, 0] == 1 and positive_map[0, 1:].sum() == 0
+    assert positive_map[1, 1:4].all() and positive_map[1, :1].sum() == 0
+    assert token_map == {1: [0], 2: [1, 2, 3]}
+
+
+def test_total_prototype_length_cannot_exceed_max_text_len():
+    detector = _make_detector_stub(max_text_len=3)
+
+    with pytest.raises(RuntimeError, match='exceed max_text_len'):
+        detector._prototypes_to_text_dict(
+            [torch.ones(2, 8), torch.ones(2, 8)], batch_size=1)
 
 
 @pytest.mark.parametrize('bbox, expected_message', [

@@ -8,9 +8,7 @@ import os
 
 lang_model_name = 'bert-base-uncased'
 num_classes = len(_base_.metainfo['classes'])
-prototype_tokens_per_class = 32
-max_text_len = (max(256, num_classes * prototype_tokens_per_class)
-                if _base_.use_class_name_token_prototypes else 256)
+max_text_len = 256
 support_ann_file = _base_.train_ann_file
 if not os.path.isabs(support_ann_file):
     support_ann_file = os.path.join(_base_.data_root, support_ann_file)
@@ -20,15 +18,16 @@ model = dict(
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
-    use_class_name_token_prototypes=_base_.use_class_name_token_prototypes,
+    use_blip_prototypes=_base_.use_blip_prototypes,
     support_ann_file=support_ann_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
     support_image_root=os.path.join(_base_.data_root, 'train'),
     support_image_batch_size=2,
-    blip2_model_name=os.getenv(
-        'CDFSOD_BLIP2_MODEL', 'Salesforce/blip2-itm-vit-g'),
-    blip2_gradient_checkpointing=True,
+    blip_model_name=os.getenv(
+        'CDFSOD_BLIP_MODEL', 'Salesforce/blip-itm-base-coco'),
+    blip_gradient_checkpointing=True,
+    blip_prototype_mode='class_avg',
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -137,9 +136,8 @@ optim_wrapper = dict(
     paramwise_cfg=dict(custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
         'backbone': dict(lr_mult=0.1),
-        'support_blip2_encoder.vision_model': dict(lr_mult=0.01),
-        'support_blip2_encoder.qformer': dict(lr_mult=0.1),
-        'support_blip2_encoder.query_tokens': dict(lr_mult=0.1),
+        'support_blip_encoder.vision_model': dict(lr_mult=0.01),
+        'support_blip_encoder.text_encoder': dict(lr_mult=0.1),
         'text_feat_map': dict(lr_mult=0.1),
     }))
 

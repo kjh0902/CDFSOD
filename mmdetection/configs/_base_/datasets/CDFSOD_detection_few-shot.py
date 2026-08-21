@@ -5,7 +5,7 @@ import os
 #   CDFSOD_DATA_ROOT=/path/to/datasets
 #   CDFSOD_DATASET=NEU-DET
 #   CDFSOD_TRAIN_ANN=annotations/1_shot.json
-#   CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1
+#   CDFSOD_USE_BLIP_PROTOTYPES=1
 
 dataset_type = 'CocoDataset'
 datasets_root = os.getenv(
@@ -64,8 +64,9 @@ domain_attributes_by_dataset = {
 train_ann_file = os.getenv('CDFSOD_TRAIN_ANN', 'annotations/train.json')
 val_ann_file = 'annotations/test.json'
 test_ann_file = 'annotations/test.json'
-use_class_name_token_prototypes = os.getenv(
-    'CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES', '1') != '0'
+use_blip_prototypes = os.getenv(
+    'CDFSOD_USE_BLIP_PROTOTYPES',
+    os.getenv('CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES', '1')) != '0'
 domain_attribute = os.getenv(
     'CDFSOD_DOMAIN_ATTRIBUTE',
     domain_attributes_by_dataset[dataset_name])
