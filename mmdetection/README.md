@@ -43,13 +43,14 @@ python tools/test.py \
 `categories`, `annotations`를 직접 연결해 K-shot train support object를 crop합니다.
 각 crop은 `Salesforce/blip-image-captioning-base`에 독립적으로 입력됩니다. Caption
 decoder는 `[DEC]`에서 시작하고 `[DEC]`, `[ENC]` logits를 차단한 noise-free
-Straight-Through Argmax로 최대 20 token의 greedy caption을 생성합니다.
+Straight-Through Argmax로 최대 10 token의 greedy caption을 생성합니다.
 
 BLIP과 Grounding DINO BERT가 공유하는 `bert-base-uncased` vocabulary를 이용해 생성
 분포를 BERT `inputs_embeds`로 직접 전달하므로 문자열 decode/re-tokenize로 gradient가
 끊기지 않습니다. BERT 입력은 `[CLS] class name : caption [SEP]`이며, BERT 출력 중
 class-name subword state만 선택합니다. 같은 class의 support와 subword를 평균한 뒤
 기존 `text_feat_map`으로 768→256 projection합니다. 클래스당 하나의 prototype과
-positive index를 사용합니다. 학습 중 BLIP captioner와 BERT까지 detection loss의
-gradient가 전달되며 매 iteration 다시 계산합니다. 평가 중에는 최초 한 번 계산해
-detach/cache합니다. Test image와 test GT는 prototype 생성에 사용되지 않습니다.
+positive index를 사용합니다. 학습 중 support mini-batch 전체에 non-reentrant gradient
+checkpoint를 적용하며 BLIP captioner와 BERT까지 detection loss의 gradient가 전달됩니다.
+평가 중에는 최초 한 번 계산해 detach/cache합니다. Test image와 test GT는 prototype
+생성에 사용되지 않습니다.

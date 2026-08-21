@@ -11,6 +11,7 @@ import torch.nn as nn
 from mmengine.runner.amp import autocast
 from PIL import Image
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
@@ -562,8 +563,15 @@ class GroundingDINO(DINO):
         ]
         return torch.stack(object_features, dim=0)
 
+    def _compute_support_batch_caption_features(
+            self, pixel_values: Tensor, labels: Tensor) -> Tensor:
+        """Run the differentiable support caption pipeline for one batch."""
+        caption_outputs = self.support_blip_captioner(pixel_values)
+        return self._encode_caption_enriched_class_features(
+            caption_outputs, labels)
+
     def compute_support_caption_features(self, device) -> Tensor:
-        """Recompute differentiable caption-enriched BERT features."""
+        """Recompute differentiable caption features with train checkpoint."""
         self._prepare_support_image_inputs()
         object_features = []
         for start_idx in range(0, self._support_pixel_values.size(0),
@@ -572,10 +580,17 @@ class GroundingDINO(DINO):
             pixel_values = self._support_pixel_values[start_idx:end_idx].to(
                 device, non_blocking=True)
             labels = self._support_pixel_labels[start_idx:end_idx].to(device)
-            caption_outputs = self.support_blip_captioner(pixel_values)
-            object_features.append(
-                self._encode_caption_enriched_class_features(
-                    caption_outputs, labels))
+            if self.training:
+                batch_features = gradient_checkpoint(
+                    self._compute_support_batch_caption_features,
+                    pixel_values,
+                    labels,
+                    use_reentrant=False)
+            else:
+                batch_features = \
+                    self._compute_support_batch_caption_features(
+                        pixel_values, labels)
+            object_features.append(batch_features)
         caption_features = torch.cat(object_features, dim=0)
         labels = self._support_pixel_labels.to(device)
         return self.aggregate_support_caption_features(

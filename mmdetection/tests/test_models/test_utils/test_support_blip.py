@@ -144,7 +144,7 @@ def test_pretrained_caption_components_are_preserved_and_trainable():
     captioner = _build_captioner()
 
     assert captioner.hidden_size == 768
-    assert captioner.max_length == 20
+    assert captioner.max_length == 10
     assert captioner.tokenizer.bos_token_id == 10
     assert captioner.enc_token_id == 11
     assert all(parameter.requires_grad for parameter in captioner.parameters())

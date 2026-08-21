@@ -1,5 +1,6 @@
 import json
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -73,6 +74,74 @@ def _support_feature_inputs():
     ])
     labels = torch.tensor([0, 0, 1])
     return features, labels
+
+
+def _make_checkpoint_detector_stub():
+    detector = GroundingDINO.__new__(GroundingDINO)
+    nn.Module.__init__(detector)
+    detector.support_image_batch_size = 2
+    detector.support_class_names = ['class_0', 'class_1']
+    detector._support_pixel_values = torch.stack([
+        torch.ones(3, 2, 2),
+        torch.full((3, 2, 2), 2.0),
+    ])
+    detector._support_pixel_labels = torch.tensor([0, 1])
+    detector.support_scale = nn.Parameter(torch.tensor(1.0))
+
+    def prepare(self):
+        return None
+
+    def compute_batch(self, pixel_values, labels):
+        values = pixel_values.mean(dim=(1, 2, 3)) * self.support_scale
+        return values[:, None].expand(-1, 2)
+
+    detector._prepare_support_image_inputs = MethodType(prepare, detector)
+    detector._compute_support_batch_caption_features = MethodType(
+        compute_batch, detector)
+    return detector
+
+
+def test_training_support_pipeline_uses_non_reentrant_checkpoint():
+    detector = _make_checkpoint_detector_stub()
+    detector.training = True
+
+    def run_checkpoint(function, *args, **kwargs):
+        assert kwargs == {'use_reentrant': False}
+        return function(*args)
+
+    with patch(
+            'mmdet.models.detectors.grounding_dino.gradient_checkpoint',
+            side_effect=run_checkpoint) as checkpoint_mock:
+        features = detector.compute_support_caption_features(
+            torch.device('cpu'))
+
+    checkpoint_mock.assert_called_once()
+    assert features.shape == (2, 2)
+
+
+def test_training_support_checkpoint_preserves_parameter_gradients():
+    detector = _make_checkpoint_detector_stub()
+    detector.training = True
+
+    features = detector.compute_support_caption_features(torch.device('cpu'))
+    features.square().mean().backward()
+
+    assert detector.support_scale.grad is not None
+    assert detector.support_scale.grad.abs().item() > 0
+
+
+def test_eval_support_pipeline_skips_gradient_checkpoint():
+    detector = _make_checkpoint_detector_stub()
+    detector.training = False
+
+    with patch(
+            'mmdet.models.detectors.grounding_dino.gradient_checkpoint'
+    ) as checkpoint_mock:
+        features = detector.compute_support_caption_features(
+            torch.device('cpu'))
+
+    checkpoint_mock.assert_not_called()
+    assert features.shape == (2, 2)
 
 
 def test_caption_features_are_averaged_by_class():

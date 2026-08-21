@@ -30,7 +30,8 @@ class SupportBlipCaptioner(nn.Module):
         self.text_decoder = pretrained.text_decoder
         self.hidden_size = pretrained.config.text_config.hidden_size
         self.vocab_size = pretrained.config.text_config.vocab_size
-        self.max_length = pretrained.config.text_config.max_length
+        pretrained_max_length = pretrained.config.text_config.max_length
+        self.max_length = 10
         self.bos_token_id = pretrained.config.text_config.bos_token_id
         self.sep_token_id = pretrained.config.text_config.sep_token_id
         self.pad_token_id = pretrained.config.text_config.pad_token_id
@@ -43,10 +44,10 @@ class SupportBlipCaptioner(nn.Module):
             raise ValueError(
                 'Grounding DINO BERT expects 768-dimensional BLIP text '
                 f'embeddings, got {self.hidden_size}.')
-        if self.max_length != 20:
+        if pretrained_max_length < self.max_length:
             raise ValueError(
-                'The differentiable caption path is fixed to the pretrained '
-                f'BLIP max_length=20, got {self.max_length}.')
+                'The pretrained BLIP caption max_length must be at least '
+                f'{self.max_length}, got {pretrained_max_length}.')
         if self.bos_token_id is None or self.sep_token_id is None or \
                 self.pad_token_id is None:
             raise ValueError('BLIP caption special token ids must be defined.')

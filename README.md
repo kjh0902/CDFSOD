@@ -41,7 +41,7 @@ object가 있어야 합니다. Prototype loader는 `support_image_root` 아래�
 encoder와 caption decoder를 사용하며 다른 호환 checkpoint 또는 로컬 경로는
 `CDFSOD_BLIP_MODEL`로 지정할 수 있습니다.
 
-각 support crop은 독립적으로 captioning됩니다. `[DEC]`에서 시작하는 최대 길이 20의
+각 support crop은 독립적으로 captioning됩니다. `[DEC]`에서 시작하는 최대 길이 10의
 greedy decoder에서 `[DEC]`, `[ENC]` logits를 차단하고 noise-free Straight-Through
 Argmax를 적용합니다. Forward token은 masked greedy argmax와 같고 backward는 softmax
 확률을 통해 BLIP vision encoder와 caption decoder로 전달됩니다.
@@ -58,9 +58,11 @@ projection됩니다. 새 projection layer는 만들지 않습니다. 결과는 `
 사용합니다. 전체 class 수는 Grounding DINO `max_text_len=256`을 넘을 수 없습니다.
 
 학습에서는 BLIP 전처리 image tensor만 CPU에 보관하고 captioner와 BERT 출력을 매
-iteration 다시 계산합니다. BLIP vision encoder, caption decoder, Grounding DINO BERT와
-`text_feat_map`을 모두 fine-tuning합니다. 평가에서는 마지막 checkpoint와 target
-support set으로 prototype을 첫 predict 시 다시 생성해 detach/cache합니다.
+iteration 다시 계산합니다. Support mini-batch의 BLIP caption decoding부터 BERT
+class-token feature까지 non-reentrant gradient checkpoint를 적용하며, BLIP vision
+encoder, caption decoder, Grounding DINO BERT와 `text_feat_map`을 모두 fine-tuning합니다.
+평가에서는 마지막 checkpoint와 target support set으로 prototype을 첫 predict 시 다시
+생성해 detach/cache합니다.
 
 ## 학습과 평가
 
