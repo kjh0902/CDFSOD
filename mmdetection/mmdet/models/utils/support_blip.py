@@ -3,99 +3,135 @@ from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
-from transformers import BlipForImageTextRetrieval, BlipProcessor
+from transformers import BlipForConditionalGeneration, BlipProcessor
 
 
-class SupportBlipEncoder(nn.Module):
-    """BLIP-1 vision and multimodal text encoders for support pairs.
+class SupportBlipCaptioner(nn.Module):
+    """Differentiable BLIP-1 captioner for support object crops.
 
-    The pretrained ITM head and projection layers are intentionally discarded.
-    Grounding DINO's pretrained ``text_feat_map`` remains the only 768 -> 256
-    projection used by the CDFSOD prototype path.
+    Caption tokens are selected with noise-free straight-through argmax. The
+    hard forward pass matches greedy decoding with ``[DEC]`` and ``[ENC]``
+    suppressed, while the backward pass follows the softmax probabilities.
     """
 
     def __init__(self,
-                 model_name: str = 'Salesforce/blip-itm-base-coco',
+                 model_name: str =
+                 'Salesforce/blip-image-captioning-base',
                  gradient_checkpointing: bool = True) -> None:
         super().__init__()
-        pretrained = BlipForImageTextRetrieval.from_pretrained(model_name)
+        pretrained = BlipForConditionalGeneration.from_pretrained(model_name)
         processor = BlipProcessor.from_pretrained(model_name)
         self.image_processor = processor.image_processor
         self.tokenizer = processor.tokenizer
         self.vision_model = pretrained.vision_model
-        self.text_encoder = pretrained.text_encoder
+        self.text_decoder = pretrained.text_decoder
         self.hidden_size = pretrained.config.text_config.hidden_size
-        self.tokenizer.add_special_tokens({'bos_token': '[DEC]'})
-        self.tokenizer.add_special_tokens(
-            {'additional_special_tokens': ['[ENC]']})
+        self.vocab_size = pretrained.config.text_config.vocab_size
+        self.max_length = pretrained.config.text_config.max_length
+        self.bos_token_id = pretrained.config.text_config.bos_token_id
+        self.sep_token_id = pretrained.config.text_config.sep_token_id
+        self.pad_token_id = pretrained.config.text_config.pad_token_id
         self.enc_token_id = self.tokenizer.convert_tokens_to_ids('[ENC]')
-        num_text_embeddings = (
-            self.text_encoder.get_input_embeddings().num_embeddings)
-        if self.enc_token_id == self.tokenizer.unk_token_id or \
-                self.enc_token_id != num_text_embeddings - 1:
-            raise ValueError(
-                'BLIP tokenizer [ENC] token must map to the final pretrained '
-                f'text embedding, got token id {self.enc_token_id} for '
-                f'{num_text_embeddings} embeddings.')
 
         if self.hidden_size != 768:
             raise ValueError(
-                'Grounding DINO text_feat_map expects 768-dimensional BLIP '
-                f'text features, got {self.hidden_size}.')
+                'Grounding DINO BERT expects 768-dimensional BLIP text '
+                f'embeddings, got {self.hidden_size}.')
+        if self.max_length != 20:
+            raise ValueError(
+                'The differentiable caption path is fixed to the pretrained '
+                f'BLIP max_length=20, got {self.max_length}.')
+        if self.bos_token_id is None or self.sep_token_id is None or \
+                self.pad_token_id is None:
+            raise ValueError('BLIP caption special token ids must be defined.')
+        if self.enc_token_id == self.tokenizer.unk_token_id:
+            raise ValueError('BLIP tokenizer must contain the pretrained '
+                             '[ENC] token.')
+        if max(self.bos_token_id, self.enc_token_id) >= self.vocab_size:
+            raise ValueError(
+                'BLIP special token ids exceed decoder vocabulary.')
+
+        input_embeddings = self.text_decoder.get_input_embeddings()
+        if input_embeddings.num_embeddings != self.vocab_size:
+            raise ValueError(
+                'BLIP decoder embedding and vocabulary sizes must match, got '
+                f'{input_embeddings.num_embeddings} and {self.vocab_size}.')
 
         self.requires_grad_(True)
         if gradient_checkpointing:
-            for module in (self.vision_model, self.text_encoder):
-                if not getattr(
-                        module, 'supports_gradient_checkpointing', True):
-                    continue
-                enable = getattr(module, 'gradient_checkpointing_enable', None)
-                if enable is not None:
-                    enable()
+            self._enable_supported_gradient_checkpointing(self.vision_model)
+            self._enable_supported_gradient_checkpointing(self.text_decoder)
 
-    def preprocess_pairs(self, images: Sequence[Image.Image],
-                         texts: Sequence[str]) -> Dict[str, Tensor]:
-        """Preprocess aligned image-text pairs and retain tensors on CPU."""
+    @staticmethod
+    def _enable_supported_gradient_checkpointing(module: nn.Module) -> None:
+        if not getattr(module, 'supports_gradient_checkpointing', False):
+            return
+        enable = getattr(module, 'gradient_checkpointing_enable', None)
+        if enable is None:
+            return
+        try:
+            enable()
+        except ValueError:
+            # Some Transformers wrappers advertise support although the
+            # concrete BLIP text submodule in that release does not.
+            return
+
+    def preprocess_images(self, images: Sequence[Image.Image]) -> Tensor:
+        """Preprocess support crops once and keep the pixels on CPU."""
         if not images:
             raise ValueError('At least one support crop is required.')
-        if len(images) != len(texts):
-            raise ValueError('Support image and text counts must match.')
-
         image_inputs = self.image_processor(
             images=list(images), return_tensors='pt')
-        text_inputs = self.tokenizer(
-            list(texts),
-            padding=True,
-            return_tensors='pt')
-        inputs = dict(
-            pixel_values=image_inputs['pixel_values'],
-            input_ids=text_inputs['input_ids'],
-            attention_mask=text_inputs['attention_mask'])
-
-        num_pairs = len(images)
-        if inputs['pixel_values'].dim() != 4 or \
-                inputs['pixel_values'].size(0) != num_pairs:
+        pixel_values = image_inputs['pixel_values']
+        if pixel_values.dim() != 4 or pixel_values.size(0) != len(images):
             raise ValueError(
                 'BLIP image processor must return [N, 3, H, W].')
-        for key in ('input_ids', 'attention_mask'):
-            if inputs[key].dim() != 2 or inputs[key].size(0) != num_pairs:
-                raise ValueError(
-                    f'BLIP tokenizer must return {key} with shape [N, L].')
-        if inputs['input_ids'].shape != inputs['attention_mask'].shape:
-            raise ValueError(
-                'BLIP text input masks must have matching shapes.')
-        return {key: value.detach().cpu() for key, value in inputs.items()}
+        return pixel_values.detach().cpu()
 
-    def forward(self, pixel_values: Tensor, input_ids: Tensor,
-                attention_mask: Tensor) -> Tensor:
-        """Return the image-grounded [ENC] state for each support pair."""
-        batch_size = pixel_values.size(0)
-        if input_ids.dim() != 2 or input_ids.size(1) == 0 or \
-                input_ids.size(0) != batch_size or \
-                attention_mask.shape != input_ids.shape:
-            raise ValueError('BLIP image and text batch shapes must match.')
+    def validate_grounding_tokenizer(self, grounding_tokenizer) -> int:
+        """Validate the shared BERT vocabulary and return its size."""
+        blip_vocab = self.tokenizer.get_vocab()
+        grounding_vocab = grounding_tokenizer.get_vocab()
+        mismatched = [
+            token for token, token_id in grounding_vocab.items()
+            if blip_vocab.get(token) != token_id
+        ]
+        if mismatched:
+            examples = mismatched[:5]
+            raise ValueError(
+                'BLIP and Grounding DINO BERT lexical vocabularies are not '
+                f'id-compatible; mismatched tokens include {examples}.')
+        grounding_vocab_size = len(grounding_vocab)
+        if grounding_vocab_size >= self.vocab_size:
+            raise ValueError(
+                'BLIP caption vocabulary must extend the Grounding DINO BERT '
+                'vocabulary with its private special tokens.')
+        for token_id in (self.bos_token_id, self.enc_token_id):
+            if token_id < grounding_vocab_size:
+                raise ValueError(
+                    'BLIP [DEC]/[ENC] ids must be outside the shared lexical '
+                    'vocabulary.')
+        return grounding_vocab_size
+
+    def _mask_private_special_logits(self, logits: Tensor) -> Tensor:
+        masked_logits = logits.clone()
+        masked_logits[:, self.bos_token_id] = -torch.inf
+        masked_logits[:, self.enc_token_id] = -torch.inf
+        return masked_logits
+
+    def forward(self, pixel_values: Tensor) -> Dict[str, Tensor]:
+        """Generate differentiable greedy captions for aligned crop rows.
+
+        Returns:
+            A dictionary containing full-vocabulary straight-through token
+            distributions, hard token ids and a mask selecting caption tokens
+            before ``[SEP]``. Sequence length is at most ``max_length - 1``.
+        """
+        if pixel_values.dim() != 4 or pixel_values.size(0) == 0:
+            raise ValueError('pixel_values must have shape [N, 3, H, W].')
 
         vision_outputs = self.vision_model(
             pixel_values=pixel_values, return_dict=True)
@@ -104,19 +140,68 @@ class SupportBlipEncoder(nn.Module):
             image_embeds.shape[:-1],
             dtype=torch.long,
             device=image_embeds.device)
-        encoder_input_ids = input_ids.clone()
-        encoder_input_ids[:, 0] = self.enc_token_id
-        text_outputs = self.text_encoder(
-            input_ids=encoder_input_ids,
-            attention_mask=attention_mask,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_attention_mask,
-            return_dict=True)
-        multimodal_tokens = text_outputs.last_hidden_state
-        expected_shape = (batch_size, input_ids.size(1), self.hidden_size)
-        if tuple(multimodal_tokens.shape) != expected_shape:
-            raise RuntimeError(
-                f'Unexpected BLIP multimodal text shape '
-                f'{tuple(multimodal_tokens.shape)}; expected '
-                f'{expected_shape}.')
-        return multimodal_tokens[:, 0, :]
+        batch_size = pixel_values.size(0)
+        decoder_embeddings = self.text_decoder.get_input_embeddings()
+        bos_ids = torch.full(
+            (batch_size, ),
+            self.bos_token_id,
+            dtype=torch.long,
+            device=pixel_values.device)
+        decoder_inputs_embeds = decoder_embeddings(bos_ids).unsqueeze(1)
+        decoder_attention_mask = torch.ones(
+            batch_size, 1, dtype=torch.long, device=pixel_values.device)
+        finished = torch.zeros(
+            batch_size, dtype=torch.bool, device=pixel_values.device)
+
+        token_distributions = []
+        token_ids = []
+        caption_masks = []
+        for _ in range(self.max_length - 1):
+            decoder_outputs = self.text_decoder(
+                inputs_embeds=decoder_inputs_embeds,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_attention_mask,
+                use_cache=False,
+                return_dict=True)
+            logits = self._mask_private_special_logits(
+                decoder_outputs.logits[:, -1, :])
+            probabilities = torch.softmax(logits, dim=-1)
+            greedy_ids = probabilities.argmax(dim=-1)
+            active = ~finished
+            selected_ids = torch.where(
+                active, greedy_ids,
+                torch.full_like(greedy_ids, self.pad_token_id))
+            hard = F.one_hot(
+                selected_ids, num_classes=self.vocab_size).to(
+                    probabilities.dtype)
+            straight_through = hard + probabilities - probabilities.detach()
+            pad_hard = F.one_hot(
+                torch.full_like(selected_ids, self.pad_token_id),
+                num_classes=self.vocab_size).to(probabilities.dtype)
+            straight_through = torch.where(
+                active.unsqueeze(-1), straight_through, pad_hard)
+
+            reached_sep = active & selected_ids.eq(self.sep_token_id)
+            is_caption_token = active & ~reached_sep & \
+                selected_ids.ne(self.pad_token_id)
+            token_distributions.append(straight_through)
+            token_ids.append(selected_ids)
+            caption_masks.append(is_caption_token)
+
+            next_embeddings = straight_through @ decoder_embeddings.weight
+            decoder_inputs_embeds = torch.cat(
+                [decoder_inputs_embeds, next_embeddings.unsqueeze(1)], dim=1)
+            decoder_attention_mask = torch.cat([
+                decoder_attention_mask,
+                active.to(torch.long).unsqueeze(1)
+            ], dim=1)
+            finished = finished | reached_sep
+            if finished.all():
+                break
+
+        return {
+            'token_distributions': torch.stack(token_distributions, dim=1),
+            'token_ids': torch.stack(token_ids, dim=1),
+            'caption_mask': torch.stack(caption_masks, dim=1),
+        }

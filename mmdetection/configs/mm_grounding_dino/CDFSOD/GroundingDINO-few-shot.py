@@ -25,7 +25,8 @@ model = dict(
     support_image_root=os.path.join(_base_.data_root, 'train'),
     support_image_batch_size=2,
     blip_model_name=os.getenv(
-        'CDFSOD_BLIP_MODEL', 'Salesforce/blip-itm-base-coco'),
+        'CDFSOD_BLIP_MODEL',
+        'Salesforce/blip-image-captioning-base'),
     blip_gradient_checkpointing=True,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
@@ -135,8 +136,9 @@ optim_wrapper = dict(
     paramwise_cfg=dict(custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
         'backbone': dict(lr_mult=0.1),
-        'support_blip_encoder.vision_model': dict(lr_mult=0.01),
-        'support_blip_encoder.text_encoder': dict(lr_mult=0.1),
+        'support_blip_captioner.vision_model': dict(lr_mult=0.01),
+        'support_blip_captioner.text_decoder': dict(lr_mult=0.1),
+        'language_model': dict(lr_mult=0.1),
         'text_feat_map': dict(lr_mult=0.1),
     }))
 

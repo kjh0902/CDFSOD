@@ -18,7 +18,7 @@ from .misc import (align_tensor, aligned_bilinear, center_of_mass,
 from .panoptic_gt_processing import preprocess_panoptic_gt
 from .point_sample import (get_uncertain_point_coords_with_randomness,
                            get_uncertainty)
-from .support_blip import SupportBlipEncoder
+from .support_blip import SupportBlipCaptioner
 from .vlfuse_helper import BertEncoderLayer, VLFuse, permute_and_flatten
 from .wbf import weighted_boxes_fusion
 
@@ -35,5 +35,5 @@ __all__ = [
     'reweight_loss_dict', 'relative_coordinate_maps', 'aligned_bilinear',
     'unfold_wo_center', 'imrenormalize', 'VLFuse', 'permute_and_flatten',
     'BertEncoderLayer', 'align_tensor', 'weighted_boxes_fusion',
-    'SupportBlipEncoder'
+    'SupportBlipCaptioner'
 ]

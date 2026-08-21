@@ -19,7 +19,7 @@ export CDFSOD_TRAIN_ANN="annotations/${SHOT}_shot.json"
 export CDFSOD_USE_BLIP_PROTOTYPES="${CDFSOD_USE_BLIP_PROTOTYPES:-${CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES:-1}}"
 
 CONFIG="configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py"
-TEXT_TAG="blip1_enc_prototype"
+TEXT_TAG="blip1_st_caption_prototype"
 if [ "$CDFSOD_USE_BLIP_PROTOTYPES" = "0" ]; then
   TEXT_TAG="class_name"
 fi
@@ -28,7 +28,7 @@ WORK_DIR="work_dirs/${DATASET}_${SHOT}shot_${TEXT_TAG}"
 echo "dataset: ${DATASET}"
 echo "shot: ${SHOT}"
 echo "data root: ${CDFSOD_DATA_ROOT}/${DATASET}"
-echo "BLIP multimodal prototypes: ${CDFSOD_USE_BLIP_PROTOTYPES}"
+echo "Differentiable BLIP caption prototypes: ${CDFSOD_USE_BLIP_PROTOTYPES}"
 echo "support annotation: ${CDFSOD_TRAIN_ANN}"
 echo "config: ${CONFIG}"
 echo "work dir: ${WORK_DIR}"
