@@ -10,6 +10,8 @@ from mmdet.models.utils import SupportBlipEncoder
 
 class _FakeVisionModel(nn.Module):
 
+    supports_gradient_checkpointing = True
+
     def __init__(self):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(2.0))
@@ -26,6 +28,8 @@ class _FakeVisionModel(nn.Module):
 
 class _FakeTextEncoder(nn.Module):
 
+    supports_gradient_checkpointing = True
+
     def __init__(self):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(3.0))
@@ -40,6 +44,14 @@ class _FakeTextEncoder(nn.Module):
         visual = encoder_hidden_states.mean(dim=(1, 2))[:, None, None]
         return SimpleNamespace(
             last_hidden_state=text * self.scale + visual)
+
+
+class _FakeUnsupportedTextEncoder(_FakeTextEncoder):
+
+    supports_gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        raise ValueError('This text encoder does not support checkpointing.')
 
 
 class _FakeImageProcessor:
@@ -62,10 +74,11 @@ class _FakeTokenizer:
                 num_texts, -1).clone())
 
 
-def _build_encoder():
+def _build_encoder(text_encoder=None):
     pretrained = SimpleNamespace(
         vision_model=_FakeVisionModel(),
-        text_encoder=_FakeTextEncoder(),
+        text_encoder=(text_encoder if text_encoder is not None else
+                      _FakeTextEncoder()),
         config=SimpleNamespace(text_config=SimpleNamespace(hidden_size=768)))
     processor = SimpleNamespace(
         image_processor=_FakeImageProcessor(), tokenizer=_FakeTokenizer())
@@ -89,6 +102,16 @@ def test_pretrained_blip_components_are_preserved_and_trainable():
     assert all(parameter.requires_grad for parameter in encoder.parameters())
     assert encoder.vision_model.checkpointing_enabled
     assert encoder.text_encoder.checkpointing_enabled
+
+
+def test_unsupported_text_encoder_skips_gradient_checkpointing():
+    text_encoder = _FakeUnsupportedTextEncoder()
+
+    encoder = _build_encoder(text_encoder=text_encoder)
+
+    assert encoder.text_encoder is text_encoder
+    assert not encoder.text_encoder.checkpointing_enabled
+    assert encoder.vision_model.checkpointing_enabled
 
 
 def test_pretrained_blip_pair_processor_is_used():

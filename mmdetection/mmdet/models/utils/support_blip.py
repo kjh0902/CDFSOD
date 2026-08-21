@@ -36,6 +36,9 @@ class SupportBlipEncoder(nn.Module):
         self.requires_grad_(True)
         if gradient_checkpointing:
             for module in (self.vision_model, self.text_encoder):
+                if not getattr(
+                        module, 'supports_gradient_checkpointing', True):
+                    continue
                 enable = getattr(module, 'gradient_checkpointing_enable', None)
                 if enable is not None:
                     enable()
