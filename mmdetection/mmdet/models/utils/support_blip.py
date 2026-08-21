@@ -27,6 +27,18 @@ class SupportBlipEncoder(nn.Module):
         self.vision_model = pretrained.vision_model
         self.text_encoder = pretrained.text_encoder
         self.hidden_size = pretrained.config.text_config.hidden_size
+        self.tokenizer.add_special_tokens({'bos_token': '[DEC]'})
+        self.tokenizer.add_special_tokens(
+            {'additional_special_tokens': ['[ENC]']})
+        self.enc_token_id = self.tokenizer.convert_tokens_to_ids('[ENC]')
+        num_text_embeddings = (
+            self.text_encoder.get_input_embeddings().num_embeddings)
+        if self.enc_token_id == self.tokenizer.unk_token_id or \
+                self.enc_token_id != num_text_embeddings - 1:
+            raise ValueError(
+                'BLIP tokenizer [ENC] token must map to the final pretrained '
+                f'text embedding, got token id {self.enc_token_id} for '
+                f'{num_text_embeddings} embeddings.')
 
         if self.hidden_size != 768:
             raise ValueError(
@@ -56,35 +68,32 @@ class SupportBlipEncoder(nn.Module):
         text_inputs = self.tokenizer(
             list(texts),
             padding=True,
-            return_special_tokens_mask=True,
             return_tensors='pt')
         inputs = dict(
             pixel_values=image_inputs['pixel_values'],
             input_ids=text_inputs['input_ids'],
-            attention_mask=text_inputs['attention_mask'],
-            special_tokens_mask=text_inputs['special_tokens_mask'])
+            attention_mask=text_inputs['attention_mask'])
 
         num_pairs = len(images)
         if inputs['pixel_values'].dim() != 4 or \
                 inputs['pixel_values'].size(0) != num_pairs:
             raise ValueError(
                 'BLIP image processor must return [N, 3, H, W].')
-        for key in ('input_ids', 'attention_mask', 'special_tokens_mask'):
+        for key in ('input_ids', 'attention_mask'):
             if inputs[key].dim() != 2 or inputs[key].size(0) != num_pairs:
                 raise ValueError(
                     f'BLIP tokenizer must return {key} with shape [N, L].')
-        if inputs['input_ids'].shape != inputs['attention_mask'].shape or \
-                inputs['input_ids'].shape != \
-                inputs['special_tokens_mask'].shape:
+        if inputs['input_ids'].shape != inputs['attention_mask'].shape:
             raise ValueError(
                 'BLIP text input masks must have matching shapes.')
         return {key: value.detach().cpu() for key, value in inputs.items()}
 
     def forward(self, pixel_values: Tensor, input_ids: Tensor,
                 attention_mask: Tensor) -> Tensor:
-        """Return independently fused text tokens for aligned support pairs."""
+        """Return the image-grounded [ENC] state for each support pair."""
         batch_size = pixel_values.size(0)
-        if input_ids.size(0) != batch_size or \
+        if input_ids.dim() != 2 or input_ids.size(1) == 0 or \
+                input_ids.size(0) != batch_size or \
                 attention_mask.shape != input_ids.shape:
             raise ValueError('BLIP image and text batch shapes must match.')
 
@@ -95,8 +104,10 @@ class SupportBlipEncoder(nn.Module):
             image_embeds.shape[:-1],
             dtype=torch.long,
             device=image_embeds.device)
+        encoder_input_ids = input_ids.clone()
+        encoder_input_ids[:, 0] = self.enc_token_id
         text_outputs = self.text_encoder(
-            input_ids=input_ids,
+            input_ids=encoder_input_ids,
             attention_mask=attention_mask,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_attention_mask,
@@ -108,4 +119,4 @@ class SupportBlipEncoder(nn.Module):
                 f'Unexpected BLIP multimodal text shape '
                 f'{tuple(multimodal_tokens.shape)}; expected '
                 f'{expected_shape}.')
-        return multimodal_tokens
+        return multimodal_tokens[:, 0, :]

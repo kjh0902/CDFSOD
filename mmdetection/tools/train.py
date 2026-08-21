@@ -25,11 +25,6 @@ def parse_args():
         action='store_true',
         help='enable automatically scaling LR.')
     parser.add_argument(
-        '--blip-positive-map-mode',
-        choices=['all', 'class_only'],
-        default='class_only',
-        help='positive token mapping for BLIP multimodal prototypes')
-    parser.add_argument(
         '--resume',
         nargs='?',
         type=str,
@@ -85,8 +80,6 @@ def main():
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
-    cfg.model.blip_positive_map_mode = args.blip_positive_map_mode
-
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None

@@ -27,7 +27,6 @@ model = dict(
     blip_model_name=os.getenv(
         'CDFSOD_BLIP_MODEL', 'Salesforce/blip-itm-base-coco'),
     blip_gradient_checkpointing=True,
-    blip_positive_map_mode='class_only',
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
