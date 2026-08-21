@@ -133,7 +133,7 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
-    paramwise_cfg=dict(custom_keys={
+    paramwise_cfg=dict(bypass_duplicate=True, custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
         'backbone': dict(lr_mult=0.1),
         'support_blip_captioner.vision_model': dict(lr_mult=0.01),
