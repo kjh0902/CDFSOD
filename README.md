@@ -58,9 +58,10 @@ projection됩니다. 새 projection layer는 만들지 않습니다. 결과는 `
 사용합니다. 전체 class 수는 Grounding DINO `max_text_len=256`을 넘을 수 없습니다.
 
 학습에서는 BLIP 전처리 image tensor만 CPU에 보관하고 captioner와 BERT 출력을 매
-iteration 다시 계산합니다. Support mini-batch의 BLIP caption decoding부터 BERT
-class-token feature까지 non-reentrant gradient checkpoint를 적용하며, BLIP vision
-encoder, caption decoder, Grounding DINO BERT와 `text_feat_map`을 모두 fine-tuning합니다.
+iteration 다시 계산합니다. BLIP caption decoder의 Transformer layer에만 gradient
+checkpoint를 적용하며, BLIP vision encoder, caption decoder, Grounding DINO BERT와
+`text_feat_map`을 모두 fine-tuning합니다. ST embedding과 BERT를 포함한 support
+pipeline 바깥쪽에는 별도 checkpoint를 적용하지 않습니다.
 평가에서는 마지막 checkpoint와 target support set으로 prototype을 첫 predict 시 다시
 생성해 detach/cache합니다.
 

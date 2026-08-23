@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from functools import partial
 from typing import Dict, Sequence
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
 
@@ -74,22 +76,32 @@ class SupportBlipCaptioner(nn.Module):
 
         self.requires_grad_(True)
         if gradient_checkpointing:
-            self._enable_supported_gradient_checkpointing(self.vision_model)
-            self._enable_supported_gradient_checkpointing(self.text_decoder)
+            self._enable_decoder_layer_gradient_checkpointing()
 
-    @staticmethod
-    def _enable_supported_gradient_checkpointing(module: nn.Module) -> None:
-        if not getattr(module, 'supports_gradient_checkpointing', False):
-            return
-        enable = getattr(module, 'gradient_checkpointing_enable', None)
-        if enable is None:
-            return
-        try:
-            enable()
-        except ValueError:
-            # Some Transformers wrappers advertise support although the
-            # concrete BLIP text submodule in that release does not.
-            return
+    def _enable_decoder_layer_gradient_checkpointing(self) -> None:
+        """Checkpoint only the BLIP caption decoder Transformer layers.
+
+        Transformers applies checkpointing in ``BlipTextLayer.__call__``.
+        Configuring those layers directly keeps the vision encoder and the
+        surrounding ST-caption/BERT pipeline out of the checkpointed region.
+        It also avoids enabling checkpointing recursively on unrelated BLIP
+        components through the pretrained-model wrapper.
+        """
+        text_model = getattr(self.text_decoder, 'bert', None)
+        encoder = getattr(text_model, 'encoder', None)
+        layers = getattr(encoder, 'layer', None)
+        if not isinstance(layers, nn.ModuleList) or not layers:
+            raise ValueError(
+                'BLIP caption decoder must expose '
+                'text_decoder.bert.encoder.layer Transformer layers.')
+        checkpoint_func = partial(checkpoint, use_reentrant=False)
+        for layer in layers:
+            if not hasattr(layer, 'gradient_checkpointing'):
+                raise ValueError(
+                    'Every BLIP caption decoder Transformer layer must '
+                    'support gradient checkpointing.')
+            layer._gradient_checkpointing_func = checkpoint_func
+            layer.gradient_checkpointing = True
 
     def preprocess_images(self, images: Sequence[Image.Image]) -> Tensor:
         """Preprocess support crops once and keep the pixels on CPU."""

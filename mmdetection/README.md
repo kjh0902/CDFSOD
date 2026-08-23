@@ -50,7 +50,9 @@ BLIP과 Grounding DINO BERT가 공유하는 `bert-base-uncased` vocabulary를 �
 끊기지 않습니다. BERT 입력은 `[CLS] class name : caption [SEP]`이며, BERT 출력 중
 class-name subword state만 선택합니다. 같은 class의 support와 subword를 평균한 뒤
 기존 `text_feat_map`으로 768→256 projection합니다. 클래스당 하나의 prototype과
-positive index를 사용합니다. 학습 중 support mini-batch 전체에 non-reentrant gradient
-checkpoint를 적용하며 BLIP captioner와 BERT까지 detection loss의 gradient가 전달됩니다.
+positive index를 사용합니다. 학습 중 BLIP caption decoder의 Transformer layer에만
+gradient checkpoint를 적용하며 BLIP captioner와 BERT까지 detection loss의 gradient가
+전달됩니다. ST embedding과 BERT를 포함한 support pipeline 바깥쪽에는 별도 checkpoint를
+적용하지 않습니다.
 평가 중에는 최초 한 번 계산해 detach/cache합니다. Test image와 test GT는 prototype
 생성에 사용되지 않습니다.

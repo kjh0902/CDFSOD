@@ -1,6 +1,5 @@
 import json
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -76,7 +75,7 @@ def _support_feature_inputs():
     return features, labels
 
 
-def _make_checkpoint_detector_stub():
+def _make_support_pipeline_detector_stub():
     detector = GroundingDINO.__new__(GroundingDINO)
     nn.Module.__init__(detector)
     detector.support_image_batch_size = 2
@@ -101,26 +100,8 @@ def _make_checkpoint_detector_stub():
     return detector
 
 
-def test_training_support_pipeline_uses_non_reentrant_checkpoint():
-    detector = _make_checkpoint_detector_stub()
-    detector.training = True
-
-    def run_checkpoint(function, *args, **kwargs):
-        assert kwargs == {'use_reentrant': False}
-        return function(*args)
-
-    with patch(
-            'mmdet.models.detectors.grounding_dino.gradient_checkpoint',
-            side_effect=run_checkpoint) as checkpoint_mock:
-        features = detector.compute_support_caption_features(
-            torch.device('cpu'))
-
-    checkpoint_mock.assert_called_once()
-    assert features.shape == (2, 2)
-
-
-def test_training_support_checkpoint_preserves_parameter_gradients():
-    detector = _make_checkpoint_detector_stub()
+def test_direct_training_support_pipeline_preserves_parameter_gradients():
+    detector = _make_support_pipeline_detector_stub()
     detector.training = True
 
     features = detector.compute_support_caption_features(torch.device('cpu'))
@@ -128,20 +109,6 @@ def test_training_support_checkpoint_preserves_parameter_gradients():
 
     assert detector.support_scale.grad is not None
     assert detector.support_scale.grad.abs().item() > 0
-
-
-def test_eval_support_pipeline_skips_gradient_checkpoint():
-    detector = _make_checkpoint_detector_stub()
-    detector.training = False
-
-    with patch(
-            'mmdet.models.detectors.grounding_dino.gradient_checkpoint'
-    ) as checkpoint_mock:
-        features = detector.compute_support_caption_features(
-            torch.device('cpu'))
-
-    checkpoint_mock.assert_not_called()
-    assert features.shape == (2, 2)
 
 
 def test_caption_features_are_averaged_by_class():

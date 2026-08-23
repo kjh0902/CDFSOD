@@ -29,19 +29,16 @@ class _FakeVisionModel(nn.Module):
 
 class _FakeTextDecoder(nn.Module):
 
-    supports_gradient_checkpointing = True
-
-    def __init__(self, checkpointing_error=False):
+    def __init__(self, expose_transformer_encoder=True):
         super().__init__()
         self.embedding = nn.Embedding(12, 8)
         self.scale = nn.Parameter(torch.tensor(0.1))
-        self.checkpointing_enabled = False
-        self.checkpointing_error = checkpointing_error
-
-    def gradient_checkpointing_enable(self):
-        if self.checkpointing_error:
-            raise ValueError('unsupported concrete decoder')
-        self.checkpointing_enabled = True
+        if expose_transformer_encoder:
+            self.bert = nn.Module()
+            self.bert.encoder = nn.Module()
+            self.bert.encoder.gradient_checkpointing = False
+            self.bert.encoder.layer = nn.ModuleList(
+                [_FakeTextLayer(), _FakeTextLayer()])
 
     def get_input_embeddings(self):
         return self.embedding
@@ -64,6 +61,11 @@ class _FakeTextDecoder(nn.Module):
         logits = step_logits[:, None, :].expand(
             -1, sequence_length, -1)
         return SimpleNamespace(logits=logits)
+
+
+class _FakeTextLayer(nn.Module):
+
+    gradient_checkpointing = False
 
 
 class _FakeImageProcessor:
@@ -113,7 +115,8 @@ class _FakeTokenizer:
         return dict(self._vocab)
 
 
-def _build_captioner(checkpointing_error=False):
+def _build_captioner(expose_transformer_encoder=True,
+                     gradient_checkpointing=True):
     text_config = SimpleNamespace(
         hidden_size=768,
         vocab_size=12,
@@ -123,7 +126,7 @@ def _build_captioner(checkpointing_error=False):
         pad_token_id=0)
     pretrained = SimpleNamespace(
         vision_model=_FakeVisionModel(),
-        text_decoder=_FakeTextDecoder(checkpointing_error),
+        text_decoder=_FakeTextDecoder(expose_transformer_encoder),
         config=SimpleNamespace(text_config=text_config))
     processor = SimpleNamespace(
         image_processor=_FakeImageProcessor(), tokenizer=_FakeTokenizer())
@@ -134,7 +137,8 @@ def _build_captioner(checkpointing_error=False):
                 'mmdet.models.utils.support_blip.'
                 'BlipProcessor.from_pretrained',
                 return_value=processor) as processor_loader:
-        captioner = SupportBlipCaptioner('fake/blip')
+        captioner = SupportBlipCaptioner(
+            'fake/blip', gradient_checkpointing=gradient_checkpointing)
     model_loader.assert_called_once_with('fake/blip')
     processor_loader.assert_called_once_with('fake/blip')
     return captioner
@@ -148,15 +152,32 @@ def test_pretrained_caption_components_are_preserved_and_trainable():
     assert captioner.tokenizer.bos_token_id == 10
     assert captioner.enc_token_id == 11
     assert all(parameter.requires_grad for parameter in captioner.parameters())
-    assert captioner.vision_model.checkpointing_enabled
-    assert captioner.text_decoder.checkpointing_enabled
+    assert not captioner.vision_model.checkpointing_enabled
+    assert not captioner.text_decoder.bert.encoder.gradient_checkpointing
+    layers = captioner.text_decoder.bert.encoder.layer
+    assert all(layer.gradient_checkpointing for layer in layers)
+    assert all(
+        layer._gradient_checkpointing_func.keywords == {
+            'use_reentrant': False
+        } for layer in layers)
 
 
-def test_unsupported_decoder_checkpointing_is_skipped():
-    captioner = _build_captioner(checkpointing_error=True)
+def test_disabled_checkpointing_leaves_vision_and_decoder_unchanged():
+    captioner = _build_captioner(gradient_checkpointing=False)
 
-    assert captioner.vision_model.checkpointing_enabled
-    assert not captioner.text_decoder.checkpointing_enabled
+    assert not captioner.vision_model.checkpointing_enabled
+    assert not captioner.text_decoder.bert.encoder.gradient_checkpointing
+    assert all(
+        not layer.gradient_checkpointing
+        for layer in captioner.text_decoder.bert.encoder.layer)
+    assert all(
+        not hasattr(layer, '_gradient_checkpointing_func')
+        for layer in captioner.text_decoder.bert.encoder.layer)
+
+
+def test_missing_decoder_transformer_layers_raise_clear_error():
+    with pytest.raises(ValueError, match='text_decoder.bert.encoder.layer'):
+        _build_captioner(expose_transformer_encoder=False)
 
 
 def test_pretrained_blip_image_processor_is_used():

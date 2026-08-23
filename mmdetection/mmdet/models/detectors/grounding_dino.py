@@ -11,7 +11,6 @@ import torch.nn as nn
 from mmengine.runner.amp import autocast
 from PIL import Image
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
@@ -571,7 +570,7 @@ class GroundingDINO(DINO):
             caption_outputs, labels)
 
     def compute_support_caption_features(self, device) -> Tensor:
-        """Recompute differentiable caption features with train checkpoint."""
+        """Recompute differentiable caption features for all support crops."""
         self._prepare_support_image_inputs()
         object_features = []
         for start_idx in range(0, self._support_pixel_values.size(0),
@@ -580,16 +579,8 @@ class GroundingDINO(DINO):
             pixel_values = self._support_pixel_values[start_idx:end_idx].to(
                 device, non_blocking=True)
             labels = self._support_pixel_labels[start_idx:end_idx].to(device)
-            if self.training:
-                batch_features = gradient_checkpoint(
-                    self._compute_support_batch_caption_features,
-                    pixel_values,
-                    labels,
-                    use_reentrant=False)
-            else:
-                batch_features = \
-                    self._compute_support_batch_caption_features(
-                        pixel_values, labels)
+            batch_features = self._compute_support_batch_caption_features(
+                pixel_values, labels)
             object_features.append(batch_features)
         caption_features = torch.cat(object_features, dim=0)
         labels = self._support_pixel_labels.to(device)
