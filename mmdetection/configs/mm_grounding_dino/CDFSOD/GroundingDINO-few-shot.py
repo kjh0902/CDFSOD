@@ -8,20 +8,26 @@ import os
 
 lang_model_name = 'bert-base-uncased'
 num_classes = len(_base_.metainfo['classes'])
-support_caption_file = _base_.instance_caption_file
-if not os.path.isabs(support_caption_file):
-    support_caption_file = os.path.join(_base_.data_root,
-                                        support_caption_file)
+max_text_len = 256
+support_ann_file = _base_.train_ann_file
+if not os.path.isabs(support_ann_file):
+    support_ann_file = os.path.join(_base_.data_root, support_ann_file)
 
 model = dict(
     type='GroundingDINO',
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
-    use_class_name_token_prototypes=_base_.use_class_name_token_prototypes,
-    support_caption_file=support_caption_file,
+    use_blip_prototypes=_base_.use_blip_prototypes,
+    support_ann_file=support_ann_file,
     support_class_names=_base_.metainfo['classes'],
     support_domain_attribute=_base_.domain_attribute,
+    support_image_root=os.path.join(_base_.data_root, 'train'),
+    support_image_batch_size=2,
+    blip_model_name=os.getenv(
+        'CDFSOD_BLIP_MODEL',
+        'Salesforce/blip-image-captioning-base'),
+    blip_gradient_checkpointing=True,
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -98,7 +104,8 @@ model = dict(
         type='GroundingDINOHead',
         num_classes=num_classes,
         sync_cls_avg_factor=True,
-        contrastive_cfg=dict(max_text_len=256, log_scale=0.0, bias=False),
+        contrastive_cfg=dict(
+            max_text_len=max_text_len, log_scale=0.0, bias=False),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
@@ -126,9 +133,13 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
-    paramwise_cfg=dict(custom_keys={
+    paramwise_cfg=dict(bypass_duplicate=True, custom_keys={
         'absolute_pos_embed': dict(decay_mult=0.),
-        'backbone': dict(lr_mult=0.1)
+        'backbone': dict(lr_mult=0.1),
+        'support_blip_captioner.vision_model': dict(lr_mult=0.01),
+        'support_blip_captioner.text_decoder': dict(lr_mult=0.1),
+        'language_model': dict(lr_mult=0.1),
+        'text_feat_map': dict(lr_mult=0.1),
     }))
 
 max_epochs = 30

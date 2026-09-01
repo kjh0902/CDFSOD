@@ -1,21 +1,11 @@
 # CDFSOD GroundingDINO 사용법
 
-이 폴더에는 MMDetection 기반 Grounding DINO 코드가 들어 있습니다.
-전체 설치와 실험 흐름은 저장소 루트의 `README.md`를 보면 됩니다.
+이 폴더에는 MMDetection 기반 Grounding DINO 코드가 들어 있습니다. 전체 설치와 실험
+흐름은 저장소 루트의 `README.md`를 보면 됩니다.
 
 ## 핵심 실행 명령어
 
-support caption 생성:
-
-```bash
-python mmdetection/tools/generate_instance_captions.py \
-  --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
-  --ann-file annotations/1_shot.json \
-  --img-prefix train \
-  --output annotations/1_shot_captions.json
-```
-
-class-name token prototype 방식 학습:
+Straight-Through BLIP caption prototype 방식 학습:
 
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1 1
@@ -24,7 +14,7 @@ bash mmdetection/run_all_training.sh NEU-DET 1 1
 class name만 사용하는 baseline:
 
 ```bash
-CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
+CDFSOD_USE_BLIP_PROTOTYPES=0 bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
 debug 출력:
@@ -37,18 +27,32 @@ CDFSOD_DEBUG_TEXT_TOKENS=1 bash mmdetection/run_all_training.sh NEU-DET 1 1
 
 ```bash
 cd mmdetection
+CDFSOD_DATASET=NEU-DET \
+CDFSOD_TRAIN_ANN=annotations/1_shot.json \
 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_class_name_token_prototype/epoch_30.pth \
-  --work-dir work_dirs/NEU-DET_1shot_class_name_token_prototype
+  work_dirs/NEU-DET_1shot_blip1_st_caption_prototype/epoch_30.pth \
+  --work-dir work_dirs/NEU-DET_1shot_blip1_st_caption_prototype
 ```
 
 ## 현재 기본 동작
 
-기본값은 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=1`입니다.
+기본값은 `CDFSOD_USE_BLIP_PROTOTYPES=1`입니다.
 
-학습 중 support caption JSON을 한 번 읽어서 class별 prompt bank를 만들고, 매 iteration마다 현재 BERT로 전체 support enriched prompt를 다시 encoding합니다.
-BERT에는 `{class_name}, {instance_caption}, {domain_attribute}.` 전체 prompt가 들어가지만, 출력에서는 tokenizer `offset_mapping`을 이용해 class name 문자 범위와 겹치는 token feature만 선택합니다.
+별도 caption JSON 없이 `annotations/{SHOT}_shot.json`의 표준 COCO `images`,
+`categories`, `annotations`를 직접 연결해 K-shot train support object를 crop합니다.
+각 crop은 `Salesforce/blip-image-captioning-base`에 독립적으로 입력됩니다. Caption
+decoder는 `[DEC]`에서 시작하고 `[DEC]`, `[ENC]` logits를 차단한 noise-free
+Straight-Through Argmax로 최대 10 token의 greedy caption을 생성합니다.
 
-선택된 class-name token feature는 같은 class끼리 전부 평균해서 class당 1개 text prototype으로 만듭니다. `[CLS]` token은 사용하지 않습니다.
-baseline을 원하면 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`으로 실행하면 됩니다.
+BLIP과 Grounding DINO BERT가 공유하는 `bert-base-uncased` vocabulary를 이용해 생성
+분포를 BERT `inputs_embeds`로 직접 전달하므로 문자열 decode/re-tokenize로 gradient가
+끊기지 않습니다. BERT 입력은 `[CLS] class name : caption [SEP]`이며, BERT 출력 중
+class-name subword state만 선택합니다. 같은 class의 support와 subword를 평균한 뒤
+기존 `text_feat_map`으로 768→256 projection합니다. 클래스당 하나의 prototype과
+positive index를 사용합니다. 학습 중 BLIP caption decoder의 Transformer layer에만
+gradient checkpoint를 적용하며 BLIP captioner와 BERT까지 detection loss의 gradient가
+전달됩니다. ST embedding과 BERT를 포함한 support pipeline 바깥쪽에는 별도 checkpoint를
+적용하지 않습니다.
+평가 중에는 최초 한 번 계산해 detach/cache합니다. Test image와 test GT는 prototype
+생성에 사용되지 않습니다.

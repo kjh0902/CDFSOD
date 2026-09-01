@@ -1,9 +1,10 @@
-# CDFSOD Grounding DINO class-name token prototype
+# CDFSOD Grounding DINO differentiable BLIP caption prototype
 
 이 저장소는 CDFSOD few-shot detection을 위한 MMDetection 기반 Grounding DINO
-학습 코드입니다. 기본 설정은 support image의 instance caption과 domain attribute를
-BERT prompt로 사용하되, class name에 해당하는 token feature만 선택하고 class별로
-평균하여 text prototype을 만듭니다. `[CLS]` token은 사용하지 않습니다.
+학습 코드입니다. 기본 설정은 클래스별 K-shot support instance의 GT bbox crop에서
+pretrained BLIP-1 caption을 생성합니다. 생성 분포를 Straight-Through Argmax와
+`inputs_embeds`로 Grounding DINO BERT에 직접 연결하고, class-name token hidden state만
+평균해 Grounding DINO text prototype으로 사용합니다.
 
 ## 데이터 구조
 
@@ -15,38 +16,54 @@ DATASET_NAME/
     train.json
     test.json
     1_shot.json
-    1_shot_captions.json
     5_shot.json
-    5_shot_captions.json
     10_shot.json
-    10_shot_captions.json
   train/
   test/
 ```
 
-지원 데이터셋은 `NEU-DET`, `clipart1k`, `UODD`이며 class name과 기본 domain
-attribute는
+지원 데이터셋은 `NEU-DET`, `clipart1k`, `UODD`이며 class name은
 `mmdetection/configs/_base_/datasets/CDFSOD_detection_few-shot.py`에 정의되어
 있습니다.
 
-## support caption 생성
+## Support object annotation
 
-기본 prototype 방식으로 학습하려면 먼저 shot annotation의 각 GT bbox crop에 대한
-caption JSON을 생성합니다. 다음 예시는 NEU-DET 1-shot 데이터에 BLIP caption을
-생성합니다.
+별도의 caption 파일은 필요하지 않습니다. 학습에 선택된 표준 COCO annotation
+`annotations/{SHOT}_shot.json`의 `images`, `categories`, `annotations`를 직접 읽습니다.
+각 annotation의 `image_id`로 train image의 `file_name`을, `category_id`로 class name을
+찾고 `bbox`를 support crop으로 사용합니다. 모든 target class에는 최소 한 개의 support
+object가 있어야 합니다. Prototype loader는 `support_image_root` 아래의 train image만
+읽으며 test image와 test GT는 사용하지 않습니다.
 
-```bash
-python mmdetection/tools/generate_instance_captions.py \
-  --dataset-root /home/aislab5090/CDFSOD/junhyung/datasets/NEU-DET \
-  --ann-file annotations/1_shot.json \
-  --img-prefix train \
-  --output annotations/1_shot_captions.json
-```
+## Differentiable BLIP caption prototype
 
-caption 생성 스크립트는 기본적으로
-`Salesforce/blip-image-captioning-base`를 사용하며, CUDA를 사용할 수 없으면 CPU로
-전환합니다. 다른 모델이나 장치를 사용하려면 각각 `--model-name`, `--device`로
-지정할 수 있습니다.
+기본 checkpoint는 `Salesforce/blip-image-captioning-base`입니다. Pretrained vision
+encoder와 caption decoder를 사용하며 다른 호환 checkpoint 또는 로컬 경로는
+`CDFSOD_BLIP_MODEL`로 지정할 수 있습니다.
+
+각 support crop은 독립적으로 captioning됩니다. `[DEC]`에서 시작하는 최대 길이 10의
+greedy decoder에서 `[DEC]`, `[ENC]` logits를 차단하고 noise-free Straight-Through
+Argmax를 적용합니다. Forward token은 masked greedy argmax와 같고 backward는 softmax
+확률을 통해 BLIP vision encoder와 caption decoder로 전달됩니다.
+
+BLIP과 Grounding DINO BERT가 공유하는 `bert-base-uncased` lexical vocabulary를 사용해
+caption을 decode/re-tokenize하지 않고 BERT embedding으로 직접 변환합니다. BERT 입력은
+`[CLS] class name : caption [SEP]`이며 최종 출력에서 class-name subword만 선택합니다.
+같은 class의 support와 subword token을 모두 평균해 클래스당 `[768]` prototype을
+만듭니다.
+
+결과는 Grounding DINO checkpoint의 기존 pretrained `text_feat_map`으로 768→256
+projection됩니다. 새 projection layer는 만들지 않습니다. 결과는 `[C,256]`이며 클래스
+`c`의 training/inference positive mapping은 Grounding DINO prototype index `c` 하나를
+사용합니다. 전체 class 수는 Grounding DINO `max_text_len=256`을 넘을 수 없습니다.
+
+학습에서는 BLIP 전처리 image tensor만 CPU에 보관하고 captioner와 BERT 출력을 매
+iteration 다시 계산합니다. BLIP caption decoder의 Transformer layer에만 gradient
+checkpoint를 적용하며, BLIP vision encoder, caption decoder, Grounding DINO BERT와
+`text_feat_map`을 모두 fine-tuning합니다. ST embedding과 BERT를 포함한 support
+pipeline 바깥쪽에는 별도 checkpoint를 적용하지 않습니다.
+평가에서는 마지막 checkpoint와 target support set으로 prototype을 첫 predict 시 다시
+생성해 detach/cache합니다.
 
 ## 학습과 평가
 
@@ -59,7 +76,6 @@ bash mmdetection/run_all_training.sh DATASET SHOT GPU_COUNT
 ```bash
 bash mmdetection/run_all_training.sh NEU-DET 1 1
 bash mmdetection/run_all_training.sh clipart1k 5 4
-bash mmdetection/run_all_training.sh UODD 10 4
 ```
 
 데이터 루트가 다르면 환경 변수로 지정합니다.
@@ -69,24 +85,17 @@ CDFSOD_DATA_ROOT=/other/datasets \
   bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
-기본 caption 파일은 `annotations/{SHOT}_shot_captions.json`입니다. 다른 파일이나
-domain attribute를 사용하려면 다음과 같이 지정합니다.
-
-```bash
-CDFSOD_CAPTION_FILE=annotations/custom_captions.json \
-CDFSOD_DOMAIN_ATTRIBUTE="custom domain description" \
-  bash mmdetection/run_all_training.sh NEU-DET 1 1
-```
-
-기본 실험 결과는
-`mmdetection/work_dirs/{DATASET}_{SHOT}shot_class_name_token_prototype`에 저장됩니다.
+학습 annotation과 BLIP support annotation은 동일한
+`CDFSOD_TRAIN_ANN=annotations/{SHOT}_shot.json`입니다. 기본 실험 결과는
+`mmdetection/work_dirs/{DATASET}_{SHOT}shot_blip1_st_caption_prototype`에 저장됩니다.
 스크립트는 30 epoch 학습 후 `epoch_30.pth`를 평가합니다.
 
-caption prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은
-다음과 같이 실행합니다. 결과 경로에는 `_class_name` suffix가 붙습니다.
+BLIP prototype을 사용하지 않고 class name만 사용하는 Grounding DINO baseline은 다음과
+같이 실행합니다. 이전 환경변수 `CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0`도 fallback으로
+지원합니다.
 
 ```bash
-CDFSOD_USE_CLASS_NAME_TOKEN_PROTOTYPES=0 \
+CDFSOD_USE_BLIP_PROTOTYPES=0 \
   bash mmdetection/run_all_training.sh NEU-DET 1 1
 ```
 
@@ -97,13 +106,17 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 - 모델: Grounding DINO Swin-B
 - pretrained checkpoint: OpenMMLab Grounding DINO Swin-B checkpoint
 - optimizer: AdamW
-- learning rate: `1e-4` (backbone multiplier `0.1`)
+- learning rate: `1e-4` (backbone `0.1`, BLIP vision encoder `0.01`, BLIP
+  caption decoder `0.1`, Grounding DINO BERT `0.1`, `text_feat_map` `0.1`)
 - weight decay: `1e-4`
 - batch size: GPU당 `2`
 - epochs: `30`
 - LR milestone: epoch `20`, gamma `0.1`
-- train annotation: `annotations/{SHOT}_shot.json`
-- support caption: `annotations/{SHOT}_shot_captions.json`
+- train/support annotation: `annotations/{SHOT}_shot.json`
+- BLIP-1: `Salesforce/blip-image-captioning-base`, hidden dim `768`
+- support crop batch size: `2`, pretrained image processor 사용
+- prototype generation: class/support-wise mean of caption-enriched class tokens
+- maximum classes/prototype tokens: `256`
 - validation/test annotation: `annotations/test.json`
 
 상세 설정은
@@ -116,9 +129,8 @@ debug 출력을 켜려면 `CDFSOD_DEBUG_TEXT_TOKENS=1`을 지정합니다.
 cd mmdetection
 CDFSOD_DATASET=NEU-DET \
 CDFSOD_TRAIN_ANN=annotations/1_shot.json \
-CDFSOD_CAPTION_FILE=annotations/1_shot_captions.json \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python tools/test.py \
   configs/mm_grounding_dino/CDFSOD/GroundingDINO-few-shot-SwinB.py \
-  work_dirs/NEU-DET_1shot_class_name_token_prototype/epoch_30.pth \
-  --work-dir work_dirs/NEU-DET_1shot_class_name_token_prototype
+  work_dirs/NEU-DET_1shot_blip1_st_caption_prototype/epoch_30.pth \
+  --work-dir work_dirs/NEU-DET_1shot_blip1_st_caption_prototype
 ```

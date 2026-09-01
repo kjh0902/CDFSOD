@@ -1,14 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import json
+import os
 import re
 import warnings
-from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 from mmengine.runner.amp import autocast
+from PIL import Image
 from torch import Tensor
 
 from mmdet.registry import MODELS
@@ -17,6 +18,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from ..utils import SupportBlipCaptioner
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -58,27 +60,61 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
-                 use_class_name_token_prototypes: bool = False,
-                 support_caption_file: Optional[str] = None,
+                 use_blip_prototypes: bool = False,
+                 support_ann_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  support_domain_attribute: Optional[str] = None,
+                 support_image_root: Optional[str] = None,
+                 support_image_batch_size: int = 2,
+                 blip_model_name: str =
+                 'Salesforce/blip-image-captioning-base',
+                 blip_gradient_checkpointing: bool = True,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
-        self.use_class_name_token_prototypes = use_class_name_token_prototypes
-        self.support_caption_file = support_caption_file
+        self.use_blip_prototypes = use_blip_prototypes
+        self.support_ann_file = support_ann_file
         self.support_class_names = list(support_class_names or [])
         self.support_domain_attribute = support_domain_attribute
-        self.support_prompt_bank = None
-        self.support_prompt_labels = None
-        self.support_prompt_texts = None
-        self.support_tokenized = None
-        self._cached_eval_support_prototype_text_dict = None
+        self.support_image_root = support_image_root
+        if support_image_batch_size <= 0:
+            raise ValueError('support_image_batch_size must be positive.')
+        self.support_image_batch_size = support_image_batch_size
+        self.blip_model_name = blip_model_name
+        self.blip_gradient_checkpointing = blip_gradient_checkpointing
+        self.support_entries = None
+        self._support_pixel_values = None
+        self._support_pixel_labels = None
+        self._support_class_token_ids = None
+        self._support_colon_token_ids = None
+        self._cached_eval_support_prototypes = None
         super().__init__(*args, **kwargs)
-        if self.use_class_name_token_prototypes:
-            self.build_support_prompt_bank()
+        if self.use_blip_prototypes:
+            self.support_blip_captioner = SupportBlipCaptioner(
+                model_name=self.blip_model_name,
+                gradient_checkpointing=self.blip_gradient_checkpointing)
+            bert = self.language_model.language_backbone.body.model
+            bert_hidden_size = bert.config.hidden_size
+            if self.text_feat_map.in_features != bert_hidden_size or \
+                    bert_hidden_size != \
+                    self.support_blip_captioner.hidden_size:
+                raise ValueError(
+                    'BLIP caption decoder, Grounding DINO BERT and '
+                    'text_feat_map input dimensions must match.')
+            self.blip_shared_vocab_size = \
+                self.support_blip_captioner.validate_grounding_tokenizer(
+                    self.language_model.tokenizer)
+            bert_vocab_size = bert.get_input_embeddings().num_embeddings
+            if self.blip_shared_vocab_size != bert_vocab_size:
+                raise ValueError(
+                    'Validated shared vocabulary size must match the '
+                    'Grounding DINO BERT embedding table.')
+            self.build_support_object_bank()
+        else:
+            self.support_blip_captioner = None
+            self.blip_shared_vocab_size = None
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -106,10 +142,10 @@ class GroundingDINO(DINO):
             bias=True)
 
     def train(self, mode: bool = True):
-        """Switch train/eval mode and clear stale eval text-token cache."""
+        """Switch mode and clear stale detached support prototypes."""
         super().train(mode)
         if mode:
-            self._cached_eval_support_prototype_text_dict = None
+            self._cached_eval_support_prototypes = None
         return self
 
     def init_weights(self) -> None:
@@ -216,192 +252,362 @@ class GroundingDINO(DINO):
             positive_map, plus=1)
         return positive_map_label_to_token, positive_map
 
-    def build_support_prompt_bank(self) -> None:
-        """Read support captions once and cache class-name token positions."""
-        if self.support_prompt_bank is not None:
+    def build_support_object_bank(self) -> None:
+        """Load support object paths, GT boxes and labels from COCO JSON."""
+        if self.support_entries is not None:
             return
-        if not self.support_caption_file:
-            raise ValueError('support_caption_file is required when '
-                             'support enriched class tokens are enabled.')
+        if not self.support_ann_file:
+            raise ValueError('support_ann_file is required when BLIP '
+                             'caption prototypes are enabled.')
 
-        with open(self.support_caption_file, 'r', encoding='utf-8') as f:
-            caption_data = json.load(f)
+        with open(self.support_ann_file, 'r', encoding='utf-8') as f:
+            support_data = json.load(f)
+        if not isinstance(support_data, dict):
+            raise ValueError('Support annotation file must be a COCO JSON '
+                             'dictionary.')
 
-        if isinstance(caption_data, dict):
-            entries = caption_data.get('captions',
-                                       caption_data.get('annotations',
-                                                        caption_data))
-        else:
-            entries = caption_data
+        images = support_data.get('images')
+        annotations = support_data.get('annotations')
+        categories = support_data.get('categories')
+        if not isinstance(images, list) or not isinstance(annotations, list) \
+                or not isinstance(categories, list):
+            raise ValueError('Support annotation file must contain COCO '
+                             'images, annotations and categories arrays.')
 
-        class_to_idx = {name: i for i, name in enumerate(
-            self.support_class_names)}
-        prompt_bank = defaultdict(list)
-        span_bank = defaultdict(list)
+        class_to_idx = {
+            name: idx
+            for idx, name in enumerate(self.support_class_names)
+        }
+        images_by_id = {}
+        category_names_by_id = {}
+        support_entries = []
+        validation_errors = []
 
-        if isinstance(entries, dict):
-            iterable_entries = [
-                value for value in entries.values() if isinstance(value, dict)
-            ]
-        else:
-            iterable_entries = entries
-
-        for item in iterable_entries:
-            class_name = item.get('category_name', item.get('class_name'))
-            caption = item.get('caption', '')
-            if class_name not in class_to_idx or not caption:
+        for image_idx, image in enumerate(images):
+            if not isinstance(image, dict):
+                validation_errors.append(
+                    f'image {image_idx} is not a dictionary')
                 continue
-            prompt, class_span = self._format_support_prompt(
-                class_name, caption)
-            class_idx = class_to_idx[class_name]
-            prompt_bank[class_idx].append(prompt)
-            span_bank[class_idx].append(class_span)
+            image_id = image.get('id')
+            file_name = image.get('file_name')
+            if image_id is None:
+                validation_errors.append(
+                    f'image {image_idx} has no id')
+                continue
+            if image_id in images_by_id:
+                validation_errors.append(
+                    f'duplicate image id {image_id!r}')
+                continue
+            if not isinstance(file_name, str) or not file_name:
+                validation_errors.append(
+                    f'image {image_idx} has an invalid file_name')
+                continue
+            images_by_id[image_id] = file_name
 
-        for class_idx, class_name in enumerate(self.support_class_names):
-            if len(prompt_bank[class_idx]) == 0:
-                prompt, class_span = self._format_support_prompt(
-                    class_name, '')
-                prompt_bank[class_idx].append(prompt)
-                span_bank[class_idx].append(class_span)
+        for category_idx, category in enumerate(categories):
+            if not isinstance(category, dict):
+                validation_errors.append(
+                    f'category {category_idx} is not a dictionary')
+                continue
+            category_id = category.get('id')
+            category_name = category.get('name')
+            if category_id is None:
+                validation_errors.append(
+                    f'category {category_idx} has no id')
+                continue
+            if category_id in category_names_by_id:
+                validation_errors.append(
+                    f'duplicate category id {category_id!r}')
+                continue
+            if not isinstance(category_name, str) or not category_name:
+                validation_errors.append(
+                    f'category {category_idx} has an invalid name')
+                continue
+            category_names_by_id[category_id] = category_name
 
-        prompt_texts = []
-        prompt_labels = []
-        prompt_class_spans = []
-        ordered_bank = {}
-        for class_idx in range(len(self.support_class_names)):
-            ordered_bank[class_idx] = prompt_bank[class_idx]
-            for prompt, class_span in zip(prompt_bank[class_idx],
-                                          span_bank[class_idx]):
-                prompt_texts.append(prompt)
-                prompt_labels.append(class_idx)
-                prompt_class_spans.append(class_span)
+        for ann_idx, annotation in enumerate(annotations):
+            if not isinstance(annotation, dict):
+                validation_errors.append(
+                    f'annotation {ann_idx} is not a dictionary')
+                continue
+            image_id = annotation.get('image_id')
+            category_id = annotation.get('category_id')
+            if image_id not in images_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown image id '
+                    f'{image_id!r}')
+                continue
+            if category_id not in category_names_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown category id '
+                    f'{category_id!r}')
+                continue
+            category_name = category_names_by_id[category_id]
+            if category_name not in class_to_idx:
+                validation_errors.append(
+                    f'annotation {ann_idx} has unknown class '
+                    f'{category_name!r}')
+                continue
+            bbox = annotation.get('bbox')
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                validation_errors.append(
+                    f'annotation {ann_idx} has an invalid xywh bbox')
+                continue
+            try:
+                x, y, width, height = [float(value) for value in bbox]
+            except (TypeError, ValueError):
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-numeric bbox')
+                continue
+            if width <= 0 or height <= 0:
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-positive bbox size')
+                continue
 
-        self.support_prompt_bank = ordered_bank
-        self.support_prompt_texts = prompt_texts
-        self.support_prompt_labels = torch.tensor(prompt_labels,
-                                                  dtype=torch.long)
-        self.support_prompt_class_spans = prompt_class_spans
-        self.support_tokenized = self._tokenize_support_prompts(prompt_texts)
-        self.support_prompt_class_token_positions = \
-            self._find_class_name_token_positions(
-                self.support_tokenized['offset_mapping'],
-                prompt_class_spans)
+            support_entries.append(
+                dict(
+                    file_name=images_by_id[image_id],
+                    bbox=(x, y, width, height),
+                    class_idx=class_to_idx[category_name]))
 
-    def _format_support_prompt(self, class_name: str,
-                               caption: str) -> Tuple[str, Tuple[int, int]]:
-        clean_class_name = clean_label_name(class_name).strip()
-        parts = [clean_class_name]
-        if caption:
-            parts.append(caption.strip().rstrip('.'))
-        if self.support_domain_attribute:
-            parts.append(self.support_domain_attribute.strip().rstrip('.'))
-        prompt = ', '.join(parts) + '.'
-        return prompt, (0, len(clean_class_name))
+        support_counts = [0] * len(self.support_class_names)
+        for entry in support_entries:
+            support_counts[entry['class_idx']] += 1
+        missing_classes = [
+            self.support_class_names[class_idx]
+            for class_idx, count in enumerate(support_counts) if count == 0
+        ]
+        if missing_classes:
+            validation_errors.append(
+                f'classes without support objects: {missing_classes}')
+        if validation_errors:
+            raise ValueError(
+                f'Invalid support annotation file {self.support_ann_file}: '
+                + '; '.join(validation_errors))
 
-    def _tokenize_support_prompts(self, prompts: Sequence[str]) -> dict:
-        tokenized = self.language_model.tokenizer.batch_encode_plus(
-            list(prompts),
-            max_length=self.language_model.max_tokens,
-            padding='max_length' if self.language_model.pad_to_max else
-            'longest',
-            return_offsets_mapping=True,
-            return_special_tokens_mask=True,
-            return_tensors='pt',
-            truncation=True)
-        return dict(tokenized)
+        if self.support_image_root is None:
+            raise ValueError('support_image_root is required for support '
+                             'images referenced by the COCO annotation file.')
+        self.support_entries = support_entries
 
-    def _find_class_name_token_positions(self, offset_mapping: Tensor,
-                                         class_spans: Sequence[Tuple[int,
-                                                                    int]]):
-        token_positions = []
-        for prompt_idx, (span_start, span_end) in enumerate(class_spans):
-            positions = []
-            for token_idx, (token_start, token_end) in enumerate(
-                    offset_mapping[prompt_idx].tolist()):
-                if token_end <= token_start:
-                    continue
-                if token_start < span_end and token_end > span_start:
-                    positions.append(token_idx)
-            if len(positions) == 0:
-                prompt = self.support_prompt_texts[prompt_idx]
-                raise RuntimeError(
-                    f'No class-name tokens found for prompt: {prompt}')
-            token_positions.append(positions)
-        return token_positions
+    def _prepare_support_image_inputs(self) -> None:
+        """Crop and preprocess support objects once, retaining CPU pixels."""
+        if self._support_pixel_values is not None:
+            return
+        self.build_support_object_bank()
+        image_cache = {}
+        crops = []
+        labels = []
+        for entry in self.support_entries:
+            image_path = entry['file_name']
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(self.support_image_root, image_path)
+            if image_path not in image_cache:
+                try:
+                    image_cache[image_path] = Image.open(image_path).convert(
+                        'RGB')
+                except (OSError, ValueError) as error:
+                    message = f'Unable to read support image: {image_path}'
+                    raise FileNotFoundError(message) from error
+            image = image_cache[image_path]
+            x, y, width, height = entry['bbox']
+            left = max(0, int(round(x)))
+            top = max(0, int(round(y)))
+            right = min(image.width, int(round(x + width)))
+            bottom = min(image.height, int(round(y + height)))
+            if right <= left or bottom <= top:
+                raise ValueError(
+                    f'Support bbox becomes empty after clipping: '
+                    f'{entry["bbox"]} in {image_path}')
+            crops.append(
+                image.crop((left, top, right, bottom)).convert('RGB'))
+            class_idx = entry['class_idx']
+            labels.append(class_idx)
 
-    def _prepare_cached_tokenized(self, device) -> dict:
-        tokenized = {
-            key: value.to(device)
-            for key, value in self.support_tokenized.items()
-            if key != 'offset_mapping'
-        }
-        return {
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-            'token_type_ids': tokenized.get('token_type_ids', None)
-        }
+        self._support_pixel_values = \
+            self.support_blip_captioner.preprocess_images(crops)
+        self._support_pixel_labels = torch.tensor(labels, dtype=torch.long)
 
-    def _encode_support_prompt_features(self, tokenizer_input: dict) -> Tensor:
-        """Encode enriched prompts with standard BERT row-wise attention."""
+    @staticmethod
+    def aggregate_support_caption_features(
+            object_features: Tensor, object_labels: Tensor,
+            num_classes: int) -> Tensor:
+        """Average caption-enriched class-token features by class."""
+        if object_features.dim() != 2:
+            raise ValueError(
+                'object_features must have shape [N, hidden].')
+        if object_features.size(0) != object_labels.numel():
+            raise ValueError('Support feature and label counts must match.')
+        if num_classes <= 0:
+            raise ValueError('num_classes must be positive.')
+        if ((object_labels < 0) | (object_labels >= num_classes)).any():
+            raise ValueError('Support labels are outside the class range.')
+
+        class_prototypes = []
+        missing_classes = []
+        for class_idx in range(num_classes):
+            class_mask = object_labels == class_idx
+            if not class_mask.any():
+                missing_classes.append(class_idx)
+                continue
+
+            class_prototypes.append(object_features[class_mask].mean(dim=0))
+        if missing_classes:
+            raise ValueError('No support object found for class indices: '
+                             f'{missing_classes}.')
+        return torch.stack(class_prototypes, dim=0)
+
+    def _prepare_support_prompt_tokens(self) -> None:
+        """Cache class-name and colon token ids without caption decoding."""
+        if self._support_class_token_ids is not None:
+            return
+        tokenizer = self.language_model.tokenizer
+        class_token_ids = []
+        for class_name in self.support_class_names:
+            clean_name = clean_label_name(class_name).strip()
+            token_ids = tokenizer.encode(
+                clean_name, add_special_tokens=False)
+            if len(token_ids) == 0:
+                raise ValueError(
+                    f'No BERT tokens found for support class {class_name}.')
+            class_token_ids.append(torch.tensor(token_ids, dtype=torch.long))
+        colon_token_ids = tokenizer.encode(':', add_special_tokens=False)
+        if len(colon_token_ids) == 0:
+            raise ValueError(
+                'Grounding DINO BERT tokenizer cannot encode ":".')
+        self._support_class_token_ids = class_token_ids
+        self._support_colon_token_ids = torch.tensor(
+            colon_token_ids, dtype=torch.long)
+
+    def _encode_caption_enriched_class_features(
+            self, caption_outputs: Dict[str, Tensor],
+            object_labels: Tensor) -> Tensor:
+        """Encode ``class_name: caption`` and keep class-name states only."""
+        self._prepare_support_prompt_tokens()
+        distributions = caption_outputs['token_distributions']
+        caption_mask = caption_outputs['caption_mask']
+        if distributions.dim() != 3 or \
+                caption_mask.shape != distributions.shape[:2]:
+            raise ValueError('Invalid differentiable BLIP caption shapes.')
+        if distributions.size(0) != object_labels.numel():
+            raise ValueError('Caption and support label counts must match.')
+
         bert = self.language_model.language_backbone.body.model
-        outputs = bert(
-            input_ids=tokenizer_input['input_ids'],
-            attention_mask=tokenizer_input['attention_mask'],
-            token_type_ids=tokenizer_input.get('token_type_ids', None),
+        bert_embeddings = bert.get_input_embeddings()
+        embedding_weight = bert_embeddings.weight
+        tokenizer = self.language_model.tokenizer
+        cls_token_id = tokenizer.cls_token_id
+        sep_token_id = tokenizer.sep_token_id
+        if cls_token_id is None or sep_token_id is None:
+            raise ValueError('Grounding DINO BERT special tokens are missing.')
+
+        prompt_embeddings = []
+        class_spans = []
+        for row_idx, class_idx in enumerate(object_labels.tolist()):
+            class_ids = self._support_class_token_ids[class_idx].to(
+                distributions.device)
+            prefix_ids = torch.cat([
+                torch.tensor(
+                    [cls_token_id],
+                    dtype=torch.long,
+                    device=distributions.device),
+                class_ids,
+                self._support_colon_token_ids.to(distributions.device)
+            ])
+            prefix_embeddings = bert_embeddings(prefix_ids)
+            active_distribution = distributions[
+                row_idx, caption_mask[row_idx], :self.blip_shared_vocab_size]
+            active_distribution = active_distribution.to(
+                embedding_weight.dtype)
+            caption_embeddings = active_distribution @ embedding_weight
+            sep_embedding = bert_embeddings(
+                torch.tensor(
+                    [sep_token_id],
+                    dtype=torch.long,
+                    device=distributions.device))
+            row_embeddings = torch.cat([
+                prefix_embeddings, caption_embeddings, sep_embedding
+            ], dim=0)
+            if row_embeddings.size(0) > self.language_model.max_tokens:
+                raise RuntimeError(
+                    'BLIP enriched support prompt exceeds Grounding DINO '
+                    f'BERT max_tokens={self.language_model.max_tokens}.')
+            prompt_embeddings.append(row_embeddings)
+            class_spans.append((1, 1 + class_ids.numel()))
+
+        max_length = max(row.size(0) for row in prompt_embeddings)
+        hidden_size = embedding_weight.size(1)
+        inputs_embeds = embedding_weight.new_zeros(
+            len(prompt_embeddings), max_length, hidden_size)
+        attention_mask = torch.zeros(
+            len(prompt_embeddings),
+            max_length,
+            dtype=torch.long,
+            device=distributions.device)
+        for row_idx, row_embeddings in enumerate(prompt_embeddings):
+            row_length = row_embeddings.size(0)
+            inputs_embeds[row_idx, :row_length] = row_embeddings
+            attention_mask[row_idx, :row_length] = 1
+
+        bert_outputs = bert(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            token_type_ids=torch.zeros_like(attention_mask),
             output_hidden_states=False,
             return_dict=True)
-        return outputs.last_hidden_state
+        hidden_states = bert_outputs.last_hidden_state
+        object_features = [
+            hidden_states[row_idx, span_start:span_end].mean(dim=0)
+            for row_idx, (span_start, span_end) in enumerate(class_spans)
+        ]
+        return torch.stack(object_features, dim=0)
 
-    def compute_support_class_token_features(self):
-        """Encode prompts and keep only class-name token features."""
-        self.build_support_prompt_bank()
-        device = next(self.language_model.parameters()).device
-        tokenizer_input = self._prepare_cached_tokenized(device)
-        hidden_states = self._encode_support_prompt_features(tokenizer_input)
+    def _compute_support_batch_caption_features(
+            self, pixel_values: Tensor, labels: Tensor) -> Tensor:
+        """Run the differentiable support caption pipeline for one batch."""
+        caption_outputs = self.support_blip_captioner(pixel_values)
+        return self._encode_caption_enriched_class_features(
+            caption_outputs, labels)
 
-        selected_features = []
-        selected_labels = []
-        for prompt_idx, class_idx in enumerate(
-                self.support_prompt_labels.tolist()):
-            for token_idx in self.support_prompt_class_token_positions[
-                    prompt_idx]:
-                selected_features.append(hidden_states[prompt_idx, token_idx])
-                selected_labels.append(class_idx)
-        selected_features = torch.stack(selected_features, dim=0)
-        selected_labels = torch.tensor(
-            selected_labels, dtype=torch.long, device=device)
+    def compute_support_caption_features(self, device) -> Tensor:
+        """Recompute differentiable caption features for all support crops."""
+        self._prepare_support_image_inputs()
+        object_features = []
+        for start_idx in range(0, self._support_pixel_values.size(0),
+                               self.support_image_batch_size):
+            end_idx = start_idx + self.support_image_batch_size
+            pixel_values = self._support_pixel_values[start_idx:end_idx].to(
+                device, non_blocking=True)
+            labels = self._support_pixel_labels[start_idx:end_idx].to(device)
+            batch_features = self._compute_support_batch_caption_features(
+                pixel_values, labels)
+            object_features.append(batch_features)
+        caption_features = torch.cat(object_features, dim=0)
+        labels = self._support_pixel_labels.to(device)
+        return self.aggregate_support_caption_features(
+            caption_features, labels, len(self.support_class_names))
 
-        return selected_features, selected_labels
+    def compute_caption_support_prototypes(self, device) -> Tensor:
+        """Build one projected differentiable caption prototype per class."""
+        caption_prototypes = self.compute_support_caption_features(device)
+        expected_shape = (
+            len(self.support_class_names), self.text_feat_map.in_features)
+        if tuple(caption_prototypes.shape) != expected_shape:
+            raise RuntimeError(
+                'Unexpected aggregated caption prototype shape: '
+                f'{tuple(caption_prototypes.shape)}; expected '
+                f'{expected_shape}.')
+        return self.text_feat_map(caption_prototypes)
 
-    def compute_class_text_prototypes(self):
-        """Average selected class-name token features into class prototypes."""
-        token_features, token_labels = self.compute_support_class_token_features()
-        prototypes = []
-        for class_idx in range(len(self.support_class_names)):
-            class_mask = token_labels == class_idx
-            if not class_mask.any():
-                raise RuntimeError(
-                    f'No support class-name tokens for class '
-                    f'{self.support_class_names[class_idx]}')
-            prototypes.append(token_features[class_mask].mean(dim=0))
-        prototypes = torch.stack(prototypes, dim=0)
-
-        return prototypes
-
-    def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from class-name-token averaged prototypes."""
-        if (not self.training and self._cached_eval_support_prototype_text_dict
-                is not None):
-            cached = self._cached_eval_support_prototype_text_dict
-            return {
-                key: value.to(device)
-                for key, value in cached.items()
-            }
-
-        prototypes = self.compute_class_text_prototypes()
-        if self.text_feat_map is not None:
-            prototypes = self.text_feat_map(prototypes)
-        prototypes = prototypes.to(device)
+    def _prototypes_to_text_dict(self, prototypes: Tensor,
+                                 batch_size: int) -> Dict:
+        """Build a Grounding DINO text dictionary from class prototypes."""
+        expected_shape = (len(self.support_class_names), self.embed_dims)
+        if tuple(prototypes.shape) != expected_shape:
+            raise ValueError(
+                'Caption prototypes must have shape [classes, hidden], got '
+                f'{tuple(prototypes.shape)}; expected {expected_shape}.')
+        device = prototypes.device
         num_tokens = prototypes.size(0)
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
@@ -410,7 +616,8 @@ class GroundingDINO(DINO):
                 f'Class text prototypes ({num_tokens}) exceed max_text_len '
                 f'({max_text_len}).')
 
-        embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
+        embedded = prototypes.unsqueeze(0).expand(
+            batch_size, -1, -1)
         text_token_mask = torch.ones(
             batch_size, num_tokens, dtype=torch.bool, device=device)
         text_self_attention_masks = torch.eye(
@@ -424,30 +631,45 @@ class GroundingDINO(DINO):
             text_token_mask=text_token_mask,
             masks=text_self_attention_masks,
             position_ids=position_ids)
-
-        if not self.training:
-            self._cached_eval_support_prototype_text_dict = {
-                key: value.detach().cpu()
-                for key, value in text_dict.items()
-            }
         return text_dict
+
+    def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
+        """Build text_dict from differentiable BLIP caption prototypes."""
+        if (not self.training and
+                self._cached_eval_support_prototypes is not None):
+            prototypes = self._cached_eval_support_prototypes.to(device)
+            return self._prototypes_to_text_dict(prototypes, batch_size)
+
+        prototypes = self.compute_caption_support_prototypes(device)
+        if not self.training:
+            prototypes = prototypes.detach()
+            self._cached_eval_support_prototypes = prototypes.cpu()
+        return self._prototypes_to_text_dict(prototypes, batch_size)
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Create positive maps from classes to class prototype positions."""
+        """Map each class target to its single enriched text prototype."""
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
+        num_classes = len(self.support_class_names)
+        if num_classes > max_text_len:
+            raise RuntimeError(
+                f'Class prototypes ({num_classes}) exceed max_text_len '
+                f'({max_text_len}).')
         positive_maps = []
         for labels in gt_labels:
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
+                if label < 0 or label >= num_classes:
+                    raise ValueError(
+                        f'Class label {label} exceeds prototype range.')
                 positive_map[row_idx, label] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to class prototype positions."""
+        """Map every class to its single enriched prototype position."""
         return {
             class_idx + 1: [class_idx]
             for class_idx in range(len(self.support_class_names))
@@ -688,7 +910,7 @@ class GroundingDINO(DINO):
             for data_samples in batch_data_samples
         ]
 
-        if self.use_class_name_token_prototypes:
+        if self.use_blip_prototypes:
             text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
             positive_maps = self.build_prototype_positive_maps(
@@ -787,10 +1009,10 @@ class GroundingDINO(DINO):
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
-        if self.use_class_name_token_prototypes:
-            visual_feats = self.extract_feat(batch_inputs)
+        if self.use_blip_prototypes:
             text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
+            visual_feats = self.extract_feat(batch_inputs)
             token_positive_map = self.build_prototype_token_positive_map()
             entities = self.support_class_names
             for data_sample in batch_data_samples:
