@@ -85,6 +85,7 @@ def test_caption_features_are_averaged_by_class():
 def test_support_blip_and_bert_run_inside_dedicated_autocast():
     detector = Detector.__new__(Detector)
     nn.Module.__init__(detector)
+    detector.blip_gradient_checkpointing = True
     active = {'value': False}
     calls = []
 
@@ -114,13 +115,56 @@ def test_support_blip_and_bert_run_inside_dedicated_autocast():
         encode, detector)
     with patch(
             'mmdet.models.detectors.grounding_dino_HED.autocast',
-            return_value=_AutocastContext()) as mocked_autocast:
+            return_value=_AutocastContext()) as mocked_autocast, patch(
+                'mmdet.models.detectors.grounding_dino_HED.checkpoint',
+                side_effect=lambda function, *args, **kwargs: function(
+                    *args)) as mocked_checkpoint:
         detector._compute_support_batch_caption_features(
             torch.ones(2, 3, 4, 4), torch.tensor([0, 1]))
 
     mocked_autocast.assert_called_once_with(enabled=True)
+    mocked_checkpoint.assert_called_once()
+    assert mocked_checkpoint.call_args.kwargs == {'use_reentrant': False}
     assert calls == [('blip', True), ('bert', True)]
     assert not active['value']
+
+
+def test_full_support_checkpoint_preserves_blip_and_bert_gradients():
+    detector = Detector.__new__(Detector)
+    nn.Module.__init__(detector)
+    detector.blip_gradient_checkpointing = True
+
+    class _Captioner(nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, pixel_values):
+            return {'caption': pixel_values.mean() * self.scale}
+
+    language_model = nn.Module()
+    language_model.support_blip_captioner = _Captioner()
+    detector.language_model = language_model
+    detector.bert_scale = nn.Parameter(torch.tensor(3.0))
+
+    def encode(self, caption_outputs, labels):
+        return caption_outputs['caption'] * self.bert_scale
+
+    detector._encode_caption_enriched_class_features = MethodType(
+        encode, detector)
+    with patch(
+            'mmdet.models.detectors.grounding_dino_HED.autocast') \
+            as mocked_autocast:
+        mocked_autocast.return_value.__enter__.return_value = None
+        features = detector._compute_support_batch_caption_features(
+            torch.ones(2, 3, 4, 4), torch.tensor([0, 1]))
+        features.backward()
+
+    assert detector.support_blip_captioner.scale.grad is not None
+    assert detector.support_blip_captioner.scale.grad.abs().item() > 0
+    assert detector.bert_scale.grad is not None
+    assert detector.bert_scale.grad.abs().item() > 0
 
 
 def test_each_class_maps_to_its_single_caption_prototype():

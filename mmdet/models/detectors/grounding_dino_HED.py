@@ -11,6 +11,7 @@ import torch.nn as nn
 from mmengine.runner.amp import autocast
 from PIL import Image
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
@@ -459,11 +460,19 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
     def _compute_support_batch_caption_features(
             self, pixel_values: Tensor, labels: Tensor) -> Tensor:
-        """Run one support caption batch with mixed precision."""
-        with autocast(enabled=True):
-            caption_outputs = self.support_blip_captioner(pixel_values)
-            return self._encode_caption_enriched_class_features(
-                caption_outputs, labels)
+        """Run one checkpointed support caption batch with mixed precision."""
+
+        def compute_features(pixel_values: Tensor, labels: Tensor) -> Tensor:
+            with autocast(enabled=True):
+                caption_outputs = self.support_blip_captioner(pixel_values)
+                return self._encode_caption_enriched_class_features(
+                    caption_outputs, labels)
+
+        if self.training and self.blip_gradient_checkpointing and \
+                torch.is_grad_enabled():
+            return checkpoint(
+                compute_features, pixel_values, labels, use_reentrant=False)
+        return compute_features(pixel_values, labels)
 
     def compute_support_caption_features(self, device) -> Tensor:
         """Recompute differentiable caption features for all support crops."""
