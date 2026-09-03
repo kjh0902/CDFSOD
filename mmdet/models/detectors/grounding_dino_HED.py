@@ -1,12 +1,15 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import copy
+import json
+import os
+import random
 import re
 import warnings
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 from mmengine.runner.amp import autocast
+from PIL import Image
 from torch import Tensor
 
 from mmdet.registry import MODELS
@@ -15,10 +18,10 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerDecoder_parallel_15_DNQueryRand, GroundingDinoTransformerEncoder)
+from ..utils import SupportBlipCaptioner
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
-import random
 
 
 def clean_label_name(name: str) -> str:
@@ -56,6 +59,13 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
     def __init__(self,
                  language_model,
                  *args,
+                 support_ann_file: str,
+                 support_class_names: Sequence[str],
+                 support_image_root: str,
+                 support_image_batch_size: int = 2,
+                 blip_model_name: str =
+                 'Salesforce/blip-image-captioning-base',
+                 blip_gradient_checkpointing: bool = True,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
                  **kwargs) -> None:
@@ -64,7 +74,53 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         self._special_tokens = '. '
         self.use_autocast = use_autocast
         self.rand_dnquery_rate = rand_dnquery_rate
+        if not support_ann_file:
+            raise ValueError('support_ann_file is required.')
+        if not support_class_names:
+            raise ValueError('support_class_names must not be empty.')
+        if not support_image_root:
+            raise ValueError('support_image_root is required.')
+        if support_image_batch_size <= 0:
+            raise ValueError('support_image_batch_size must be positive.')
+        self.support_ann_file = support_ann_file
+        self.support_class_names = list(support_class_names)
+        self.support_image_root = support_image_root
+        self.support_image_batch_size = support_image_batch_size
+        self.blip_model_name = blip_model_name
+        self.blip_gradient_checkpointing = blip_gradient_checkpointing
+        self.support_entries = None
+        self._support_pixel_values = None
+        self._support_pixel_labels = None
+        self._support_class_token_ids = None
+        self._support_colon_token_ids = None
+        self._cached_eval_support_prototypes = None
         super().__init__(*args, **kwargs)
+
+        support_blip_captioner = SupportBlipCaptioner(
+            model_name=self.blip_model_name,
+            gradient_checkpointing=self.blip_gradient_checkpointing)
+        self.language_model.support_blip_captioner = support_blip_captioner
+        bert = self.language_model.language_backbone.body.model
+        bert_hidden_size = bert.config.hidden_size
+        if self.text_feat_map.in_features != bert_hidden_size or \
+                bert_hidden_size != support_blip_captioner.hidden_size:
+            raise ValueError(
+                'BLIP caption decoder, Grounding DINO BERT and '
+                'text_feat_map input dimensions must match.')
+        self.blip_shared_vocab_size = \
+            support_blip_captioner.validate_grounding_tokenizer(
+                self.language_model.tokenizer)
+        bert_vocab_size = bert.get_input_embeddings().num_embeddings
+        if self.blip_shared_vocab_size != bert_vocab_size:
+            raise ValueError(
+                'Validated shared vocabulary size must match the '
+                'Grounding DINO BERT embedding table.')
+        self.build_support_object_bank()
+
+    @property
+    def support_blip_captioner(self) -> SupportBlipCaptioner:
+        """Return BLIP registered under the language-model parameter group."""
+        return self.language_model.support_blip_captioner
 
 
     def _init_layers(self) -> None:
@@ -97,6 +153,420 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         super().init_weights()
         nn.init.constant_(self.text_feat_map.bias.data, 0)
         nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+
+    def train(self, mode: bool = True):
+        """Switch mode and clear stale detached support prototypes."""
+        super().train(mode)
+        if mode:
+            self._cached_eval_support_prototypes = None
+        return self
+
+    def build_support_object_bank(self) -> None:
+        """Load support object paths, GT boxes and labels from COCO JSON."""
+        if self.support_entries is not None:
+            return
+
+        with open(self.support_ann_file, 'r', encoding='utf-8') as f:
+            support_data = json.load(f)
+        if not isinstance(support_data, dict):
+            raise ValueError('Support annotation file must be a COCO JSON '
+                             'dictionary.')
+
+        images = support_data.get('images')
+        annotations = support_data.get('annotations')
+        categories = support_data.get('categories')
+        if not isinstance(images, list) or not isinstance(annotations, list) \
+                or not isinstance(categories, list):
+            raise ValueError('Support annotation file must contain COCO '
+                             'images, annotations and categories arrays.')
+
+        class_to_idx = {
+            name: idx
+            for idx, name in enumerate(self.support_class_names)
+        }
+        images_by_id = {}
+        category_names_by_id = {}
+        support_entries = []
+        validation_errors = []
+
+        for image_idx, image in enumerate(images):
+            if not isinstance(image, dict):
+                validation_errors.append(
+                    f'image {image_idx} is not a dictionary')
+                continue
+            image_id = image.get('id')
+            file_name = image.get('file_name')
+            if image_id is None:
+                validation_errors.append(f'image {image_idx} has no id')
+                continue
+            if image_id in images_by_id:
+                validation_errors.append(f'duplicate image id {image_id!r}')
+                continue
+            if not isinstance(file_name, str) or not file_name:
+                validation_errors.append(
+                    f'image {image_idx} has an invalid file_name')
+                continue
+            images_by_id[image_id] = file_name
+
+        for category_idx, category in enumerate(categories):
+            if not isinstance(category, dict):
+                validation_errors.append(
+                    f'category {category_idx} is not a dictionary')
+                continue
+            category_id = category.get('id')
+            category_name = category.get('name')
+            if category_id is None:
+                validation_errors.append(
+                    f'category {category_idx} has no id')
+                continue
+            if category_id in category_names_by_id:
+                validation_errors.append(
+                    f'duplicate category id {category_id!r}')
+                continue
+            if not isinstance(category_name, str) or not category_name:
+                validation_errors.append(
+                    f'category {category_idx} has an invalid name')
+                continue
+            category_names_by_id[category_id] = category_name
+
+        for ann_idx, annotation in enumerate(annotations):
+            if not isinstance(annotation, dict):
+                validation_errors.append(
+                    f'annotation {ann_idx} is not a dictionary')
+                continue
+            image_id = annotation.get('image_id')
+            category_id = annotation.get('category_id')
+            if image_id not in images_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown image id '
+                    f'{image_id!r}')
+                continue
+            if category_id not in category_names_by_id:
+                validation_errors.append(
+                    f'annotation {ann_idx} references unknown category id '
+                    f'{category_id!r}')
+                continue
+            category_name = category_names_by_id[category_id]
+            if category_name not in class_to_idx:
+                validation_errors.append(
+                    f'annotation {ann_idx} has unknown class '
+                    f'{category_name!r}')
+                continue
+            bbox = annotation.get('bbox')
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                validation_errors.append(
+                    f'annotation {ann_idx} has an invalid xywh bbox')
+                continue
+            try:
+                x, y, width, height = [float(value) for value in bbox]
+            except (TypeError, ValueError):
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-numeric bbox')
+                continue
+            if width <= 0 or height <= 0:
+                validation_errors.append(
+                    f'annotation {ann_idx} has a non-positive bbox size')
+                continue
+
+            support_entries.append(
+                dict(
+                    file_name=images_by_id[image_id],
+                    bbox=(x, y, width, height),
+                    class_idx=class_to_idx[category_name]))
+
+        support_counts = [0] * len(self.support_class_names)
+        for entry in support_entries:
+            support_counts[entry['class_idx']] += 1
+        missing_classes = [
+            self.support_class_names[class_idx]
+            for class_idx, count in enumerate(support_counts) if count == 0
+        ]
+        if missing_classes:
+            validation_errors.append(
+                f'classes without support objects: {missing_classes}')
+        if validation_errors:
+            raise ValueError(
+                f'Invalid support annotation file {self.support_ann_file}: '
+                + '; '.join(validation_errors))
+
+        self.support_entries = support_entries
+
+    def _prepare_support_image_inputs(self) -> None:
+        """Crop and preprocess support objects once, retaining CPU pixels."""
+        if self._support_pixel_values is not None:
+            return
+        self.build_support_object_bank()
+        image_cache = {}
+        crops = []
+        labels = []
+        for entry in self.support_entries:
+            image_path = entry['file_name']
+            if not os.path.isabs(image_path):
+                image_path = os.path.join(self.support_image_root, image_path)
+            if image_path not in image_cache:
+                try:
+                    image_cache[image_path] = Image.open(image_path).convert(
+                        'RGB')
+                except (OSError, ValueError) as error:
+                    message = f'Unable to read support image: {image_path}'
+                    raise FileNotFoundError(message) from error
+            image = image_cache[image_path]
+            x, y, width, height = entry['bbox']
+            left = max(0, int(round(x)))
+            top = max(0, int(round(y)))
+            right = min(image.width, int(round(x + width)))
+            bottom = min(image.height, int(round(y + height)))
+            if right <= left or bottom <= top:
+                raise ValueError(
+                    'Support bbox becomes empty after clipping: '
+                    f'{entry["bbox"]} in {image_path}')
+            crops.append(image.crop((left, top, right, bottom)).convert('RGB'))
+            labels.append(entry['class_idx'])
+
+        self._support_pixel_values = \
+            self.support_blip_captioner.preprocess_images(crops)
+        self._support_pixel_labels = torch.tensor(labels, dtype=torch.long)
+
+    @staticmethod
+    def aggregate_support_caption_features(
+            object_features: Tensor, object_labels: Tensor,
+            num_classes: int) -> Tensor:
+        """Average caption-enriched class-token features by class."""
+        if object_features.dim() != 2:
+            raise ValueError('object_features must have shape [N, hidden].')
+        if object_features.size(0) != object_labels.numel():
+            raise ValueError('Support feature and label counts must match.')
+        if num_classes <= 0:
+            raise ValueError('num_classes must be positive.')
+        if ((object_labels < 0) | (object_labels >= num_classes)).any():
+            raise ValueError('Support labels are outside the class range.')
+
+        class_prototypes = []
+        missing_classes = []
+        for class_idx in range(num_classes):
+            class_mask = object_labels == class_idx
+            if not class_mask.any():
+                missing_classes.append(class_idx)
+                continue
+            class_prototypes.append(object_features[class_mask].mean(dim=0))
+        if missing_classes:
+            raise ValueError('No support object found for class indices: '
+                             f'{missing_classes}.')
+        return torch.stack(class_prototypes, dim=0)
+
+    def _prepare_support_prompt_tokens(self) -> None:
+        """Cache class-name and colon token ids without caption decoding."""
+        if self._support_class_token_ids is not None:
+            return
+        tokenizer = self.language_model.tokenizer
+        class_token_ids = []
+        for class_name in self.support_class_names:
+            clean_name = clean_label_name(class_name).strip()
+            token_ids = tokenizer.encode(clean_name, add_special_tokens=False)
+            if len(token_ids) == 0:
+                raise ValueError(
+                    f'No BERT tokens found for support class {class_name}.')
+            class_token_ids.append(torch.tensor(token_ids, dtype=torch.long))
+        colon_token_ids = tokenizer.encode(':', add_special_tokens=False)
+        if len(colon_token_ids) == 0:
+            raise ValueError('Grounding DINO BERT tokenizer cannot encode ":".')
+        self._support_class_token_ids = class_token_ids
+        self._support_colon_token_ids = torch.tensor(
+            colon_token_ids, dtype=torch.long)
+
+    def _encode_caption_enriched_class_features(
+            self, caption_outputs: Dict[str, Tensor],
+            object_labels: Tensor) -> Tensor:
+        """Encode ``class_name: caption`` and keep class-name states only."""
+        self._prepare_support_prompt_tokens()
+        distributions = caption_outputs['token_distributions']
+        caption_mask = caption_outputs['caption_mask']
+        if distributions.dim() != 3 or \
+                caption_mask.shape != distributions.shape[:2]:
+            raise ValueError('Invalid differentiable BLIP caption shapes.')
+        if distributions.size(0) != object_labels.numel():
+            raise ValueError('Caption and support label counts must match.')
+
+        bert = self.language_model.language_backbone.body.model
+        bert_embeddings = bert.get_input_embeddings()
+        embedding_weight = bert_embeddings.weight
+        tokenizer = self.language_model.tokenizer
+        cls_token_id = tokenizer.cls_token_id
+        sep_token_id = tokenizer.sep_token_id
+        if cls_token_id is None or sep_token_id is None:
+            raise ValueError('Grounding DINO BERT special tokens are missing.')
+
+        prompt_embeddings = []
+        class_spans = []
+        for row_idx, class_idx in enumerate(object_labels.tolist()):
+            class_ids = self._support_class_token_ids[class_idx].to(
+                distributions.device)
+            prefix_ids = torch.cat([
+                torch.tensor(
+                    [cls_token_id],
+                    dtype=torch.long,
+                    device=distributions.device),
+                class_ids,
+                self._support_colon_token_ids.to(distributions.device)
+            ])
+            prefix_embeddings = bert_embeddings(prefix_ids)
+            active_distribution = distributions[
+                row_idx, caption_mask[row_idx], :self.blip_shared_vocab_size]
+            active_distribution = active_distribution.to(
+                embedding_weight.dtype)
+            caption_embeddings = active_distribution @ embedding_weight
+            sep_embedding = bert_embeddings(
+                torch.tensor(
+                    [sep_token_id],
+                    dtype=torch.long,
+                    device=distributions.device))
+            row_embeddings = torch.cat([
+                prefix_embeddings, caption_embeddings, sep_embedding
+            ], dim=0)
+            if row_embeddings.size(0) > self.language_model.max_tokens:
+                raise RuntimeError(
+                    'BLIP enriched support prompt exceeds Grounding DINO '
+                    f'BERT max_tokens={self.language_model.max_tokens}.')
+            prompt_embeddings.append(row_embeddings)
+            class_spans.append((1, 1 + class_ids.numel()))
+
+        max_length = max(row.size(0) for row in prompt_embeddings)
+        hidden_size = embedding_weight.size(1)
+        inputs_embeds = embedding_weight.new_zeros(
+            len(prompt_embeddings), max_length, hidden_size)
+        attention_mask = torch.zeros(
+            len(prompt_embeddings),
+            max_length,
+            dtype=torch.long,
+            device=distributions.device)
+        for row_idx, row_embeddings in enumerate(prompt_embeddings):
+            row_length = row_embeddings.size(0)
+            inputs_embeds[row_idx, :row_length] = row_embeddings
+            attention_mask[row_idx, :row_length] = 1
+
+        bert_outputs = bert(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            token_type_ids=torch.zeros_like(attention_mask),
+            output_hidden_states=False,
+            return_dict=True)
+        hidden_states = bert_outputs.last_hidden_state
+        object_features = [
+            hidden_states[row_idx, span_start:span_end].mean(dim=0)
+            for row_idx, (span_start, span_end) in enumerate(class_spans)
+        ]
+        return torch.stack(object_features, dim=0)
+
+    def _compute_support_batch_caption_features(
+            self, pixel_values: Tensor, labels: Tensor) -> Tensor:
+        """Run the differentiable support caption pipeline for one batch."""
+        caption_outputs = self.support_blip_captioner(pixel_values)
+        return self._encode_caption_enriched_class_features(
+            caption_outputs, labels)
+
+    def compute_support_caption_features(self, device) -> Tensor:
+        """Recompute differentiable caption features for all support crops."""
+        self._prepare_support_image_inputs()
+        object_features = []
+        for start_idx in range(0, self._support_pixel_values.size(0),
+                               self.support_image_batch_size):
+            end_idx = start_idx + self.support_image_batch_size
+            pixel_values = self._support_pixel_values[start_idx:end_idx].to(
+                device, non_blocking=True)
+            labels = self._support_pixel_labels[start_idx:end_idx].to(device)
+            batch_features = self._compute_support_batch_caption_features(
+                pixel_values, labels)
+            object_features.append(batch_features)
+        caption_features = torch.cat(object_features, dim=0)
+        labels = self._support_pixel_labels.to(device)
+        return self.aggregate_support_caption_features(
+            caption_features, labels, len(self.support_class_names))
+
+    def compute_caption_support_prototypes(self, device) -> Tensor:
+        """Build one projected differentiable caption prototype per class."""
+        caption_prototypes = self.compute_support_caption_features(device)
+        expected_shape = (
+            len(self.support_class_names), self.text_feat_map.in_features)
+        if tuple(caption_prototypes.shape) != expected_shape:
+            raise RuntimeError(
+                'Unexpected aggregated caption prototype shape: '
+                f'{tuple(caption_prototypes.shape)}; expected '
+                f'{expected_shape}.')
+        return self.text_feat_map(caption_prototypes)
+
+    def _prototypes_to_text_dict(self, prototypes: Tensor,
+                                 batch_size: int) -> Dict:
+        """Build a Grounding DINO text dictionary from class prototypes."""
+        expected_shape = (len(self.support_class_names), self.embed_dims)
+        if tuple(prototypes.shape) != expected_shape:
+            raise ValueError(
+                'Caption prototypes must have shape [classes, hidden], got '
+                f'{tuple(prototypes.shape)}; expected {expected_shape}.')
+        device = prototypes.device
+        num_tokens = prototypes.size(0)
+        max_text_len = self.bbox_head.cls_branches[
+            self.decoder.num_layers].max_text_len
+        if num_tokens > max_text_len:
+            raise RuntimeError(
+                f'Class text prototypes ({num_tokens}) exceed max_text_len '
+                f'({max_text_len}).')
+
+        embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
+        text_token_mask = torch.ones(
+            batch_size, num_tokens, dtype=torch.bool, device=device)
+        text_self_attention_masks = torch.eye(
+            num_tokens, dtype=torch.bool,
+            device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        position_ids = torch.arange(
+            num_tokens, dtype=torch.long,
+            device=device).unsqueeze(0).expand(batch_size, -1)
+        return dict(
+            embedded=embedded,
+            text_token_mask=text_token_mask,
+            masks=text_self_attention_masks,
+            position_ids=position_ids)
+
+    def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
+        """Build text_dict from differentiable BLIP caption prototypes."""
+        if not self.training and \
+                self._cached_eval_support_prototypes is not None:
+            prototypes = self._cached_eval_support_prototypes.to(device)
+            return self._prototypes_to_text_dict(prototypes, batch_size)
+
+        prototypes = self.compute_caption_support_prototypes(device)
+        if not self.training:
+            prototypes = prototypes.detach()
+            self._cached_eval_support_prototypes = prototypes.cpu()
+        return self._prototypes_to_text_dict(prototypes, batch_size)
+
+    def build_prototype_positive_maps(self, gt_labels: List[Tensor],
+                                      device) -> List[Tensor]:
+        """Map each class target to its single enriched text prototype."""
+        max_text_len = self.bbox_head.cls_branches[
+            self.decoder.num_layers].max_text_len
+        num_classes = len(self.support_class_names)
+        if num_classes > max_text_len:
+            raise RuntimeError(
+                f'Class prototypes ({num_classes}) exceed max_text_len '
+                f'({max_text_len}).')
+        positive_maps = []
+        for labels in gt_labels:
+            positive_map = torch.zeros(
+                labels.size(0), max_text_len, device=device)
+            for row_idx, label in enumerate(labels.detach().cpu().tolist()):
+                if label < 0 or label >= num_classes:
+                    raise ValueError(
+                        f'Class label {label} exceeds prototype range.')
+                positive_map[row_idx, label] = 1.0
+            positive_maps.append(positive_map)
+        return positive_maps
+
+    def build_prototype_token_positive_map(self) -> dict:
+        """Map every class to its single enriched prototype position."""
+        return {
+            class_idx + 1: [class_idx]
+            for class_idx in range(len(self.support_class_names))
+        }
 
     def to_enhance_text_prompts(self, original_caption, enhanced_text_prompts):
         caption_string = ''
@@ -538,192 +1008,43 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
-        text_prompts = []
-        enhanced_text_prompts = []
-        tokens_positives = []
-        for data_samples in batch_data_samples:
-            text_prompts.append(data_samples.text)
-            if 'caption_prompt' in data_samples:
-                enhanced_text_prompts.append(data_samples.caption_prompt)
-            else:
-                enhanced_text_prompts.append(None)
-            tokens_positives.append(data_samples.get('tokens_positive', None))
-
-        if 'custom_entities' in batch_data_samples[0]:
-            # Assuming that the `custom_entities` flag
-            # inside a batch is always the same. For single image inference
-            custom_entities = batch_data_samples[0].custom_entities
-        else:
-            custom_entities = False
-        if len(text_prompts) == 1:
-            # All the text prompts are the same,
-            # so there is no need to calculate them multiple times.
-            _positive_maps_and_prompts = [
-                self.get_tokens_positive_and_prompts(
-                    text_prompts[0], custom_entities, enhanced_text_prompts[0],
-                    tokens_positives[0])
-            ] * len(batch_inputs)
-        else:
-            _positive_maps_and_prompts = [
-                self.get_tokens_positive_and_prompts(text_prompt,
-                                                     custom_entities,
-                                                     enhanced_text_prompt,
-                                                     tokens_positive)
-                for text_prompt, enhanced_text_prompt, tokens_positive in zip(
-                    text_prompts, enhanced_text_prompts, tokens_positives)
-            ]
-        token_positive_maps, text_prompts, _, entities = zip(
-            *_positive_maps_and_prompts)
-
-        # image feature extraction
+        text_dict = self.build_prototype_text_dict(
+            len(batch_inputs), batch_inputs.device)
         visual_feats = self.extract_feat(batch_inputs)
+        token_positive_map = self.build_prototype_token_positive_map()
+        for data_sample in batch_data_samples:
+            data_sample.token_positive_map = token_positive_map
 
-        if isinstance(text_prompts[0], list):
-            # chunked text prompts, only bs=1 is supported
-            assert len(batch_inputs) == 1
-            count = 0
-            results_list = []
-
-            entities = [[item for lst in entities[0] for item in lst]]
-
-            for b in range(len(text_prompts[0])):
-                text_prompts_once = [text_prompts[0][b]]
-                token_positive_maps_once = token_positive_maps[0][b]
-                text_dict = self.language_model(text_prompts_once)
-                # text feature map layer
-                if self.text_feat_map is not None:
-                    text_dict['embedded'] = self.text_feat_map(
-                        text_dict['embedded'])
-
-                batch_data_samples[
-                    0].token_positive_map = token_positive_maps_once
-
-                head_inputs_dict = self.forward_transformer(
-                    copy.deepcopy(visual_feats), text_dict, batch_data_samples)
-                pred_instances = self.bbox_head.predict(
-                    **head_inputs_dict,
-                    rescale=rescale,
-                    batch_data_samples=batch_data_samples)[0]
-
-                if len(pred_instances) > 0:
-                    pred_instances.labels += count
-                count += len(token_positive_maps_once)
-                results_list.append(pred_instances)
-            results_list = [results_list[0].cat(results_list)]
-            is_rec_tasks = [False] * len(results_list)
-        else:
-            # extract text feats
-            text_dict = self.language_model(list(text_prompts))
-            # text feature map layer
-            if self.text_feat_map is not None:
-                text_dict['embedded'] = self.text_feat_map(
-                    text_dict['embedded'])
-
-            is_rec_tasks = []
-            for i, data_samples in enumerate(batch_data_samples):
-                if token_positive_maps[i] is not None:
-                    is_rec_tasks.append(False)
-                else:
-                    is_rec_tasks.append(True)
-                data_samples.token_positive_map = token_positive_maps[i]
-
-            head_inputs_dict = self.forward_transformer(
-                visual_feats, text_dict, batch_data_samples)
-            results_list = self.bbox_head.predict(
-                **head_inputs_dict,
-                rescale=rescale,
-                batch_data_samples=batch_data_samples)
-
-        for data_sample, pred_instances, entity, is_rec_task in zip(
-                batch_data_samples, results_list, entities, is_rec_tasks):
+        head_inputs_dict = self.forward_transformer(
+            visual_feats, text_dict, batch_data_samples)
+        results_list = self.bbox_head.predict(
+            **head_inputs_dict,
+            rescale=rescale,
+            batch_data_samples=batch_data_samples)
+        for data_sample, pred_instances in zip(batch_data_samples,
+                                               results_list):
             if len(pred_instances) > 0:
-                label_names = []
-                for labels in pred_instances.labels:
-                    if is_rec_task:
-                        label_names.append(entity)
-                        continue
-                    if labels >= len(entity):
-                        warnings.warn(
-                            'The unexpected output indicates an issue with '
-                            'named entity recognition. You can try '
-                            'setting custom_entities=True and running '
-                            'again to see if it helps.')
-                        label_names.append('unobject')
-                    else:
-                        label_names.append(entity[labels])
-                # for visualization
-                pred_instances.label_names = label_names
+                pred_instances.label_names = [
+                    self.support_class_names[label.item()]
+                    if label.item() < len(self.support_class_names)
+                    else 'unobject' for label in pred_instances.labels
+                ]
             data_sample.pred_instances = pred_instances
         return batch_data_samples
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
-        text_prompts = [
-            data_samples.text for data_samples in batch_data_samples
-        ]
-
         gt_labels = [
             data_samples.gt_instances.labels
             for data_samples in batch_data_samples
         ]
-
-        if 'tokens_positive' in batch_data_samples[0]:
-            tokens_positive = [
-                data_samples.tokens_positive
-                for data_samples in batch_data_samples
-            ]
-            positive_maps = []
-            for token_positive, text_prompt, gt_label in zip(
-                    tokens_positive, text_prompts, gt_labels):
-                tokenized = self.language_model.tokenizer(
-                    [text_prompt],
-                    padding='max_length'
-                    if self.language_model.pad_to_max else 'longest',
-                    return_tensors='pt')
-                new_tokens_positive = [
-                    token_positive[label.item()] for label in gt_label
-                ]
-                _, positive_map = self.get_positive_map(
-                    tokenized, new_tokens_positive)
-                positive_maps.append(positive_map)
-            new_text_prompts = text_prompts
-        else:
-            new_text_prompts = []
-            positive_maps = []
-            if len(set(text_prompts)) == 1:
-                # All the text prompts are the same,
-                # so there is no need to calculate them multiple times.
-                tokenized, caption_string, tokens_positive, _ = \
-                    self.get_tokens_and_prompts(
-                        text_prompts[0], True)
-                new_text_prompts = [caption_string] * len(batch_inputs)
-                for gt_label in gt_labels:
-                    new_tokens_positive = [
-                        tokens_positive[label] for label in gt_label
-                    ]
-                    _, positive_map = self.get_positive_map(
-                        tokenized, new_tokens_positive)
-                    positive_maps.append(positive_map)
-            else:
-                for text_prompt, gt_label in zip(text_prompts, gt_labels):
-                    tokenized, caption_string, tokens_positive, _ = \
-                        self.get_tokens_and_prompts(
-                            text_prompt, True)
-                    new_tokens_positive = [
-                        tokens_positive[label] for label in gt_label
-                    ]
-                    _, positive_map = self.get_positive_map(
-                        tokenized, new_tokens_positive)
-                    positive_maps.append(positive_map)
-                    new_text_prompts.append(caption_string)
-
-        text_dict = self.language_model(new_text_prompts)
-        if self.text_feat_map is not None:
-            text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        text_dict = self.build_prototype_text_dict(
+            len(batch_inputs), batch_inputs.device)
+        positive_maps = self.build_prototype_positive_maps(
+            gt_labels, batch_inputs.device)
 
         for i, data_samples in enumerate(batch_data_samples):
-            positive_map = positive_maps[i].to(
-                batch_inputs.device).bool().float()
+            positive_map = positive_maps[i].bool().float()
             text_token_mask = text_dict['text_token_mask'][i]
             data_samples.gt_instances.positive_maps = positive_map
             data_samples.gt_instances.text_token_mask = \

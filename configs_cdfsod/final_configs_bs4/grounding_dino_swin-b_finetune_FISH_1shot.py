@@ -24,6 +24,14 @@ metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 model = dict(
     type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
     rand_dnquery_rate=0.5,
+    support_ann_file=f'{data_root}/annotations/1_shot.json',
+    support_class_names=class_names,
+    support_image_root=f'{data_root}/train',
+    support_image_batch_size=2,
+    blip_model_name=os.getenv(
+        'CDFSOD_BLIP_MODEL',
+        'Salesforce/blip-image-captioning-base'),
+    blip_gradient_checkpointing=True,
     bbox_head=dict(
         type='GroundingDINOHead_ParallelDecoder_DN',
         num_classes=num_classes))
@@ -139,6 +147,7 @@ optim_wrapper = dict(
     optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(
+        bypass_duplicate=True,
         custom_keys={
             'absolute_pos_embed': dict(decay_mult=0.),
             'backbone': dict(lr_mult=0.2),
