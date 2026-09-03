@@ -9,12 +9,20 @@ from PIL import Image
 from mmdet.models.utils import SupportBlipCaptioner
 
 
+class _FakeVisionLayer(nn.Module):
+
+    gradient_checkpointing = False
+
+
 class _FakeVisionModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, expose_transformer_encoder=True):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(1.0))
-        self.checkpointing_enabled = False
+        if expose_transformer_encoder:
+            self.encoder = nn.Module()
+            self.encoder.layers = nn.ModuleList(
+                [_FakeVisionLayer(), _FakeVisionLayer()])
 
     def forward(self, pixel_values, return_dict=True):
         pooled = pixel_values.mean(dim=(1, 2, 3)) * self.scale
@@ -111,6 +119,7 @@ class _FakeTokenizer:
 
 
 def _build_captioner(expose_transformer_encoder=True,
+                     expose_vision_transformer_encoder=True,
                      gradient_checkpointing=True):
     text_config = SimpleNamespace(
         hidden_size=768,
@@ -120,7 +129,7 @@ def _build_captioner(expose_transformer_encoder=True,
         sep_token_id=4,
         pad_token_id=0)
     pretrained = SimpleNamespace(
-        vision_model=_FakeVisionModel(),
+        vision_model=_FakeVisionModel(expose_vision_transformer_encoder),
         text_decoder=_FakeTextDecoder(expose_transformer_encoder),
         config=SimpleNamespace(text_config=text_config))
     processor = SimpleNamespace(
@@ -147,6 +156,12 @@ def test_pretrained_caption_components_are_preserved_and_trainable():
     assert captioner.tokenizer.bos_token_id == 10
     assert captioner.enc_token_id == 11
     assert all(parameter.requires_grad for parameter in captioner.parameters())
+    vision_layers = captioner.vision_model.encoder.layers
+    assert all(layer.gradient_checkpointing for layer in vision_layers)
+    assert all(
+        layer._gradient_checkpointing_func.keywords == {
+            'use_reentrant': False
+        } for layer in vision_layers)
     layers = captioner.text_decoder.bert.encoder.layer
     assert all(layer.gradient_checkpointing for layer in layers)
     assert all(
@@ -155,15 +170,26 @@ def test_pretrained_caption_components_are_preserved_and_trainable():
         } for layer in layers)
 
 
-def test_disabled_checkpointing_leaves_decoder_layers_unchanged():
+def test_disabled_checkpointing_leaves_blip_layers_unchanged():
     captioner = _build_captioner(gradient_checkpointing=False)
 
+    assert all(
+        not layer.gradient_checkpointing
+        for layer in captioner.vision_model.encoder.layers)
+    assert all(
+        not hasattr(layer, '_gradient_checkpointing_func')
+        for layer in captioner.vision_model.encoder.layers)
     assert all(
         not layer.gradient_checkpointing
         for layer in captioner.text_decoder.bert.encoder.layer)
     assert all(
         not hasattr(layer, '_gradient_checkpointing_func')
         for layer in captioner.text_decoder.bert.encoder.layer)
+
+
+def test_missing_vision_transformer_layers_raise_clear_error():
+    with pytest.raises(ValueError, match='vision_model.encoder.layers'):
+        _build_captioner(expose_vision_transformer_encoder=False)
 
 
 def test_missing_decoder_transformer_layers_raise_clear_error():

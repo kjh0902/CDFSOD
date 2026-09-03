@@ -76,7 +76,25 @@ class SupportBlipCaptioner(nn.Module):
 
         self.requires_grad_(True)
         if gradient_checkpointing:
+            self._enable_vision_layer_gradient_checkpointing()
             self._enable_decoder_layer_gradient_checkpointing()
+
+    def _enable_vision_layer_gradient_checkpointing(self) -> None:
+        """Checkpoint only the BLIP vision Transformer encoder layers."""
+        encoder = getattr(self.vision_model, 'encoder', None)
+        layers = getattr(encoder, 'layers', None)
+        if not isinstance(layers, nn.ModuleList) or not layers:
+            raise ValueError(
+                'BLIP vision encoder must expose '
+                'vision_model.encoder.layers Transformer layers.')
+        checkpoint_func = partial(checkpoint, use_reentrant=False)
+        for layer in layers:
+            if not hasattr(layer, 'gradient_checkpointing'):
+                raise ValueError(
+                    'Every BLIP vision encoder Transformer layer must '
+                    'support gradient checkpointing.')
+            layer._gradient_checkpointing_func = checkpoint_func
+            layer.gradient_checkpointing = True
 
     def _enable_decoder_layer_gradient_checkpointing(self) -> None:
         """Checkpoint only the BLIP caption decoder Transformer layers."""
