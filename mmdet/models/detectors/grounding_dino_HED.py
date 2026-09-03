@@ -459,10 +459,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
     def _compute_support_batch_caption_features(
             self, pixel_values: Tensor, labels: Tensor) -> Tensor:
-        """Run the differentiable support caption pipeline for one batch."""
-        caption_outputs = self.support_blip_captioner(pixel_values)
-        return self._encode_caption_enriched_class_features(
-            caption_outputs, labels)
+        """Run one support caption batch with mixed precision."""
+        with autocast(enabled=True):
+            caption_outputs = self.support_blip_captioner(pixel_values)
+            return self._encode_caption_enriched_class_features(
+                caption_outputs, labels)
 
     def compute_support_caption_features(self, device) -> Tensor:
         """Recompute differentiable caption features for all support crops."""

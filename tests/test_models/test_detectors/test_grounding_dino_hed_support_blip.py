@@ -1,5 +1,6 @@
 import json
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -79,6 +80,47 @@ def test_caption_features_are_averaged_by_class():
 
     torch.testing.assert_close(
         prototypes, torch.tensor([[2., 3.], [10., 20.]]))
+
+
+def test_support_blip_and_bert_run_inside_dedicated_autocast():
+    detector = Detector.__new__(Detector)
+    nn.Module.__init__(detector)
+    active = {'value': False}
+    calls = []
+
+    class _AutocastContext:
+
+        def __enter__(self):
+            active['value'] = True
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            active['value'] = False
+
+    class _Captioner(nn.Module):
+
+        def forward(self, pixel_values):
+            calls.append(('blip', active['value']))
+            return {'caption': pixel_values.mean()}
+
+    language_model = nn.Module()
+    language_model.support_blip_captioner = _Captioner()
+    detector.language_model = language_model
+
+    def encode(self, caption_outputs, labels):
+        calls.append(('bert', active['value']))
+        return caption_outputs['caption'] + labels.float().mean()
+
+    detector._encode_caption_enriched_class_features = MethodType(
+        encode, detector)
+    with patch(
+            'mmdet.models.detectors.grounding_dino_HED.autocast',
+            return_value=_AutocastContext()) as mocked_autocast:
+        detector._compute_support_batch_caption_features(
+            torch.ones(2, 3, 4, 4), torch.tensor([0, 1]))
+
+    mocked_autocast.assert_called_once_with(enabled=True)
+    assert calls == [('blip', True), ('bert', True)]
+    assert not active['value']
 
 
 def test_each_class_maps_to_its_single_caption_prototype():
