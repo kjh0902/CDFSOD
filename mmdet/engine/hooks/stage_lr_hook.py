@@ -9,6 +9,9 @@ from mmengine.registry import HOOKS
 class BBoxHeadFirstHook6(Hook):
     """Hook for implementing two-stage training.
 
+    BLIP vision_model.encoder is frozen via LR=0 in Stage 1 and restored
+    to its original optimizer LR in Stage 2. Its requires_grad is unchanged.
+
     Stage 1: Only train bbox_head, language_model and related components, 
              freeze all other components.
     Stage 2: Unfreeze all components and set specific learning rates for 
@@ -44,6 +47,7 @@ class BBoxHeadFirstHook6(Hook):
         # Store parameter group indices corresponding to different components
         self._head_groups = []
         self._lang_model_groups = []
+        self._blip_vision_encoder_groups = []
         self._backbone_groups = []
         self._other_groups = []
 
@@ -97,6 +101,9 @@ class BBoxHeadFirstHook6(Hook):
 
             if param_name.startswith('backbone'):
                 self._backbone_groups.append(i)
+            elif param_name.startswith(
+                    'language_model.support_blip_captioner.vision_model.encoder.'):
+                self._blip_vision_encoder_groups.append(i)
             elif param_name.startswith('language_model'):
                 self._lang_model_groups.append(i)
             elif (param_name.startswith('bbox_head') or
@@ -109,6 +116,7 @@ class BBoxHeadFirstHook6(Hook):
                 self._other_groups.append(i)
         
         runner.logger.info(f'Identified param groups: Backbone={self._backbone_groups}, '
+                        f'BlipVisionEncoder={self._blip_vision_encoder_groups}, '
                         f'LanguageModel={self._lang_model_groups}, Head={self._head_groups}, '
                         f'Other={self._other_groups}')
 
@@ -153,6 +161,10 @@ class BBoxHeadFirstHook6(Hook):
         for group_idx in self._other_groups:
             optimizer.param_groups[group_idx]['lr'] = current_head_lr
         runner.logger.info(f'  - Other groups LR set to match BboxHead: {current_head_lr:.8f}')
+
+        # Restore the encoder's original optimizer LR after Stage 1 freezing.
+        for group_idx in self._blip_vision_encoder_groups:
+            optimizer.param_groups[group_idx]['lr'] = self._original_lrs[group_idx]
 
         # 3. If patience adjustment is enabled, change patience to unfrozen state value
         if self.adjust_scheduler_patience:
@@ -206,7 +218,7 @@ class BBoxHeadFirstHook6(Hook):
                 # f'  - Group {group_idx} (Trainable) LR set to {base_lr:.8f} ')
 
         # Freeze other groups
-        frozen_groups = self._other_groups
+        frozen_groups = self._other_groups + self._blip_vision_encoder_groups
         for group_idx in frozen_groups:
             base_lr = self._original_lrs[group_idx]
             optimizer.param_groups[group_idx]['lr'] = 0.0
@@ -222,6 +234,7 @@ class BBoxHeadFirstHook6(Hook):
         group_map = {
             'Head': self._head_groups,
             'Language Model': self._lang_model_groups,
+            'BLIP Vision Encoder': self._blip_vision_encoder_groups,
             'Backbone': self._backbone_groups,
             'Other': self._other_groups
         }
