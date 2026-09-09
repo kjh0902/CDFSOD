@@ -2,8 +2,83 @@
 
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스만
-정리했다.
+설정은 원본 그대로 유지한다. `grounding_dino_acl_qwen` 브랜치는 offline Qwen 설명을
+BERT class-name prototype으로 바꾸는 텍스트 입력 경로를 추가한다.
+
+## Offline Qwen class descriptions
+
+Qwen은 support GT bbox crop들을 class별로 함께 보고 공통 시각 설명 한 개를 생성한다.
+검증/test 이미지는 사용하지 않는다. JSON만 detector에 전달하며 Qwen 모델은 detector,
+optimizer, checkpoint에 포함되지 않는다. 구현은 `codex/qwen3-vl-visual-descriptions`의
+`26a352b`에서 crop 생성기와 BERT prototype 경로를 이식했다.
+
+먼저 학습 환경과 별도로 preprocessing 환경을 준비한다. 다음은 저장소의 CUDA 12.8
+PyTorch 버전과 Qwen3-VL을 지원하는 Transformers 버전을 사용하는 예시다.
+
+```bash
+conda create -n qwen-offline python=3.10 -y
+conda activate qwen-offline
+python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install transformers==4.57.1 pillow==11.3.0
+
+export CDFSOD_PATH=/path/to/datasets
+DATASET=NEU-DET
+for SHOT in 1 5 10; do
+  python tools/generate_instance_captions.py \
+    --dataset-root "${CDFSOD_PATH}/${DATASET}" \
+    --ann-file "annotations/${SHOT}_shot.json" \
+    --img-prefix train \
+    --output "annotations/${SHOT}_shot_captions.json" \
+    --model-name Qwen/Qwen3-VL-8B-Instruct \
+    --device cuda --batch-size 1
+done
+```
+
+`--batch-size`는 class 수다. class의 모든 crop을 한 요청에 넣으므로 필요한 메모리는
+crop 수와 해상도에 따라 달라진다. 이 예시는 실제 Qwen/GPU 실행 검증을 포함하지 않는다.
+`DATASET`은 `ArTaxOr`, `DIOR`, `FISH`, `NEU-DET`, `UODD`, `clipart1k` 중 선택한다.
+각 shot의 support annotation을 별도로 처리해야 한다.
+
+JSON은 아래 형식이며 생성기는 `ann_ids`, `image_ids`, `bboxes`, `file_names`도 보존한다.
+설정의 모든 class에 정확히 하나의 비어 있지 않은 설명이 필요하다. 누락, 중복, 알 수 없는
+class, 잘못된 bbox는 오류로 처리한다. JSON category ID가 아닌 `category_name`으로 매칭하며
+prototype 순서는 config의 `class_names`를 따른다.
+
+```json
+{"captions": [{"category_id": 1, "category_name": "crazing", "caption": "Thin branching lines across a rough surface."}]}
+```
+
+위 JSON은 단일 entry 예시다. 학습에는 해당 데이터셋의 모든 class entry가 필요하다.
+18개 finetune config는 각자 `annotations/{shot}_shot_captions.json`을 지정한다.
+
+```bash
+conda activate ft-fsod
+python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py
+# 다른 JSON 사용 시 (평가 시에도 동일한 override 사용)
+python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_5shot.py \
+  --cfg-options model.support_caption_file=/absolute/path/5_shot_captions.json
+```
+
+BERT는 정리된 class name과 설명을 `class_name: description.`으로 class마다 독립적으로
+인코딩한다. 문장 전체 attention을 사용하고 class-name subword의 마지막 hidden state만
+평균한 뒤 `text_feat_map`을 적용한다. 설명 토큰 자체는 detection token으로 전달하지 않는다.
+BERT/projection gradient와 기존 ACL 학습 단계별 LR 정책을 유지한다. 학습·평가 feature
+cache는 사용하지 않으며 텍스트/tokenization만 재사용한다. 긴 설명은 기존 BERT token 제한에
+따라 잘리고 class name이 잘리면 오류가 발생한다.
+
+기존 class-name 텍스트 경로로 비교하려면
+`--cfg-options model.use_class_name_token_prototypes=False`를 사용한다.
+HED decoder, DN query, detection loss, Progressive Fine-Tuning hook은 기준 ACL 코드 그대로다.
+
+가벼운 CPU sanity check (PyTorch와 Pillow 필요, MMDetection 확장/모델 다운로드 불필요):
+
+```bash
+python -m unittest discover -s tests -p test_qwen_offline_sanity.py -v
+```
+
+실제 detector 메서드에 작은 BERT 대역을 연결해 pooling/gradient/shape/positive map을 검사하고,
+mock Qwen으로 crop·JSON 경로를 검사한다. 기준 ACL commit과 핵심 메서드 및 hook/decoder/head,
+18개 config의 텍스트 옵션 외 설정이 동일한지도 확인한다. 전체 detector/GPU 학습 검증은 별도다.
 
 ## 지원 환경
 
