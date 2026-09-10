@@ -225,20 +225,15 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self.decoder.num_layers].max_text_len
         if len(self.support_class_names) > max_text_len:
             raise ValueError('Support class count exceeds max_text_len.')
-        entries = (caption_data.get('captions')
-                   if isinstance(caption_data, dict) else caption_data)
-        if not isinstance(entries, list):
-            raise ValueError('Expected a captions list in support JSON.')
+        if not isinstance(caption_data, dict):
+            raise ValueError('Expected a class-name-to-description object '
+                             'in support JSON.')
         class_to_idx = {name: i for i, name in enumerate(self.support_class_names)}
         prompt_bank = defaultdict(list)
         span_bank = defaultdict(list)
-        for item in entries:
-            if not isinstance(item, dict):
-                raise ValueError('Each caption entry must be an object.')
-            class_name = item.get('category_name', item.get('class_name'))
+        for class_name, caption in caption_data.items():
             if class_name not in class_to_idx:
                 raise ValueError(f'Unknown support class: {class_name}')
-            caption = item.get('caption')
             if (not isinstance(caption, str) or
                     not caption.strip().rstrip('.').strip()):
                 raise ValueError(f'Empty description for class: {class_name}')
