@@ -259,7 +259,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                 prompt_labels.append(class_idx)
                 prompt_class_spans.append(class_span)
 
-        self.support_prompt_bank = ordered_bank
         self.support_prompt_texts = prompt_texts
         self.support_prompt_labels = torch.tensor(prompt_labels,
                                                   dtype=torch.long)
@@ -269,6 +268,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self._find_class_name_token_positions(
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
+        num_class_tokens = sum(map(
+            len, self.support_prompt_class_token_positions))
+        if num_class_tokens > max_text_len:
+            raise ValueError('Support class-name subword count exceeds '
+                             'max_text_len.')
+        self.support_prompt_bank = ordered_bank
 
     def _format_support_prompt(
             self, class_name: str,
@@ -338,76 +343,60 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             return_dict=True)
         return outputs.last_hidden_state
 
-    def compute_support_class_token_features(self):
-        """Encode prompts and keep only class-name token features."""
-        self.build_support_prompt_bank()
-        device = next(self.language_model.parameters()).device
-        tokenizer_input = self._prepare_cached_tokenized(device)
-        hidden_states = self._encode_support_prompt_features(tokenizer_input)
-
-        selected_features = []
-        selected_labels = []
-        for prompt_idx, class_idx in enumerate(
-                self.support_prompt_labels.tolist()):
-            for token_idx in self.support_prompt_class_token_positions[
-                    prompt_idx]:
-                selected_features.append(hidden_states[prompt_idx, token_idx])
-                selected_labels.append(class_idx)
-        selected_features = torch.stack(selected_features, dim=0)
-        selected_labels = torch.tensor(
-            selected_labels, dtype=torch.long, device=device)
-
-        return selected_features, selected_labels
-
-    def compute_class_text_prototypes(self):
-        """Average selected class-name token features into class prototypes."""
-        token_features, token_labels = self.compute_support_class_token_features()
-        prototypes = []
-        for class_idx in range(len(self.support_class_names)):
-            class_mask = token_labels == class_idx
-            if not class_mask.any():
-                raise RuntimeError(
-                    f'No support class-name tokens for class '
-                    f'{self.support_class_names[class_idx]}')
-            prototypes.append(token_features[class_mask].mean(dim=0))
-        prototypes = torch.stack(prototypes, dim=0)
-
-        return prototypes
-
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build text_dict from class-name-token averaged prototypes."""
-        prototypes = self.compute_class_text_prototypes()
-        if self.text_feat_map is not None:
-            prototypes = self.text_feat_map(prototypes)
-        prototypes = prototypes.to(device)
-        num_tokens = prototypes.size(0)
-        max_text_len = self.bbox_head.cls_branches[
-            self.decoder.num_layers].max_text_len
-        if num_tokens > max_text_len:
-            raise RuntimeError(
-                f'Class text prototypes ({num_tokens}) exceed max_text_len '
-                f'({max_text_len}).')
+        """Build full prompt memory; defer class-name filtering until encoding.
 
-        embedded = prototypes.unsqueeze(0).expand(batch_size, -1, -1)
+        The legacy prototype configuration name is retained for compatibility,
+        but class-name subwords are never pooled.
+        """
+        self.build_support_prompt_bank()
+        bert_device = next(self.language_model.parameters()).device
+        tokenizer_input = self._prepare_cached_tokenized(bert_device)
+        hidden_states = self._encode_support_prompt_features(tokenizer_input)
+        valid_tokens = tokenizer_input['attention_mask'].bool()
+        prompt_features = hidden_states[valid_tokens]
+        if self.text_feat_map is not None:
+            prompt_features = self.text_feat_map(prompt_features)
+        prompt_features = prompt_features.to(device)
+        prompt_ids, positions, class_token_indices = [], [], []
+        offset = 0
+        for prompt_idx, attention_mask in enumerate(
+                self.support_tokenized['attention_mask']):
+            valid_positions = attention_mask.nonzero(as_tuple=True)[0].tolist()
+            num_prompt_tokens = len(valid_positions)
+            prompt_ids.extend([prompt_idx] * num_prompt_tokens)
+            positions.extend(range(num_prompt_tokens))
+            class_token_indices.extend(
+                offset + valid_positions.index(token_idx)
+                for token_idx in self.support_prompt_class_token_positions[
+                    prompt_idx])
+            offset += num_prompt_tokens
+
+        prompt_ids = torch.tensor(prompt_ids, device=device)
+        class_token_indices = torch.tensor(
+            class_token_indices, dtype=torch.long, device=device)
+        embedded = prompt_features.unsqueeze(0).expand(batch_size, -1, -1)
         text_token_mask = torch.ones(
-            batch_size, num_tokens, dtype=torch.bool, device=device)
-        text_self_attention_masks = torch.eye(
-            num_tokens, dtype=torch.bool,
-            device=device).unsqueeze(0).expand(batch_size, -1, -1)
-        position_ids = torch.arange(
-            num_tokens, dtype=torch.long,
+            batch_size, offset, dtype=torch.bool, device=device)
+        text_self_attention_masks = (
+            prompt_ids[:, None] == prompt_ids[None, :]
+        ).unsqueeze(0).expand(batch_size, -1, -1)
+        position_ids = torch.tensor(
+            positions, dtype=torch.long,
             device=device).unsqueeze(0).expand(batch_size, -1)
         text_dict = dict(
             embedded=embedded,
             text_token_mask=text_token_mask,
             masks=text_self_attention_masks,
-            position_ids=position_ids)
+            position_ids=position_ids,
+            class_token_indices=class_token_indices)
 
         return text_dict
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Create positive maps from classes to class prototype positions."""
+        """Mark every retained subword of each ground-truth class positive."""
+        token_positive_map = self.build_prototype_token_positive_map()
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
         positive_maps = []
@@ -417,16 +406,22 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             positive_map = torch.zeros(
                 labels.size(0), max_text_len, device=device)
             for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                positive_map[row_idx, label] = 1.0
+                positive_map[row_idx, token_positive_map[label + 1]] = 1.0
             positive_maps.append(positive_map)
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to class prototype positions."""
-        return {
-            class_idx + 1: [class_idx]
-            for class_idx in range(len(self.support_class_names))
-        }
+        """Map 1-based class ids to positions in filtered class-name memory."""
+        self.build_support_prompt_bank()
+        token_positive_map = {}
+        offset = 0
+        for class_idx, positions in zip(
+                self.support_prompt_labels.tolist(),
+                self.support_prompt_class_token_positions):
+            token_positive_map.setdefault(class_idx + 1, []).extend(
+                range(offset, offset + len(positions)))
+            offset += len(positions)
+        return token_positive_map
 
     def get_tokens_positive_and_prompts(
         self,
@@ -573,6 +568,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             text_attention_mask=~text_token_mask,
             position_ids=text_dict['position_ids'],
             text_self_attention_masks=text_dict['masks'])
+        if 'class_token_indices' in text_dict:
+            # All enhancer layers see full prompts. Query selection and every
+            # decoder branch see only individual class-name subwords.
+            indices = text_dict['class_token_indices']
+            memory_text = memory_text.index_select(1, indices)
+            text_token_mask = text_token_mask.index_select(1, indices)
         encoder_outputs_dict = dict(
             memory=memory,
             memory_mask=feat_mask,
@@ -931,7 +932,8 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                 gt_labels, batch_inputs.device)
             for i, data_samples in enumerate(batch_data_samples):
                 positive_map = positive_maps[i].bool().float()
-                text_token_mask = text_dict['text_token_mask'][i]
+                text_token_mask = text_dict['text_token_mask'][i].index_select(
+                    0, text_dict['class_token_indices'])
                 data_samples.gt_instances.positive_maps = positive_map
                 data_samples.gt_instances.text_token_mask = \
                     text_token_mask.unsqueeze(0).repeat(
