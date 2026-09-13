@@ -183,7 +183,10 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 pos_text: Tensor = None,
                 text_self_attention_masks: Tensor = None,
                 position_ids: Tensor = None):
-        """Forward function of Transformer encoder.
+        """Run E1, then average independent E2..EN visual and text outputs.
+
+        Each stage keeps its pretrained fusion, text and visual layers. All
+        stages after E1 receive the same E1 visual and text memories.
 
         Args:
             query (Tensor): The input query, has shape (bs, num_queries, dim).
@@ -229,8 +232,12 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                     num_pos_feats=256,
                     exchange_xy=False)
 
-        # main process
+        parallel_outputs = []
+        parallel_text_outputs = []
         for layer_id, layer in enumerate(self.layers):
+            if layer_id > 0:
+                output = output_after_layer1
+                memory_text = memory_text_after_layer1
             if self.fusion_layers:
                 output, memory_text = self.fusion_layers[layer_id](
                     visual_feature=output,
@@ -255,6 +262,19 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 key_padding_mask=key_padding_mask)
+            if layer_id == 0:
+                output_after_layer1 = output
+                memory_text_after_layer1 = memory_text
+            else:
+                parallel_outputs.append(output)
+                if memory_text is not None:
+                    parallel_text_outputs.append(memory_text)
+
+        if parallel_outputs:
+            output = torch.stack(parallel_outputs, dim=0).mean(dim=0)
+            if parallel_text_outputs:
+                memory_text = torch.stack(
+                    parallel_text_outputs, dim=0).mean(dim=0)
         return output, memory_text
 
 
