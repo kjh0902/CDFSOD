@@ -9,8 +9,8 @@ from mmengine.registry import HOOKS
 class BBoxHeadFirstHook6(Hook):
     """Hook for implementing two-stage training.
 
-    Stage 1: Only train bbox_head, language_model and related components, 
-             freeze all other components.
+    Stage 1: Keep the existing trainable components and train encoder E2..EN.
+             Freeze encoder E1 and other components using LR=0.
     Stage 2: Unfreeze all components and set specific learning rates for 
              different components.
         - Backbone learning rate matches the final learning rate of language_model.
@@ -45,6 +45,7 @@ class BBoxHeadFirstHook6(Hook):
         self._head_groups = []
         self._lang_model_groups = []
         self._backbone_groups = []
+        self._parallel_encoder_groups = []
         self._other_groups = []
 
     def before_train(self, runner) -> None:
@@ -94,11 +95,17 @@ class BBoxHeadFirstHook6(Hook):
             # Determine the type of the entire group by the name of the first parameter in the group
             first_param_id = id(param_group['params'][0])
             param_name = param_id_to_name.get(first_param_id, '')
+            name_parts = param_name.split('.')
 
             if param_name.startswith('backbone'):
                 self._backbone_groups.append(i)
             elif param_name.startswith('language_model'):
                 self._lang_model_groups.append(i)
+            elif (len(name_parts) >= 4 and name_parts[0] == 'encoder' and
+                  name_parts[1] in ('layers', 'text_layers', 'fusion_layers') and
+                  name_parts[2].isdigit() and int(name_parts[2]) > 0):
+                # E2..EN retain their configured LR; E1 stays in other_groups.
+                self._parallel_encoder_groups.append(i)
             elif (param_name.startswith('bbox_head') or
                   param_name.startswith('text_feat_map') or
                   param_name.startswith('neck') or
@@ -110,6 +117,7 @@ class BBoxHeadFirstHook6(Hook):
         
         runner.logger.info(f'Identified param groups: Backbone={self._backbone_groups}, '
                         f'LanguageModel={self._lang_model_groups}, Head={self._head_groups}, '
+                        f'ParallelEncoder={self._parallel_encoder_groups}, '
                         f'Other={self._other_groups}')
 
     def _should_start_stage2(self, runner) -> bool:
@@ -150,7 +158,7 @@ class BBoxHeadFirstHook6(Hook):
             runner.logger.warning('Bbox head group not found for Stage 2 LR setting!')
 
         # Other components follow bbox head's learning rate
-        for group_idx in self._other_groups:
+        for group_idx in self._other_groups + self._parallel_encoder_groups:
             optimizer.param_groups[group_idx]['lr'] = current_head_lr
         runner.logger.info(f'  - Other groups LR set to match BboxHead: {current_head_lr:.8f}')
 
@@ -193,12 +201,13 @@ class BBoxHeadFirstHook6(Hook):
 
 
     def _set_stage1_lr(self, runner):
-        """Stage 1: bbox_head and language_model use specified learning rates, other components are frozen."""
+        """Keep configured LRs for trainable groups, including encoder E2..EN."""
         runner.logger.info('Setting LRs for Stage 1...')
         optimizer = runner.optim_wrapper.optimizer
         
         # Set learning rates for trainable groups
-        trainable_groups = self._backbone_groups + self._head_groups + self._lang_model_groups
+        trainable_groups = (self._backbone_groups + self._head_groups +
+                            self._lang_model_groups + self._parallel_encoder_groups)
         for group_idx in trainable_groups:
             base_lr = self._original_lrs[group_idx]
             optimizer.param_groups[group_idx]['lr'] = base_lr
@@ -223,6 +232,7 @@ class BBoxHeadFirstHook6(Hook):
             'Head': self._head_groups,
             'Language Model': self._lang_model_groups,
             'Backbone': self._backbone_groups,
+            'Parallel Encoder': self._parallel_encoder_groups,
             'Other': self._other_groups
         }
 
