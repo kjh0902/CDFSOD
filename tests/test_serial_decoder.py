@@ -51,7 +51,8 @@ class SerialDecoderTests(unittest.TestCase):
                       if isinstance(n, ast.FunctionDef)}
             after = {n.name: n for n in cls_node(path, cls).body
                      if isinstance(n, ast.FunctionDef)}
-            self.assertEqual(before.keys(), after.keys())
+            added = {'_freeze_unused_enhancer_text_parameters'} if path == DETECTOR else set()
+            self.assertEqual(before.keys() | added, after.keys())
             for name in before.keys() - allowed:
                 self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         self.assertNotIn('additional_dn_items', source(DETECTOR))

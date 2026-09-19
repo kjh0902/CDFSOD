@@ -77,6 +77,23 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         super().__init__(*args, **kwargs)
         if self.use_class_name_token_prototypes:
             self.build_support_prompt_bank()
+            self._freeze_unused_enhancer_text_parameters()
+
+    def _freeze_unused_enhancer_text_parameters(self) -> None:
+        """Exclude the discarded final text output from DDP gradient reduction.
+
+        Earlier text layers still feed subsequent visual fusion layers. Only
+        the last text layer and the final fusion's language-only output path
+        have no route to the loss when using pre-enhancer prototypes. Keep
+        their modules and state-dict keys for checkpoint compatibility.
+        """
+        if self.encoder.text_layers:
+            self.encoder.text_layers[-1].requires_grad_(False)
+        if self.encoder.fusion_layers:
+            fusion = self.encoder.fusion_layers[-1]
+            fusion.gamma_l.requires_grad_(False)
+            fusion.attn.values_v_proj.requires_grad_(False)
+            fusion.attn.out_l_proj.requires_grad_(False)
 
 
     def _init_layers(self) -> None:
