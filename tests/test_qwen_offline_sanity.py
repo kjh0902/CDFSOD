@@ -166,8 +166,10 @@ class QwenSanity(unittest.TestCase):
         result = model.build_prototype_text_dict(2, 'cpu')
         valid = model.support_tokenized['attention_mask'].bool()
         torch.testing.assert_close(result['embedded'][0], model.text_feat_map(encoded[valid]))
-        self.assertEqual(result['class_token_indices'].tolist(), [1, 2, 10])
-        result['embedded'].sum().backward()
+        expected = model.text_feat_map(torch.stack([
+            encoded[0, [1, 2]].mean(0), encoded[1, 1]]))
+        torch.testing.assert_close(result['class_prototypes'][0], expected)
+        result['class_prototypes'].sum().backward()
         self.assertGreater(model.text_feat_map.weight.grad.abs().sum().item(), 0)
         grad = model.language_model.language_backbone.body.model.embedding.weight.grad
         self.assertGreater(grad[5].abs().sum().item(), 0)  # Description influences class features.
@@ -180,6 +182,9 @@ class QwenSanity(unittest.TestCase):
         second = model.build_prototype_text_dict(1, 'cpu')
         self.assertEqual(first['embedded'].shape, (4, 17, 3))
         self.assertEqual(second['embedded'].shape, (1, 17, 3))
+        self.assertEqual(first['class_prototypes'].shape, (4, 2, 3))
+        self.assertEqual(first['prototype_token_mask'].shape, (4, 2))
+        self.assertTrue(first['prototype_token_mask'].all())
         self.assertTrue(second['text_token_mask'].all())
         expected = torch.block_diag(torch.ones(9, 9, dtype=torch.bool),
                                     torch.ones(8, 8, dtype=torch.bool))
@@ -189,6 +194,7 @@ class QwenSanity(unittest.TestCase):
             model.text_feat_map.bias.add_(1)
         third = model.build_prototype_text_dict(1, 'cpu')
         torch.testing.assert_close(third['embedded'], second['embedded'] + 1)
+        torch.testing.assert_close(third['class_prototypes'], second['class_prototypes'] + 1)
 
     def test_validation(self):
         for entries in [{'other': 'shape'}, [], {'other': ' '},
@@ -200,8 +206,8 @@ class QwenSanity(unittest.TestCase):
                 self.model(names=names)
         with self.assertRaises(ValueError):
             self.model(limit=1)
-        with self.assertRaisesRegex(ValueError, 'subword count'):
-            self.model(limit=2)  # Two classes, but three class-name tokens.
+        self.assertEqual(self.model(limit=2).build_prototype_text_dict(
+            1, 'cpu')['class_prototypes'].shape[1], 2)
         self.assertEqual(self.model(limit=3).build_prototype_text_dict(
             1, 'cpu')['embedded'].shape[1], 17)
         model = self.model()
@@ -233,7 +239,8 @@ class QwenSanity(unittest.TestCase):
                 seen['selection'] = memory_text
                 seen['selection_mask'] = mask
                 scores = memory @ memory_text.transpose(1, 2)
-                return torch.cat([scores, scores.new_full((2, 4, 5), -float('inf'))], -1)
+                seen['selection_scores'] = scores
+                return torch.cat([scores, scores.new_full((2, 4, 6), -float('inf'))], -1)
 
         model.bbox_head.cls_branches[1] = Classifier()
         model.bbox_head.reg_branches = [None, lambda x: x.new_zeros(2, 4, 4)]
@@ -247,20 +254,27 @@ class QwenSanity(unittest.TestCase):
             self.assertEqual(fusion.length, 17)
             self.assertFalse(fusion.token_mask.any())
             torch.testing.assert_close(layer.mask, ~text['masks'])
-        expected = model.encoder.text_layers[-1].output[:, [1, 2, 10]]
+        expected = text['class_prototypes']
+        enhanced = model.encoder.text_layers[-1].output
+        self.assertFalse(torch.allclose(expected[:, 0], enhanced[:, [1, 2]].mean(1)))
         for actual in [seen['selection'], seen['decoder'], result['memory_text']]:
             torch.testing.assert_close(actual, expected)
-            self.assertEqual(actual.shape, (2, 3, 3))
+            self.assertEqual(actual.shape, (2, 2, 3))
         self.assertFalse(torch.allclose(expected[:, 0], expected[:, 1]))
-        self.assertEqual(seen['selection_mask'].shape, (2, 3))
-        result['memory_text'].square().sum().backward()
+        self.assertEqual(seen['selection_mask'].shape, (2, 2))
+        result['memory_text'].square().sum().backward(retain_graph=True)
+        self.assertIsNone(text['embedded'].grad)
+        self.assertIsNone(model.encoder.text_layers[0].attn.in_proj_weight.grad)
+        # The visual path still learns through the full-prompt enhancer.
+        seen['selection_scores'].square().sum().backward()
         self.assertGreater(text['embedded'].grad[:, 4:7].abs().sum().item(), 0)
         self.assertGreater(model.encoder.text_layers[0].attn.in_proj_weight.grad.abs().sum().item(), 0)
         self.assertGreater(model.text_feat_map.weight.grad.abs().sum().item(), 0)
         self.assertGreater(model.language_model.language_backbone.body.model.embedding.weight.grad.abs().sum().item(), 0)
 
         # Ordinary text dictionaries keep all tokens at the same boundary.
-        ordinary = {k: v for k, v in text.items() if k != 'class_token_indices'}
+        ordinary = {k: v for k, v in text.items()
+                    if k not in ('class_prototypes', 'prototype_token_mask')}
         self.assertEqual(model.forward_encoder(**inputs, text_dict=ordinary)['memory_text'].shape[1], 17)
 
     def test_independent_bert_rows_and_truncation(self):
@@ -279,14 +293,29 @@ class QwenSanity(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'truncated'):
             model.build_support_prompt_bank()
 
-    def test_single_word_subwords_are_not_pooled(self):
+    def test_single_word_subwords_are_mean_pooled(self):
         model = self.model(entries={'beetles': 'shiny wings'}, names=['beetles'])
         text = model.build_prototype_text_dict(1, 'cpu')
-        self.assertEqual(text['class_token_indices'].tolist(), [1, 2])
-        self.assertEqual(model.build_prototype_token_positive_map(), {1: [0, 1]})
+        self.assertEqual(text['class_prototypes'].shape, (1, 1, 3))
+        torch.testing.assert_close(text['class_prototypes'][:, 0],
+                                   text['embedded'][:, [1, 2]].mean(1))
+        self.assertEqual(model.build_prototype_token_positive_map(), {1: [0]})
         self.assertFalse(torch.allclose(text['embedded'][:, 1], text['embedded'][:, 2]))
         targets = model.build_prototype_positive_maps([torch.tensor([0])], 'cpu')
-        self.assertEqual(targets[0][0].tolist(), [1, 1, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(targets[0][0].tolist(), [1, 0, 0, 0, 0, 0, 0, 0])
+
+    def test_pooling_distributes_gradient_only_to_class_tokens(self):
+        model = self.model()
+        hidden = model._encode_support_prompt_features(
+            model._prepare_cached_tokenized('cpu')).detach().requires_grad_()
+        model._encode_support_prompt_features = lambda _: hidden
+        model.text_feat_map = None
+        text = model.build_prototype_text_dict(1, 'cpu')
+        text['class_prototypes'].sum().backward()
+        expected = torch.zeros_like(hidden)
+        expected[0, [1, 2]] = 0.5
+        expected[1, 1] = 1.0
+        torch.testing.assert_close(hidden.grad, expected)
 
     def test_loss_predict_contract(self):
         model = self.model()
@@ -297,22 +326,22 @@ class QwenSanity(unittest.TestCase):
         calls = []
         def forward(features, text, data):
             calls.append(text)
-            return dict(memory_text=text['embedded'].index_select(1, text['class_token_indices']),
-                        text_token_mask=text['text_token_mask'].index_select(1, text['class_token_indices']))
+            return dict(memory_text=text['class_prototypes'],
+                        text_token_mask=text['prototype_token_mask'])
         model.forward_transformer = forward
         model.bbox_head.loss = lambda **kw: {'loss_mock': kw['memory_text'].sum()}
         losses = model.loss(torch.zeros(2, 3, 4, 4), samples)
         self.assertIn('loss_mock', losses)
-        self.assertEqual(samples[0].gt_instances.positive_maps[:, :3].tolist(), [[0, 0, 1], [1, 1, 0]])
+        self.assertEqual(samples[0].gt_instances.positive_maps[:, :3].tolist(), [[0, 1, 0], [1, 0, 0]])
         self.assertEqual(samples[1].gt_instances.positive_maps.shape, (0, 8))
-        self.assertEqual(samples[1].gt_instances.text_token_mask.shape, (0, 3))
+        self.assertEqual(samples[1].gt_instances.text_token_mask.shape, (0, 2))
         class Prediction:
             labels = torch.tensor([1, 0])
             def __len__(self):
                 return 2
         model.bbox_head.predict = lambda **kw: [Prediction() for _ in kw['batch_data_samples']]
         output = model.predict(torch.zeros(2, 3, 4, 4), samples)
-        self.assertEqual(output[0].token_positive_map, {1: [0, 1], 2: [2]})
+        self.assertEqual(output[0].token_positive_map, {1: [0], 2: [1]})
         self.assertEqual(output[0].pred_instances.label_names, ['other', 'pitted_surface'])
         self.assertEqual(len(calls), 2)
 
@@ -393,7 +422,7 @@ class QwenSanity(unittest.TestCase):
         encoder.body = [n for n in encoder.body if not (
             isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
             and isinstance(n.test.left, ast.Constant)
-            and n.test.left.value == 'class_token_indices')]
+            and n.test.left.value == 'class_prototypes')]
         self.assertEqual(ast.dump(encoder), ast.dump(original['forward_encoder']))
         for name in ['loss', 'predict']:
             node = copy.deepcopy(updated[name])
