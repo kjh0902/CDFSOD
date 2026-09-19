@@ -40,7 +40,10 @@ def method(path, name, cls=None, **env):
 class SerialDecoderTests(unittest.TestCase):
     def test_non_decoder_methods_and_training_head_unchanged(self):
         for path, cls, allowed in [
-            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder'}),
+            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder',
+                             'build_support_prompt_bank', 'build_prototype_text_dict',
+                             'build_prototype_positive_maps', 'build_prototype_token_positive_map',
+                             'forward_encoder', 'loss'}),
             (HEAD, 'GroundingDINOHead_ParallelDecoder_DN', {'predict_by_feat'}),
             (LAYERS + 'grounding_dino_layers_HED.py', 'GroundingDinoTransformerEncoder', set()),
         ]:
