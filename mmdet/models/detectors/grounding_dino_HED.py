@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import json
+import math
 from collections import defaultdict
 import re
 import warnings
@@ -19,6 +20,7 @@ from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerEncoder)
+from ..losses.nearest_etf_loss import nearest_etf_loss
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -62,6 +64,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
                  use_class_name_token_prototypes: bool = False,
+                 nearest_etf_loss_weight: float = 0.0,
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  **kwargs) -> None:
@@ -71,6 +74,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         self.use_autocast = use_autocast
         # Accept the legacy config option; serial decoding uses one DN batch.
         self.use_class_name_token_prototypes = use_class_name_token_prototypes
+        if (not math.isfinite(nearest_etf_loss_weight)
+                or nearest_etf_loss_weight < 0):
+            raise ValueError(
+                'nearest_etf_loss_weight must be finite and nonnegative.')
+        self.nearest_etf_loss_weight = nearest_etf_loss_weight
         self.support_caption_file = support_caption_file
         self.support_class_names = list(support_class_names or [])
         self.support_prompt_bank = None
@@ -871,6 +879,10 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                 visual_features, text_dict, batch_data_samples)
             losses = self.bbox_head.loss(
                 **head_inputs_dict, batch_data_samples=batch_data_samples)
+            if self.nearest_etf_loss_weight > 0:
+                losses['loss_nearest_etf'] = (
+                    self.nearest_etf_loss_weight
+                    * nearest_etf_loss(head_inputs_dict['memory_text']))
             return losses
 
         if 'tokens_positive' in batch_data_samples[0]:

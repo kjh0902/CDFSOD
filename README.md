@@ -80,6 +80,90 @@ python -m unittest discover -s tests -p test_qwen_offline_sanity.py -v
 mock Qwen으로 crop·JSON 경로를 검사한다. 기준 ACL commit과 핵심 메서드 및 hook/decoder/head,
 18개 config의 텍스트 옵션 외 설정이 동일한지도 확인한다. 전체 detector/GPU 학습 검증은 별도다.
 
+## Nearest Simplex ETF auxiliary loss
+
+`acl-nearest-etf-loss`는 `codex/acl-pooled-prototypes-through-fe`의 mean-pooled
+BERT class prototype과 전체 Feature Enhancer 경로를 유지한다. 실제 연결 위치는
+`grounding_dino_HED.py`의 다음 경로다.
+
+```text
+build_prototype_text_dict: class-name token 평균 → text_feat_map → [B,C,D]
+forward_encoder: 모든 fusion/text/visual enhancer layer → 최종 memory_text
+pre_decoder / forward_transformer:
+  ├─ encoder classification → Language-guided Query Selection
+  ├─ decoder → head classification → 기존 detection losses
+  └─ head_inputs_dict['memory_text'] → detector.loss → loss_nearest_etf
+```
+
+ETF는 보조 loss의 target으로만 사용한다. 최종 `memory_text`를 교체하거나 수정하지
+않으며, Feature Enhancer/decoder/head 및 기존 detection loss 계산은 유지한다.
+각 이미지의 전체 C개 class prototype에 적용하며 GT에 등장한 class만 고르지 않는다.
+
+### 정확한 nearest-ETF 해
+
+공식 [ETF_distance.py](https://github.com/evanmarkou/Guiding-Neural-Collapse/blob/main/nc/ETF_distance.py)의
+목적함수와 [ddn_modules.py](https://github.com/evanmarkou/Guiding-Neural-Collapse/blob/main/nc/models/ddn_modules.py)의
+proximal 항을 제외한 목적함수는 `||Y - P H / sqrt(C-1)||_F²`이며,
+`H = I - 11ᵀ/C`, `PᵀP = I`이다. 이 제약 아래 target norm이 항상 1이므로
+교차항을 최대화하는 orthogonal Procrustes 문제로 정확히 풀 수 있다.
+
+샘플별 prototype `X`에 대해 class 평균을 빼고 전체 행렬을 정규화한다.
+`Z = (X - mean_classes(X)) / max(||X - mean_classes(X)||_F, 1e-6)`.
+개별 class vector는 L2 정규화하지 않는다.
+
+Helmert basis `Q`를 `QᵀQ = I`, `QQᵀ = H`가 되도록 구성하고,
+`ZᵀQ = UΣVᵀ`를 thin SVD로 분해하면 nearest target은
+`T = Q V Uᵀ / sqrt(C-1)`이다. 따라서 `TTᵀ = H/(C-1)`이고 `||T||_F = 1`이다.
+이 식은 `D >= C`에서 공식 Stiefel 표현과 같은 target 집합을 가지며,
+redundant null direction을 제거하여 simplex의 최소 차원 `D = C-1`도 지원한다.
+고정된 canonical ETF 방향을 target으로 사용하지 않는다.
+
+```python
+loss_nearest_etf = nearest_etf_loss_weight * (
+    (normalized_prototypes - detached_nearest_target).square()
+    .sum(dim=(-2, -1)).mean()
+)
+```
+
+원소별 평균이 아닌 샘플별 squared Frobenius distance의 batch 평균이다.
+SVD와 target 구성 전체는 `torch.no_grad()` 안에서 실행한다. Gradient는
+중심화·정규화를 거쳐 원래 prototype 및 연결된 BERT/projection/enhancer 경로로만
+전달되며, target solve를 통과하지 않는다. Pymanopt, proximal 항, DDN,
+implicit differentiation, 이전 step의 target cache는 도입하지 않는다.
+
+FP16/BF16 입력은 autocast를 끄고 FP32로 계산하며 FP64 입력은 유지한다.
+`C < 2` 또는 `D < C-1`은 오류다. Rank 부족 시 SVD가 유효한 최적해 하나를
+선택한다. 모든 prototype이 같으면 정규화 분모를 epsilon으로 clamp하고
+`Z=0`, loss=1인 유한한 확장으로 처리한다. `C=2`의 서로 다른 두 prototype은
+중심화·정규화 후 이미 simplex이므로 보조 loss가 0이다.
+
+### 실험 설정과 검증
+
+Detector 기본값은 `nearest_etf_loss_weight=0.0`이고, 18개 finetune config는
+모두 `0.1`로 활성화한다. 가중치가 0이거나 prototype 모드가 꺼져 있으면
+ETF 계산과 loss key를 생략한다. 추론은 가중치와 무관하게 ETF를 계산하지 않는다.
+학습 파라미터나 checkpoint state는 추가되지 않는다.
+
+```bash
+# 가중치 조정
+python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
+  --cfg-options model.nearest_etf_loss_weight=0.05
+# ETF만 비활성화하여 pooled-prototype 기준 실험 재현
+python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
+  --cfg-options model.nearest_etf_loss_weight=0.0
+
+# CPU 수치/회귀/단일-rank Gloo DDP 검사 (PyTorch, Pillow)
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+테스트는 ETF Gram 조건, 해석적 최솟값, 회전된 ETF, translation/scale/rotation
+불변성, batch 평균, detached target, gradient, 저정밀·퇴화 입력을 검사한다.
+실제 detector 메서드와 enhancer loop/fusion에 가벼운 BERT/attention 대역을 연결해
+ETF 단독 gradient와 기존 `memory_text` 전달·classification 출력 보존을 확인한다.
+기존 serial decoder 회귀 검사와 checkpoint 사용/미사용 CPU DDP도 포함한다.
+CUDA autocast 검사는 CUDA가 있을 때만 실행되며, 이 경량 검증은 전체 MMDetection
+GPU 학습이나 정확도 실험을 대신하지 않는다.
+
 ## 지원 환경
 
 | 항목 | 고정값 |

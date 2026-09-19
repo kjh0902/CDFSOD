@@ -8,6 +8,7 @@ import ast
 import copy
 import importlib.util
 import json
+import math
 import re
 import subprocess
 import sys
@@ -27,6 +28,12 @@ DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
 
 
+etf_spec = importlib.util.spec_from_file_location(
+    'nearest_etf_loss', ROOT / 'mmdet/models/losses/nearest_etf_loss.py')
+etf = importlib.util.module_from_spec(etf_spec)
+etf_spec.loader.exec_module(etf)
+
+
 def load_detector():
     tree = ast.parse((ROOT / DETECTOR).read_text(encoding='utf-8'))
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
@@ -36,7 +43,8 @@ def load_detector():
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0)] + nodes, type_ignores=[])
     env = dict(torch=torch, nn=nn, Module=nn.Module, re=re, json=json,
-               defaultdict=defaultdict, copy=copy)
+               defaultdict=defaultdict, copy=copy, math=math,
+               nearest_etf_loss=etf.nearest_etf_loss)
     exec(compile(ast.fix_missing_locations(module), DETECTOR, 'exec'), env)
     return env[cls.name]
 
@@ -141,6 +149,7 @@ class QwenSanity(unittest.TestCase):
         model = Detector.__new__(Detector)
         nn.Module.__init__(model)
         model.use_class_name_token_prototypes = True
+        model.nearest_etf_loss_weight = 0.0
         model.use_autocast = False
         model.support_caption_file = str(self.path)
         model.support_class_names = names if names is not None else ['pitted_surface', 'other']
@@ -422,8 +431,12 @@ class QwenSanity(unittest.TestCase):
             tree = ast.parse(text)
             model = next(n.value for n in tree.body if isinstance(n, ast.Assign)
                          and any(isinstance(t, ast.Name) and t.id == 'model' for t in n.targets))
+            etf_weight = next(k.value for k in model.keywords
+                              if k.arg == 'nearest_etf_loss_weight')
+            self.assertEqual(ast.literal_eval(etf_weight), 0.1)
             model.keywords = [k for k in model.keywords if k.arg not in {
-                'support_caption_file', 'support_class_names', 'use_class_name_token_prototypes'}]
+                'support_caption_file', 'support_class_names', 'use_class_name_token_prototypes',
+                'nearest_etf_loss_weight'}]
             self.assertEqual(ast.dump(tree), ast.dump(ast.parse(git_file(path.relative_to(ROOT).as_posix()))))
 
 

@@ -45,7 +45,8 @@ class PrototypeLoss(nn.Module):
             level_start_index=torch.tensor([0]), valid_ratios=torch.ones(2, 1, 2),
             text_dict=text)
         scores = output['memory'] @ output['memory_text'].transpose(1, 2)
-        return scores.square().mean()
+        return scores.square().mean() + 0.1 * sanity.etf.nearest_etf_loss(
+            output['memory_text'])
 
 
 @unittest.skipUnless(torch.distributed.is_available() and
@@ -60,7 +61,10 @@ class PrototypeDDPTests(unittest.TestCase):
         for use_checkpoint in (False, True):
             with self.subTest(checkpoint=use_checkpoint):
                 torch.manual_seed(7)
-                model = self.fixture.model()
+                model = self.fixture.model(
+                    entries={'pitted_surface': 'small uneven holes',
+                             'other': 'dark round shape', 'beetles': 'shiny wings'},
+                    names=['pitted_surface', 'other', 'beetles'])
                 model.encoder = sanity.recording_encoder()
                 model.encoder.fusion_layers = nn.ModuleList([fusion_layer() for _ in range(6)])
                 self.assertTrue(all(p.requires_grad for p in model.parameters()))

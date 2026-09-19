@@ -25,6 +25,7 @@ model = dict(
     type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
     rand_dnquery_rate=0.5,
     use_class_name_token_prototypes=True,
+    nearest_etf_loss_weight=0.1,
     support_class_names=class_names,
     support_caption_file=f'{data_root}/annotations/5_shot_captions.json',
     bbox_head=dict(
