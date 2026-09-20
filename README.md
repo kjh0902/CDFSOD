@@ -2,8 +2,69 @@
 
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스만
-정리했다.
+설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
+제공하며, 이 브랜치는 아래의 Second-Order Simplex ETF auxiliary loss를 추가한다.
+
+## Second-Order Simplex ETF auxiliary loss
+
+`grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
+LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
+`forward_encoder()`가 전체 Feature Enhancer를 통과한 뒤 반환하는 최종 `memory_text`를
+auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 사용하지 않는다.
+
+계산 순서는 다음과 같다 (`eps=1e-6`).
+
+```text
+전체 dataset class prompt → 기존 tokens_positive / get_positive_map
+→ 최종 memory_text에서 class-name token 선택
+→ 각 token t / (||t||₂ + eps)
+→ class별 T̂ᵀT̂ / token 수 = M_c [D,D]
+→ flatten 및 stack [B,C,D²]
+→ class dimension centering
+→ sample별 전체 [C,D²] matrix Frobenius normalization (norm.clamp_min(eps))
+→ sample별 nearest Simplex ETF target (Helmert basis + reduced Procrustes SVD)
+→ squared Frobenius distance → batch mean
+```
+
+token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하지 않으며, 각 `M_c`를
+개별 L2/Frobenius normalize하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
+연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
+계산은 FP32로 수행하며 FP64 입력은 보존한다.
+
+전체 class prompt는 기존 `CocoDataset(return_classes=True)`의 `metainfo.classes`에서
+온다. GT label로 span을 선택하기 전 전체 class mapping을 보관하므로 NEU-DET은 GT가
+일부이거나 비어 있어도 항상 6개 class를 사용한다. 명시적 `tokens_positive` 역시 모든
+class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
+class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 token은 오류로
+처리한다. `C >= 2`, `D² >= C-1`이 필요하다.
+
+원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
+contrastive classification으로 전달된다. GT positive map, classification target,
+HED, inference 경로 및 checkpoint parameter key는 유지된다.
+
+18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
+
+```python
+second_order_etf_loss_weight=0.1
+```
+
+loss key는 `loss_second_order_etf`이며, 로그 값에는 weight가 이미 반영된다.
+옵션을 생략한 모델 생성자의 기본값은 `0.0`이다. config에서 `0.0`으로 설정하면
+auxiliary mapping 생성 및 ETF 계산을 생략한다. `tools/train.py` 실행 시에도
+`--cfg-options model.second_order_etf_loss_weight=0.0`으로 비활성화하거나 weight를
+변경할 수 있다. 공통 pretraining config에는 이 옵션을 추가하지 않았다.
+
+CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있다.
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+회귀 테스트는 실제 prompt mapping, detector 메서드, encoder loop, HED head forward를
+사용하고 무거운 dependency는 작은 test double로 대체한다. 기준 ACL commit은
+`8926970ebff1a549088b0a4c87c272e1a70fe0dd`이다. 동일 난수 상태에서 base 및 loss
+활성화/비활성화의 detection 출력·positive map·HED 입력을 비교한다. CUDA 테스트는
+CUDA가 없으면 skip한다. 이 테스트는 실제 MMCV/CUDA 학습이나 mAP 평가를 대체하지 않는다.
 
 ## 지원 환경
 
