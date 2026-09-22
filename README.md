@@ -3,40 +3,40 @@
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
 설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Second-Order Simplex ETF auxiliary loss를 추가한다.
+제공하며, 이 브랜치는 아래의 GT-aware negative-only class separation loss를 추가한다.
 
-## Second-Order Simplex ETF auxiliary loss
+## GT-aware negative-only class separation loss
 
-`grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
-LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
-`forward_encoder()`가 전체 Feature Enhancer를 통과한 뒤 반환하는 최종 `memory_text`를
-auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 사용하지 않는다.
+기존 ACL/HED detection 구조와 detection loss를 유지한다. `forward_encoder()`가
+전체 Feature Enhancer를 통과한 뒤 반환하는 최종 token-level `memory_text`에서
+class-name token만 읽어 auxiliary loss를 계산한다.
 
-계산 순서는 다음과 같다 (`eps=1e-6`).
+Class g, j의 similarity는 모든 token pair의 **raw dot product 평균**이다.
+Class별 token 수가 달라도 동일하게 동작하며, 다음 등가식으로 계산한다.
 
 ```text
-전체 dataset class prompt → 기존 tokens_positive / get_positive_map
-→ 최종 memory_text에서 class-name token 선택
-→ 각 token t / (||t||₂ + eps)
-→ class별 T̂ᵀT̂ / token 수 = M_c [D,D]
-→ flatten 및 stack [B,C,D²]
-→ class dimension centering
-→ sample별 전체 [C,D²] matrix Frobenius normalization (norm.clamp_min(eps))
-→ sample별 nearest Simplex ETF target (Helmert basis + reduced Procrustes SVD)
-→ squared Frobenius distance → batch mean
+mu_g = mean_a(t_g,a)
+s(g,j) = mean_a,b(t_g,a dot t_j,b) = mu_g dot mu_j
+L_sep(image) = mean_{g in unique GT} log(1 + sum_{j != g} exp(s(g,j) / temperature))
+L_sep = mean_image L_sep(image)
+L_total = L_detection + lambda_sep * L_sep
 ```
 
-token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하지 않으며, 각 `M_c`를
-개별 L2/Frobenius normalize하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
-연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
-계산은 FP32로 수행하며 FP64 입력은 보존한다.
+현재 이미지의 unique GT class만 anchor로 사용하며, dataset의 나머지 모든 class를
+negative로 사용한다. 같은 이미지에 등장하는 다른 GT class도 negative다. GT object가
+중복되어도 anchor 가중치는 증가하지 않는다. GT가 없는 이미지는 미분 가능한 0을
+반환하고 전체 batch 평균에 포함한다. 단일-class 입력도 negative가 없으므로 0이다.
+
+Token/class normalization, second-order representation, centering 및 target solve는
+사용하지 않는다. `logsumexp([0, negative logits...])`로 수식을 안정적으로 계산하며,
+auxiliary 연산은 autocast를 끈 FP32로 수행하고 FP64 입력은 유지한다. Gradient는
+anchor와 negative의 class-name token을 통해 Feature Enhancer로 전달된다.
 
 전체 class prompt는 기존 `CocoDataset(return_classes=True)`의 `metainfo.classes`에서
-온다. GT label로 span을 선택하기 전 전체 class mapping을 보관하므로 NEU-DET은 GT가
-일부이거나 비어 있어도 항상 6개 class를 사용한다. 명시적 `tokens_positive` 역시 모든
-class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
-class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 token은 오류로
-처리한다. `C >= 2`, `D² >= C-1`이 필요하다.
+온다. GT label로 span을 선택하기 전에 전체 class mapping을 보관한다. 명시적
+`tokens_positive`도 모든 class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
+기존 mapping의 class key는 1..C이고 GT label은 0..C-1이다. Class 누락, 빈 token,
+prompt truncation, padding/범위 밖 token, 잘못된 GT label은 오류로 처리한다.
 
 원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
 contrastive classification으로 전달된다. GT positive map, classification target,
@@ -45,14 +45,21 @@ HED, inference 경로 및 checkpoint parameter key는 유지된다.
 18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
 
 ```python
-second_order_etf_loss_weight=0.1
+lambda_sep=0.1,
+temperature=1.0,
 ```
 
-loss key는 `loss_second_order_etf`이며, 로그 값에는 weight가 이미 반영된다.
-옵션을 생략한 모델 생성자의 기본값은 `0.0`이다. config에서 `0.0`으로 설정하면
-auxiliary mapping 생성 및 ETF 계산을 생략한다. `tools/train.py` 실행 시에도
-`--cfg-options model.second_order_etf_loss_weight=0.0`으로 비활성화하거나 weight를
-변경할 수 있다. 공통 pretraining config에는 이 옵션을 추가하지 않았다.
+`lambda_sep`는 유한한 비음수, `temperature`는 유한한 양수여야 한다. Loss key는
+`loss_class_separation`이며 로그 값에는 `lambda_sep`가 이미 반영된다. 모델 생성자의
+기본값은 `lambda_sep=0.0`, `temperature=1.0`이다. `lambda_sep=0.0`이면 auxiliary
+mapping 생성과 loss 계산을 생략하며, inference에서도 실행하지 않는다. 예를 들어:
+
+```bash
+python tools/train.py CONFIG --cfg-options model.lambda_sep=0.1 model.temperature=1.0
+```
+
+공통 pretraining config에는 이 옵션을 추가하지 않았다. Raw dot product이므로 loss
+크기는 feature magnitude와 temperature에 의존하며, 위 설정은 실험 시작값이다.
 
 CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있다.
 

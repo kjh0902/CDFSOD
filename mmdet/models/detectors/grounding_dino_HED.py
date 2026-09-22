@@ -14,7 +14,7 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.second_order_etf_loss import second_order_etf_loss
+from ..losses.class_separation_loss import class_separation_loss
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerDecoder_parallel_15_DNQueryRand, GroundingDinoTransformerEncoder)
 from .dino import DINO
@@ -60,14 +60,18 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 second_order_etf_loss_weight=0.0,
+                 lambda_sep=0.0,
+                 temperature=1.0,
                  **kwargs) -> None:
 
-        if (not math.isfinite(second_order_etf_loss_weight)
-                or second_order_etf_loss_weight < 0):
+        if not math.isfinite(lambda_sep) or lambda_sep < 0:
             raise ValueError(
-                'second_order_etf_loss_weight must be finite and nonnegative.')
-        self.second_order_etf_loss_weight = float(second_order_etf_loss_weight)
+                'lambda_sep must be finite and nonnegative.')
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError(
+                'temperature must be finite and positive.')
+        self.lambda_sep = float(lambda_sep)
+        self.temperature = float(temperature)
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -664,18 +668,18 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             data_sample.pred_instances = pred_instances
         return batch_data_samples
 
-    def _get_second_order_class_token_map(self, tokenized, tokens_positive):
+    def _get_class_token_map(self, tokenized, tokens_positive):
         """Reuse ACL's mapping for all classes, before selecting GT labels."""
         classes = self.bbox_head.num_classes
         if isinstance(tokens_positive, dict):
             if set(tokens_positive) != set(range(classes)):
                 raise ValueError(
-                    'Second-order ETF requires all dataset class IDs 0..C-1.')
+                    'Class separation requires all dataset class IDs 0..C-1.')
             tokens_positive = [tokens_positive[c] for c in range(classes)]
         if (not isinstance(tokens_positive, (list, tuple))
-                or len(tokens_positive) != classes or classes < 2):
+                or len(tokens_positive) != classes or classes < 1):
             raise ValueError(
-                'Second-order ETF requires spans for every dataset class (C >= 2).')
+                'Class separation requires spans for every dataset class (C >= 1).')
         # Mapping tokenization is untruncated; BERT tokenization is truncated.
         # Reject long prompts before create_positive_map can clip class spans.
         max_length = min(
@@ -683,11 +687,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len)
         if tokenized['attention_mask'].sum(-1).max().item() > max_length:
             raise ValueError(
-                'Second-order ETF requires a complete, untruncated all-class prompt.')
+                'Class separation requires a complete, untruncated all-class prompt.')
         mapping, _ = self.get_positive_map(tokenized, tokens_positive)
         if any(not indices for indices in mapping.values()):
             raise ValueError(
-                'Second-order ETF found a dataset class without class-name tokens.')
+                'Class separation found a dataset class without class-name tokens.')
         return mapping
 
     def loss(self, batch_inputs: Tensor,
@@ -701,7 +705,17 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.second_order_etf_loss_weight > 0 else None
+        class_token_maps = [] if self.lambda_sep > 0 else None
+        if class_token_maps is not None:
+            # Validate before GT labels are used to index detection spans.
+            for labels in gt_labels:
+                if (labels.ndim != 1
+                        or labels.dtype not in (torch.uint8, torch.int8,
+                                                torch.int16, torch.int32,
+                                                torch.int64)
+                        or ((labels < 0) | (labels >= self.bbox_head.num_classes)).any()):
+                    raise ValueError(
+                        'Class separation requires 1D integer GT labels in 0..C-1.')
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -718,7 +732,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     return_tensors='pt')
                 if class_token_maps is not None:
                     class_token_maps.append(
-                        self._get_second_order_class_token_map(
+                        self._get_class_token_map(
                             tokenized, token_positive))
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
@@ -738,7 +752,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
                 if class_token_maps is not None:
-                    mapping = self._get_second_order_class_token_map(
+                    mapping = self._get_class_token_map(
                         tokenized, tokens_positive)
                     class_token_maps.extend([mapping] * len(batch_inputs))
                 for gt_label in gt_labels:
@@ -755,7 +769,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                             text_prompt, True)
                     if class_token_maps is not None:
                         class_token_maps.append(
-                            self._get_second_order_class_token_map(
+                            self._get_class_token_map(
                                 tokenized, tokens_positive))
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -788,10 +802,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         if class_token_maps is not None:
-            auxiliary_loss = second_order_etf_loss(
+            auxiliary_loss = class_separation_loss(
                 head_inputs_dict['memory_text'], class_token_maps,
-                head_inputs_dict['text_token_mask'])
-            losses['loss_second_order_etf'] = (
-                self.second_order_etf_loss_weight * auxiliary_loss)
+                head_inputs_dict['text_token_mask'], gt_labels, self.temperature)
+            losses['loss_class_separation'] = (
+                self.lambda_sep * auxiliary_loss)
         return losses
-

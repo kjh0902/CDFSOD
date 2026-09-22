@@ -18,7 +18,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from test_second_order_etf_loss import ROOT, second
+from test_class_separation_loss import ROOT, separation
 
 BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
@@ -37,7 +37,7 @@ def source(path, base=False):
 def execute(nodes, **extra):
     env = dict(torch=torch, nn=nn, math=math, copy=copy, re=re,
                random=random, warnings=warnings,
-               second_order_etf_loss=second.second_order_etf_loss)
+               class_separation_loss=separation.class_separation_loss)
     env.update(extra)
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0)] + nodes, type_ignores=[])
@@ -218,7 +218,7 @@ def fixture(base=False, weight=0.1):
     cls = BaseDetector if base else Detector
     model = cls(language_model={})
     if not base:
-        model.second_order_etf_loss_weight = weight
+        model.lambda_sep = weight
     model.language_model = Language()
     model.text_feat_map = nn.Linear(4, 4)
     model.encoder = Encoder()
@@ -259,7 +259,7 @@ def run(model, data):
     return losses, snapshot
 
 
-class SecondOrderIntegrationTests(unittest.TestCase):
+class ClassSeparationIntegrationTests(unittest.TestCase):
     def assert_nested_equal(self, a, b):
         if isinstance(a, torch.Tensor):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
@@ -285,12 +285,13 @@ class SecondOrderIntegrationTests(unittest.TestCase):
             self.assertEqual(base.state_dict().keys(), model.state_dict().keys())
             if weight:
                 actual['losses'] = dict(losses)
-                auxiliary = actual['losses'].pop('loss_second_order_etf')
+                auxiliary = actual['losses'].pop('loss_class_separation')
                 tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
-                mapping = model._get_second_order_class_token_map(tokenized, spans)
+                mapping = model._get_class_token_map(tokenized, spans)
                 final = model.encoder.text_layers[-1].output
-                torch.testing.assert_close(auxiliary, weight * second.second_order_etf_loss(
-                    final, [mapping] * 2, model.bbox_head.seen['text_token_mask']))
+                torch.testing.assert_close(auxiliary, weight * separation.class_separation_loss(
+                    final, [mapping] * 2, model.bbox_head.seen['text_token_mask'],
+                    [sample.gt_instances.labels for sample in samples()], model.temperature))
                 for value in [model.decoder.seen['memory_text'], model.bbox_head.seen['memory_text'],
                               *[branch.seen for branch in model.bbox_head.cls_branches]]:
                     self.assertIs(value, final)
@@ -301,12 +302,13 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         losses, _ = run(model, samples())
         final = model.encoder.text_layers[-1].output
         final.retain_grad()
-        losses['loss_second_order_etf'].backward()
+        losses['loss_class_separation'].backward()
         tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
-        mapping = model._get_second_order_class_token_map(tokenized, spans)
+        mapping = model._get_class_token_map(tokenized, spans)
         self.assertEqual(len(mapping), 6)
         for indices in mapping.values():
-            self.assertTrue((final.grad[:, indices].norm(dim=-1) > 0).all())
+            self.assertTrue((final.grad[0, indices].norm(dim=-1) > 0).all())
+        torch.testing.assert_close(final.grad[1], torch.zeros_like(final.grad[1]))
         for p in [model.encoder.text_layers[-1].attn.in_proj_weight,
                   model.encoder.fusion_layers[-1].projection.weight,
                   model.text_feat_map.weight, model.language_model.embedding.weight]:
@@ -320,7 +322,9 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for mode in ['shared', 'different', 'explicit_list', 'explicit_dict']:
             with self.subTest(mode=mode):
                 model = fixture()
+                model.temperature = 0.7
                 data = samples()
+                data[1].gt_instances.labels = torch.tensor([1, 1, 4])
                 if mode == 'different':
                     data[1].text = NAMES[::-1]
                 if mode.startswith('explicit'):
@@ -328,11 +332,11 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                     for sample in data:
                         sample.text = caption
                         sample.tokens_positive = (dict(enumerate(spans)) if mode.endswith('dict') else spans)
-                with patch.object(model, '_get_second_order_class_token_map',
-                                  wraps=model._get_second_order_class_token_map) as mapping:
+                with patch.object(model, '_get_class_token_map',
+                                  wraps=model._get_class_token_map) as mapping:
                     losses, _ = run(model, data)
                 self.assertEqual(mapping.call_count, 1 if mode == 'shared' else 2)
-                self.assertTrue(torch.isfinite(losses['loss_second_order_etf']))
+                self.assertTrue(torch.isfinite(losses['loss_class_separation']))
                 final = model.bbox_head.seen['memory_text']
                 _, caption, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 first = model.get_positive_map(model.language_model.tokenizer([caption]), spans)[0]
@@ -341,19 +345,41 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                     last = model.get_positive_map(tok, spans)[0]
                 else:
                     last = first
-                torch.testing.assert_close(losses['loss_second_order_etf'],
-                    0.1 * second.second_order_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
+                torch.testing.assert_close(losses['loss_class_separation'],
+                    0.1 * separation.class_separation_loss(final, [first, last], model.bbox_head.seen['text_token_mask'],
+                    [sample.gt_instances.labels for sample in data], model.temperature))
 
-    def test_disabled_and_inference_never_build_auxiliary_mapping_or_solve(self):
+    def test_disabled_and_inference_never_build_auxiliary_mapping_or_loss(self):
         model = fixture(weight=0.)
-        with patch.object(model, '_get_second_order_class_token_map', side_effect=AssertionError), \
-                patch.dict(Detector.loss.__globals__, second_order_etf_loss=lambda *a: self.fail('ETF called')):
+        with patch.object(model, '_get_class_token_map', side_effect=AssertionError), \
+                patch.dict(Detector.loss.__globals__, class_separation_loss=lambda *a: self.fail('Separation called')):
             losses, _ = run(model, samples())
-            self.assertNotIn('loss_second_order_etf', losses)
-            model.second_order_etf_loss_weight = 0.1
+            self.assertNotIn('loss_class_separation', losses)
+            model.lambda_sep = 0.1
             model.eval()
             result = model.predict(torch.zeros(2, 3, 4, 4), samples())
             self.assertEqual(result[0].pred_instances.label_names, ['crazing'])
+
+    def test_invalid_gt_rejected_before_detection_span_indexing(self):
+        model = fixture()
+        for invalid in [torch.tensor([-1]), torch.tensor([6]), torch.tensor([1.5]),
+                        torch.tensor([[0]]), torch.tensor([True])]:
+            data = samples()
+            data[0].gt_instances.labels = invalid
+            with self.assertRaisesRegex(ValueError, 'GT labels'):
+                run(model, data)
+
+    def test_all_empty_gt_batch_has_zero_auxiliary_loss_and_gradient(self):
+        model = fixture()
+        data = samples()
+        for sample in data:
+            sample.gt_instances.labels = torch.empty(0, dtype=torch.long)
+        losses, _ = run(model, data)
+        final = model.bbox_head.seen['memory_text']
+        final.retain_grad()
+        self.assertEqual(losses['loss_class_separation'].item(), 0.)
+        losses['loss_class_separation'].backward()
+        torch.testing.assert_close(final.grad, torch.zeros_like(final))
 
     def test_missing_classes_truncation_empty_spans_and_padding(self):
         model = fixture()
@@ -361,27 +387,31 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for invalid in [spans[:2], {0: spans[0], 5: spans[5]},
                         [[], *spans[1:]], -1]:
             with self.assertRaises(ValueError):
-                model._get_second_order_class_token_map(tokenized, invalid)
+                model._get_class_token_map(tokenized, invalid)
         model.language_model.max_tokens = 5
         with self.assertRaisesRegex(ValueError, 'untruncated'):
-            model._get_second_order_class_token_map(tokenized, spans)
+            model._get_class_token_map(tokenized, spans)
         model.language_model.max_tokens = 64
         model.language_model.pad_to_max = True
         losses, _ = run(model, samples())
-        self.assertTrue(torch.isfinite(losses['loss_second_order_etf']))
+        self.assertTrue(torch.isfinite(losses['loss_class_separation']))
 
     def test_constructor_weight_validation(self):
-        self.assertEqual(Detector(language_model={}).second_order_etf_loss_weight, 0.)
+        self.assertEqual(Detector(language_model={}).lambda_sep, 0.)
+        self.assertEqual(Detector(language_model={}).temperature, 1.)
+        for temperature in [0, -1, float('nan'), float('inf')]:
+            with self.assertRaises(ValueError):
+                Detector(language_model={}, temperature=temperature)
         for weight in [-1, float('nan'), float('inf')]:
             with self.assertRaises(ValueError):
-                Detector(language_model={}, second_order_etf_loss_weight=weight)
+                Detector(language_model={}, lambda_sep=weight)
 
     def test_architecture_and_all_configs_preserve_base(self):
         def methods(text):
             cls = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef))
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
-        self.assertEqual(after.keys() - before.keys(), {'_get_second_order_class_token_map'})
+        self.assertEqual(after.keys() - before.keys(), {'_get_class_token_map'})
         for name in before.keys() - {'__init__', 'loss'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         for path in [HEAD, LAYERS, 'mmdet/models/detectors/grounding_dino.py',
@@ -392,8 +422,9 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for path in configs:
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
-            self.assertEqual(new.count('second_order_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new.replace('    second_order_etf_loss_weight=0.1,\n', ''), source(rel, True))
+            self.assertEqual(new.count('lambda_sep=0.1,'), 1)
+            self.assertEqual(new.count('temperature=1.0,'), 1)
+            self.assertEqual(new.replace('    lambda_sep=0.1,\n    temperature=1.0,\n', ''), source(rel, True))
 
 
 if __name__ == '__main__':
