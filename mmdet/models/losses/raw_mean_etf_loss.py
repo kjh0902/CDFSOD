@@ -1,4 +1,4 @@
-"""Second-order class geometry from final, token-level enhancer features."""
+"""Raw mean class prototypes from final, token-level enhancer features."""
 import math
 from numbers import Integral
 
@@ -8,10 +8,10 @@ from torch import Tensor
 from .nearest_etf_loss import nearest_etf_loss
 
 
-def _second_order_representations(memory_text: Tensor, class_token_maps,
-                                  text_token_mask: Tensor,
-                                  eps: float = 1e-6) -> Tensor:
-    """Build [B,C,D*D], without normalizing individual class matrices.
+def _raw_mean_prototypes(memory_text: Tensor, class_token_maps,
+                         text_token_mask: Tensor,
+                         eps: float = 1e-6) -> Tensor:
+    """Build [B,C,D] raw token means without token or class normalization.
 
     Maps use the existing get_positive_map convention: class keys 1..C and
     zero-based token indices. Each map must contain every dataset class.
@@ -32,8 +32,8 @@ def _second_order_representations(memory_text: Tensor, class_token_maps,
     if len(class_token_maps) != batch:
         raise ValueError('Expected one complete class-token map per sample.')
     classes = len(class_token_maps[0])
-    if classes < 2 or dimensions * dimensions < classes - 1:
-        raise ValueError('Second-order ETF requires C >= 2 and D*D >= C - 1.')
+    if classes < 2 or dimensions < classes - 1:
+        raise ValueError('Raw mean ETF requires C >= 2 and D >= C - 1.')
 
     with torch.autocast(device_type=memory_text.device.type, enabled=False):
         features = (memory_text if memory_text.dtype == torch.float64
@@ -44,7 +44,7 @@ def _second_order_representations(memory_text: Tensor, class_token_maps,
                     or set(mapping) != set(range(1, classes + 1))):
                 raise ValueError(
                     'Every sample must map the same complete class IDs 1..C.')
-            matrices = []
+            prototypes = []
             for c in range(1, classes + 1):
                 indices = mapping[c]
                 if (not indices
@@ -58,24 +58,20 @@ def _second_order_representations(memory_text: Tensor, class_token_maps,
                     raise ValueError(
                         f'Sample {b}, class {c}: class tokens point to padding.')
                 tokens = features[b, indices]
-                tokens = tokens / (
-                    torch.linalg.vector_norm(tokens, dim=-1, keepdim=True) + eps)
-                # Equivalent to mean_i(t_i outer t_i), NOT outer(mean_i(t_i)).
-                matrix = tokens.transpose(0, 1) @ tokens / len(indices)
-                matrices.append(matrix.flatten())
-            samples.append(torch.stack(matrices))
+                prototypes.append(tokens.mean(dim=0))
+            samples.append(torch.stack(prototypes))
         return torch.stack(samples)
 
 
-def second_order_etf_loss(memory_text: Tensor, class_token_maps,
-                          text_token_mask: Tensor,
-                          eps: float = 1e-6) -> Tensor:
+def raw_mean_etf_loss(memory_text: Tensor, class_token_maps,
+                      text_token_mask: Tensor,
+                      eps: float = 1e-6) -> Tensor:
     """Mean independent per-image ETF distance, with a detached SVD target.
 
-    Token normalization, outer products, class means, class centering and
-    whole-matrix Frobenius normalization all remain differentiable.
+    Raw token means, class centering and whole-matrix Frobenius normalization
+    remain differentiable. No token or individual class vector is normalized.
     The original memory_text and detection mappings are never modified.
     """
-    representations = _second_order_representations(
+    prototypes = _raw_mean_prototypes(
         memory_text, class_token_maps, text_token_mask, eps)
-    return nearest_etf_loss(representations, eps=eps)
+    return nearest_etf_loss(prototypes, eps=eps)

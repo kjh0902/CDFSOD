@@ -14,7 +14,7 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.second_order_etf_loss import second_order_etf_loss
+from ..losses.raw_mean_etf_loss import raw_mean_etf_loss
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerDecoder_parallel_15_DNQueryRand, GroundingDinoTransformerEncoder)
 from .dino import DINO
@@ -60,14 +60,14 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 second_order_etf_loss_weight=0.0,
+                 raw_mean_etf_loss_weight=0.0,
                  **kwargs) -> None:
 
-        if (not math.isfinite(second_order_etf_loss_weight)
-                or second_order_etf_loss_weight < 0):
+        if (not math.isfinite(raw_mean_etf_loss_weight)
+                or raw_mean_etf_loss_weight < 0):
             raise ValueError(
-                'second_order_etf_loss_weight must be finite and nonnegative.')
-        self.second_order_etf_loss_weight = float(second_order_etf_loss_weight)
+                'raw_mean_etf_loss_weight must be finite and nonnegative.')
+        self.raw_mean_etf_loss_weight = float(raw_mean_etf_loss_weight)
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -664,18 +664,18 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             data_sample.pred_instances = pred_instances
         return batch_data_samples
 
-    def _get_second_order_class_token_map(self, tokenized, tokens_positive):
+    def _get_raw_mean_class_token_map(self, tokenized, tokens_positive):
         """Reuse ACL's mapping for all classes, before selecting GT labels."""
         classes = self.bbox_head.num_classes
         if isinstance(tokens_positive, dict):
             if set(tokens_positive) != set(range(classes)):
                 raise ValueError(
-                    'Second-order ETF requires all dataset class IDs 0..C-1.')
+                    'Raw mean ETF requires all dataset class IDs 0..C-1.')
             tokens_positive = [tokens_positive[c] for c in range(classes)]
         if (not isinstance(tokens_positive, (list, tuple))
                 or len(tokens_positive) != classes or classes < 2):
             raise ValueError(
-                'Second-order ETF requires spans for every dataset class (C >= 2).')
+                'Raw mean ETF requires spans for every dataset class (C >= 2).')
         # Mapping tokenization is untruncated; BERT tokenization is truncated.
         # Reject long prompts before create_positive_map can clip class spans.
         max_length = min(
@@ -683,11 +683,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len)
         if tokenized['attention_mask'].sum(-1).max().item() > max_length:
             raise ValueError(
-                'Second-order ETF requires a complete, untruncated all-class prompt.')
+                'Raw mean ETF requires a complete, untruncated all-class prompt.')
         mapping, _ = self.get_positive_map(tokenized, tokens_positive)
         if any(not indices for indices in mapping.values()):
             raise ValueError(
-                'Second-order ETF found a dataset class without class-name tokens.')
+                'Raw mean ETF found a dataset class without class-name tokens.')
         return mapping
 
     def loss(self, batch_inputs: Tensor,
@@ -701,7 +701,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.second_order_etf_loss_weight > 0 else None
+        class_token_maps = [] if self.raw_mean_etf_loss_weight > 0 else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -718,7 +718,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     return_tensors='pt')
                 if class_token_maps is not None:
                     class_token_maps.append(
-                        self._get_second_order_class_token_map(
+                        self._get_raw_mean_class_token_map(
                             tokenized, token_positive))
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
@@ -738,7 +738,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
                 if class_token_maps is not None:
-                    mapping = self._get_second_order_class_token_map(
+                    mapping = self._get_raw_mean_class_token_map(
                         tokenized, tokens_positive)
                     class_token_maps.extend([mapping] * len(batch_inputs))
                 for gt_label in gt_labels:
@@ -755,7 +755,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                             text_prompt, True)
                     if class_token_maps is not None:
                         class_token_maps.append(
-                            self._get_second_order_class_token_map(
+                            self._get_raw_mean_class_token_map(
                                 tokenized, tokens_positive))
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -788,10 +788,10 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         if class_token_maps is not None:
-            auxiliary_loss = second_order_etf_loss(
+            auxiliary_loss = raw_mean_etf_loss(
                 head_inputs_dict['memory_text'], class_token_maps,
                 head_inputs_dict['text_token_mask'])
-            losses['loss_second_order_etf'] = (
-                self.second_order_etf_loss_weight * auxiliary_loss)
+            losses['loss_raw_mean_etf'] = (
+                self.raw_mean_etf_loss_weight * auxiliary_loss)
         return losses
 

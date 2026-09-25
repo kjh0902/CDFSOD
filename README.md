@@ -3,9 +3,9 @@
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
 설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Second-Order Simplex ETF auxiliary loss를 추가한다.
+제공하며, 이 브랜치는 아래의 Raw Mean Prototype + Nearest ETF auxiliary loss를 사용한다.
 
-## Second-Order Simplex ETF auxiliary loss
+## Raw Mean Prototype + Nearest ETF auxiliary loss
 
 `grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
 LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
@@ -17,17 +17,19 @@ auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 �
 ```text
 전체 dataset class prompt → 기존 tokens_positive / get_positive_map
 → 최종 memory_text에서 class-name token 선택
-→ 각 token t / (||t||₂ + eps)
-→ class별 T̂ᵀT̂ / token 수 = M_c [D,D]
-→ flatten 및 stack [B,C,D²]
+→ class별 raw token 평균 p_c = sum(t_i) / token 수 [D]
+→ 이미지별 prototype stack [B,C,D] (batch 평균 없음)
 → class dimension centering
-→ sample별 전체 [C,D²] matrix Frobenius normalization (norm.clamp_min(eps))
+→ sample별 전체 [C,D] matrix Frobenius normalization (norm.clamp_min(eps))
 → sample별 nearest Simplex ETF target (Helmert basis + reduced Procrustes SVD)
 → squared Frobenius distance → batch mean
 ```
 
-token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하지 않으며, 각 `M_c`를
-개별 L2/Frobenius normalize하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
+token 하나인 class도 동일하게 처리한다. token별 L2 normalization 없이 raw feature를
+평균하며, 평균 후 각 `p_c`도 L2 normalize하지 않는다. `[B,C,D]`를 기존
+`nearest_etf_loss()`에 그대로 전달한다. 해당 함수의 class centering, 전체 matrix
+Frobenius normalization, nearest simplex ETF 계산 및 scalar loss의 batch 평균은
+변경하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
 연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
 계산은 FP32로 수행하며 FP64 입력은 보존한다.
 
@@ -36,7 +38,7 @@ token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하
 일부이거나 비어 있어도 항상 6개 class를 사용한다. 명시적 `tokens_positive` 역시 모든
 class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
 class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 token은 오류로
-처리한다. `C >= 2`, `D² >= C-1`이 필요하다.
+처리한다. `C >= 2`, `D >= C-1`이 필요하다.
 
 원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
 contrastive classification으로 전달된다. GT positive map, classification target,
@@ -45,14 +47,19 @@ HED, inference 경로 및 checkpoint parameter key는 유지된다.
 18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
 
 ```python
-second_order_etf_loss_weight=0.1
+raw_mean_etf_loss_weight=0.1
 ```
 
-loss key는 `loss_second_order_etf`이며, 로그 값에는 weight가 이미 반영된다.
+loss key는 `loss_raw_mean_etf`이며, 로그 값에는 weight가 이미 반영된다.
 옵션을 생략한 모델 생성자의 기본값은 `0.0`이다. config에서 `0.0`으로 설정하면
 auxiliary mapping 생성 및 ETF 계산을 생략한다. `tools/train.py` 실행 시에도
-`--cfg-options model.second_order_etf_loss_weight=0.0`으로 비활성화하거나 weight를
+`--cfg-options model.raw_mean_etf_loss_weight=0.0`으로 비활성화하거나 weight를
 변경할 수 있다. 공통 pretraining config에는 이 옵션을 추가하지 않았다.
+
+이전 second-order 실험의 함수·설정·로그 이름은 raw mean 이름으로 교체했다.
+이전 이름의 호환 alias는 제공하지 않으므로 외부 실행 명령의 override도
+`model.raw_mean_etf_loss_weight`를 사용해야 한다. 모델 parameter와 checkpoint key는
+유지되며 새로운 loss나 regularization은 추가하지 않는다.
 
 CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있다.
 

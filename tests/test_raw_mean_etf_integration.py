@@ -18,7 +18,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from test_second_order_etf_loss import ROOT, second
+from test_raw_mean_etf_loss import ROOT, raw_mean
 
 BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
@@ -26,6 +26,7 @@ HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/grounding_dino_layers_HED.py'
 NAMES = ('crazing', 'inclusion', 'patches', 'pitted_surface',
          'rolled-in_scale', 'scratches')
+FEATURE_DIM = 8  # Must be >= num_classes - 1 for raw mean ETF.
 
 
 def source(path, base=False):
@@ -37,7 +38,7 @@ def source(path, base=False):
 def execute(nodes, **extra):
     env = dict(torch=torch, nn=nn, math=math, copy=copy, re=re,
                random=random, warnings=warnings,
-               second_order_etf_loss=second.second_order_etf_loss)
+               raw_mean_etf_loss=raw_mean.raw_mean_etf_loss)
     env.update(extra)
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0)] + nodes, type_ignores=[])
@@ -111,7 +112,7 @@ class Language(nn.Module):
     def __init__(self):
         super().__init__()
         self.tokenizer = Tokenizer()
-        self.embedding = nn.Embedding(128, 4)
+        self.embedding = nn.Embedding(128, FEATURE_DIM)
         self.pad_to_max = False
         self.max_tokens = 64
 
@@ -129,7 +130,7 @@ class Language(nn.Module):
 class Fusion(nn.Module):
     def __init__(self):
         super().__init__()
-        self.projection = nn.Linear(4, 4)
+        self.projection = nn.Linear(FEATURE_DIM, FEATURE_DIM)
 
     def forward(self, visual_feature, lang_feature, **kw):
         return (visual_feature + lang_feature.mean(1, keepdim=True) * 0.05,
@@ -140,7 +141,7 @@ class TextLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.self_attn_cfg = SimpleNamespace(num_heads=1)
-        self.attn = nn.MultiheadAttention(4, 1, batch_first=True)
+        self.attn = nn.MultiheadAttention(FEATURE_DIM, 1, batch_first=True)
 
     def forward(self, query, query_pos, attn_mask, **kw):
         self.output = query + self.attn(query + query_pos, query + query_pos,
@@ -155,7 +156,7 @@ class VisualLayer(nn.Module):
 
 class Encoder(nn.Module):
     forward = method(LAYERS, 'GroundingDinoTransformerEncoder', 'forward',
-                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, 4).float() * 0.01)
+                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, FEATURE_DIM).float() * 0.01)
     get_encoder_reference_points = staticmethod(lambda *a, **kw: None)
 
     def __init__(self):
@@ -192,7 +193,7 @@ class Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.cls_branches = nn.ModuleList([Classifier() for _ in range(7)])
-        self.reg_branches = nn.ModuleList([nn.Linear(4, 4) for _ in range(7)])
+        self.reg_branches = nn.ModuleList([nn.Linear(FEATURE_DIM, 4) for _ in range(7)])
 
     def loss(self, batch_data_samples, **kw):
         self.seen = kw
@@ -218,16 +219,16 @@ def fixture(base=False, weight=0.1):
     cls = BaseDetector if base else Detector
     model = cls(language_model={})
     if not base:
-        model.second_order_etf_loss_weight = weight
+        model.raw_mean_etf_loss_weight = weight
     model.language_model = Language()
-    model.text_feat_map = nn.Linear(4, 4)
+    model.text_feat_map = nn.Linear(FEATURE_DIM, FEATURE_DIM)
     model.encoder = Encoder()
     model.decoder = Decoder()
     model.bbox_head = Head()
-    model.query_embedding = nn.Embedding(3, 4)
+    model.query_embedding = nn.Embedding(3, FEATURE_DIM)
     model.num_queries = 3
     model.test_cfg = {}
-    features = torch.randn(2, 5, 4)
+    features = torch.randn(2, 5, FEATURE_DIM)
     model.extract_feat = lambda _: (features,)
     model.pre_transformer = lambda *a: (dict(
         feat=features, feat_mask=torch.zeros(2, 5, dtype=torch.bool),
@@ -236,8 +237,8 @@ def fixture(base=False, weight=0.1):
         dict(memory_mask=torch.zeros(2, 5, dtype=torch.bool),
              spatial_shapes=torch.tensor([[1, 5]]), level_start_index=torch.tensor([0]),
              valid_ratios=torch.ones(2, 1, 2)))
-    model.gen_encoder_output_proposals = lambda memory, *a: (memory, torch.zeros_like(memory))
-    model.dn_query_generator = lambda _: (torch.randn(2, 1, 4), torch.randn(2, 1, 4),
+    model.gen_encoder_output_proposals = lambda memory, *a: (memory, memory.new_zeros(*memory.shape[:2], 4))
+    model.dn_query_generator = lambda _: (torch.randn(2, 1, FEATURE_DIM), torch.randn(2, 1, 4),
                                            None, dict(num_denoising_queries=1))
     return model
 
@@ -259,7 +260,7 @@ def run(model, data):
     return losses, snapshot
 
 
-class SecondOrderIntegrationTests(unittest.TestCase):
+class RawMeanIntegrationTests(unittest.TestCase):
     def assert_nested_equal(self, a, b):
         if isinstance(a, torch.Tensor):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
@@ -285,25 +286,43 @@ class SecondOrderIntegrationTests(unittest.TestCase):
             self.assertEqual(base.state_dict().keys(), model.state_dict().keys())
             if weight:
                 actual['losses'] = dict(losses)
-                auxiliary = actual['losses'].pop('loss_second_order_etf')
+                auxiliary = actual['losses'].pop('loss_raw_mean_etf')
                 tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
-                mapping = model._get_second_order_class_token_map(tokenized, spans)
+                mapping = model._get_raw_mean_class_token_map(tokenized, spans)
                 final = model.encoder.text_layers[-1].output
-                torch.testing.assert_close(auxiliary, weight * second.second_order_etf_loss(
+                torch.testing.assert_close(auxiliary, weight * raw_mean.raw_mean_etf_loss(
                     final, [mapping] * 2, model.bbox_head.seen['text_token_mask']))
                 for value in [model.decoder.seen['memory_text'], model.bbox_head.seen['memory_text'],
                               *[branch.seen for branch in model.bbox_head.cls_branches]]:
                     self.assertIs(value, final)
             self.assert_nested_equal(actual, expected)
 
+    def test_nearest_etf_receives_raw_means_of_final_enhancer_output(self):
+        model = fixture()
+        with patch.object(raw_mean, 'nearest_etf_loss',
+                          wraps=raw_mean.nearest_etf_loss) as nearest:
+            losses, _ = run(model, samples())
+        nearest.assert_called_once()
+        tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
+        mapping = model._get_raw_mean_class_token_map(tokenized, spans)
+        final = model.encoder.text_layers[-1].output
+        expected = torch.stack([
+            torch.stack([row[mapping[c]].mean(0) for c in range(1, 7)])
+            for row in final])
+        actual = nearest.call_args.args[0]
+        self.assertEqual(actual.shape, (2, 6, FEATURE_DIM))
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(losses['loss_raw_mean_etf'],
+                                   0.1 * raw_mean.nearest_etf_loss(expected))
+
     def test_auxiliary_gradient_reaches_absent_classes_and_final_enhancer(self):
         model = fixture()
         losses, _ = run(model, samples())
         final = model.encoder.text_layers[-1].output
         final.retain_grad()
-        losses['loss_second_order_etf'].backward()
+        losses['loss_raw_mean_etf'].backward()
         tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
-        mapping = model._get_second_order_class_token_map(tokenized, spans)
+        mapping = model._get_raw_mean_class_token_map(tokenized, spans)
         self.assertEqual(len(mapping), 6)
         for indices in mapping.values():
             self.assertTrue((final.grad[:, indices].norm(dim=-1) > 0).all())
@@ -328,11 +347,11 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                     for sample in data:
                         sample.text = caption
                         sample.tokens_positive = (dict(enumerate(spans)) if mode.endswith('dict') else spans)
-                with patch.object(model, '_get_second_order_class_token_map',
-                                  wraps=model._get_second_order_class_token_map) as mapping:
+                with patch.object(model, '_get_raw_mean_class_token_map',
+                                  wraps=model._get_raw_mean_class_token_map) as mapping:
                     losses, _ = run(model, data)
                 self.assertEqual(mapping.call_count, 1 if mode == 'shared' else 2)
-                self.assertTrue(torch.isfinite(losses['loss_second_order_etf']))
+                self.assertTrue(torch.isfinite(losses['loss_raw_mean_etf']))
                 final = model.bbox_head.seen['memory_text']
                 _, caption, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 first = model.get_positive_map(model.language_model.tokenizer([caption]), spans)[0]
@@ -341,16 +360,16 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                     last = model.get_positive_map(tok, spans)[0]
                 else:
                     last = first
-                torch.testing.assert_close(losses['loss_second_order_etf'],
-                    0.1 * second.second_order_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
+                torch.testing.assert_close(losses['loss_raw_mean_etf'],
+                    0.1 * raw_mean.raw_mean_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
 
     def test_disabled_and_inference_never_build_auxiliary_mapping_or_solve(self):
         model = fixture(weight=0.)
-        with patch.object(model, '_get_second_order_class_token_map', side_effect=AssertionError), \
-                patch.dict(Detector.loss.__globals__, second_order_etf_loss=lambda *a: self.fail('ETF called')):
+        with patch.object(model, '_get_raw_mean_class_token_map', side_effect=AssertionError), \
+                patch.dict(Detector.loss.__globals__, raw_mean_etf_loss=lambda *a: self.fail('ETF called')):
             losses, _ = run(model, samples())
-            self.assertNotIn('loss_second_order_etf', losses)
-            model.second_order_etf_loss_weight = 0.1
+            self.assertNotIn('loss_raw_mean_etf', losses)
+            model.raw_mean_etf_loss_weight = 0.1
             model.eval()
             result = model.predict(torch.zeros(2, 3, 4, 4), samples())
             self.assertEqual(result[0].pred_instances.label_names, ['crazing'])
@@ -361,27 +380,27 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for invalid in [spans[:2], {0: spans[0], 5: spans[5]},
                         [[], *spans[1:]], -1]:
             with self.assertRaises(ValueError):
-                model._get_second_order_class_token_map(tokenized, invalid)
+                model._get_raw_mean_class_token_map(tokenized, invalid)
         model.language_model.max_tokens = 5
         with self.assertRaisesRegex(ValueError, 'untruncated'):
-            model._get_second_order_class_token_map(tokenized, spans)
+            model._get_raw_mean_class_token_map(tokenized, spans)
         model.language_model.max_tokens = 64
         model.language_model.pad_to_max = True
         losses, _ = run(model, samples())
-        self.assertTrue(torch.isfinite(losses['loss_second_order_etf']))
+        self.assertTrue(torch.isfinite(losses['loss_raw_mean_etf']))
 
     def test_constructor_weight_validation(self):
-        self.assertEqual(Detector(language_model={}).second_order_etf_loss_weight, 0.)
+        self.assertEqual(Detector(language_model={}).raw_mean_etf_loss_weight, 0.)
         for weight in [-1, float('nan'), float('inf')]:
             with self.assertRaises(ValueError):
-                Detector(language_model={}, second_order_etf_loss_weight=weight)
+                Detector(language_model={}, raw_mean_etf_loss_weight=weight)
 
     def test_architecture_and_all_configs_preserve_base(self):
         def methods(text):
             cls = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef))
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
-        self.assertEqual(after.keys() - before.keys(), {'_get_second_order_class_token_map'})
+        self.assertEqual(after.keys() - before.keys(), {'_get_raw_mean_class_token_map'})
         for name in before.keys() - {'__init__', 'loss'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         for path in [HEAD, LAYERS, 'mmdet/models/detectors/grounding_dino.py',
@@ -392,8 +411,8 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for path in configs:
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
-            self.assertEqual(new.count('second_order_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new.replace('    second_order_etf_loss_weight=0.1,\n', ''), source(rel, True))
+            self.assertEqual(new.count('raw_mean_etf_loss_weight=0.1,'), 1)
+            self.assertEqual(new.replace('    raw_mean_etf_loss_weight=0.1,\n', ''), source(rel, True))
 
 
 if __name__ == '__main__':
