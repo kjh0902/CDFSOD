@@ -369,35 +369,21 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
                   the last dimension 4 arrange as (x1, y1, x2, y2).
         """
         result_list = []
-
         for img_id in range(len(batch_img_metas)):
-            cls_scores_mean = []
-            bbox_preds_mean = []
-            for layer_idx in range(len(all_layers_cls_scores)):
-                
-                cls_score = all_layers_cls_scores[layer_idx][img_id]
-                bbox_pred = all_layers_bbox_preds[layer_idx][img_id]
+            cls_score = all_layers_cls_scores[-1][img_id]
+            bbox_pred = all_layers_bbox_preds[-1][img_id]
+            img_meta = batch_img_metas[img_id]
+            token_positive_maps = batch_token_positive_maps[img_id]
 
-                img_meta = batch_img_metas[img_id]
-                token_positive_maps = batch_token_positive_maps[img_id]
+            if token_positive_maps is not None:
+                cls_score = convert_grounding_to_cls_scores(
+                    logits=cls_score.sigmoid()[None],
+                    positive_maps=[token_positive_maps])[0]
+            else:
+                cls_score = cls_score.sigmoid()
 
-                if token_positive_maps is not None:
-                    cls_score = convert_grounding_to_cls_scores(
-                        logits=cls_score.sigmoid()[None],
-                        positive_maps=[token_positive_maps])[0]
-                else:
-                    cls_score = cls_score.sigmoid()
-
-                cls_scores_mean.append(cls_score)
-                bbox_preds_mean.append(bbox_pred)
-
-            cls_scores_mean = torch.mean(torch.stack(cls_scores_mean), dim=0)
-            bbox_preds_mean = torch.mean(torch.stack(bbox_preds_mean), dim=0)
-
-
-            result = self._predict_by_feat_single(cls_scores_mean, bbox_preds_mean,
-                                                    token_positive_maps,
-                                                    img_meta, rescale)
+            result = self._predict_by_feat_single(
+                cls_score, bbox_pred, token_positive_maps, img_meta, rescale)
             result_list.append(result)
 
         return result_list

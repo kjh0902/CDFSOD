@@ -1,4 +1,4 @@
-"""Raw mean class prototypes from final, token-level enhancer features."""
+"""Raw mean class prototypes from projected BERT tokens before the feature enhancer."""
 import math
 from numbers import Integral
 

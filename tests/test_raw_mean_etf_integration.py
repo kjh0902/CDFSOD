@@ -1,7 +1,7 @@
 """ACL regression tests with production methods and lightweight dependencies.
 
 No downloaded weights or MMCV extensions: AST loading replaces only the heavy
-base class/imports; encoder loop, prompt mapping, detector forward and HED head
+base class/imports; encoder/serial decoder loops, prompt mapping, detector and detection head
 forward run the repository's actual code. This is not a full training test.
 """
 import ast
@@ -20,7 +20,7 @@ from torch import nn
 
 from test_raw_mean_etf_loss import ROOT, raw_mean
 
-BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
+BASE = '17fd88bbf5beb7711ab97c00d6f84381a1ad65bd'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/grounding_dino_layers_HED.py'
@@ -66,7 +66,6 @@ def load_detector(base=False):
 
 
 Detector = load_detector()
-BaseDetector = load_detector(base=True)
 
 
 class Sample(SimpleNamespace):
@@ -127,6 +126,12 @@ class Language(nn.Module):
                     masks=torch.ones(batch, length, length, dtype=torch.bool))
 
 
+class Projection(nn.Linear):
+    def forward(self, x):
+        self.output = super().forward(x)
+        return self.output
+
+
 class Fusion(nn.Module):
     def __init__(self):
         super().__init__()
@@ -166,12 +171,34 @@ class Encoder(nn.Module):
         self.text_layers = nn.ModuleList([TextLayer() for _ in range(6)])
 
 
+class DecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection = nn.Linear(FEATURE_DIM, FEATURE_DIM)
+
+    def forward(self, query, value, memory_text, **kw):
+        return (query + self.projection(query).tanh() * 0.1
+                + value.mean(1, keepdim=True) * 0.05
+                + memory_text.mean(1, keepdim=True) * 0.05)
+
+
 class Decoder(nn.Module):
     num_layers = 6
+    forward_impl = method('mmdet/models/layers/transformer/dino_layers.py',
+                          'DinoTransformerDecoder', 'forward',
+                          coordinate_to_encoding=lambda x: x,
+                          inverse_sigmoid=lambda x, eps: torch.logit(x.clamp(eps, 1 - eps)))
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([DecoderLayer() for _ in range(6)])
+        self.ref_point_head = nn.Linear(4, FEATURE_DIM)
+        self.norm = nn.Identity()
+        self.return_intermediate = True
 
     def forward(self, query, reference_points, **kw):
         self.seen = dict(query=query, reference_points=reference_points, **kw)
-        return query.unsqueeze(0).expand(6, -1, -1, -1), [reference_points] * 7
+        return self.forward_impl(query=query, reference_points=reference_points, **kw)
 
 
 class Classifier(nn.Module):
@@ -214,14 +241,12 @@ class Prediction:
         return 1
 
 
-def fixture(base=False, weight=0.1):
+def fixture(weight=0.1):
     torch.manual_seed(29)
-    cls = BaseDetector if base else Detector
-    model = cls(language_model={})
-    if not base:
-        model.raw_mean_etf_loss_weight = weight
+    model = Detector(language_model={})
+    model.raw_mean_etf_loss_weight = weight
     model.language_model = Language()
-    model.text_feat_map = nn.Linear(FEATURE_DIM, FEATURE_DIM)
+    model.text_feat_map = Projection(FEATURE_DIM, FEATURE_DIM)
     model.encoder = Encoder()
     model.decoder = Decoder()
     model.bbox_head = Head()
@@ -229,9 +254,10 @@ def fixture(base=False, weight=0.1):
     model.num_queries = 3
     model.test_cfg = {}
     features = torch.randn(2, 5, FEATURE_DIM)
-    model.extract_feat = lambda _: (features,)
-    model.pre_transformer = lambda *a: (dict(
-        feat=features, feat_mask=torch.zeros(2, 5, dtype=torch.bool),
+    model.backbone = nn.Linear(FEATURE_DIM, FEATURE_DIM)
+    model.extract_feat = lambda _: (model.backbone(features),)
+    model.pre_transformer = lambda feats, *a: (dict(
+        feat=feats[0], feat_mask=torch.zeros(2, 5, dtype=torch.bool),
         feat_pos=torch.zeros_like(features), spatial_shapes=torch.tensor([[1, 5]]),
         level_start_index=torch.tensor([0]), valid_ratios=torch.ones(2, 1, 2)),
         dict(memory_mask=torch.zeros(2, 5, dtype=torch.bool),
@@ -277,8 +303,8 @@ class RawMeanIntegrationTests(unittest.TestCase):
         else:
             self.assertEqual(a, b)
 
-    def test_base_detection_and_hed_inputs_unchanged_with_loss_enabled_or_disabled(self):
-        base = fixture(base=True)
+    def test_serial_detection_unchanged_with_loss_enabled_or_disabled(self):
+        base = fixture(weight=0.)
         _, expected = run(base, samples())
         for weight in [0., 0.1]:
             model = fixture(weight=weight)
@@ -291,16 +317,20 @@ class RawMeanIntegrationTests(unittest.TestCase):
                 mapping = model._get_raw_mean_class_token_map(tokenized, spans)
                 final = model.encoder.text_layers[-1].output
                 torch.testing.assert_close(auxiliary, weight * raw_mean.raw_mean_etf_loss(
-                    final, [mapping] * 2, model.bbox_head.seen['text_token_mask']))
+                    model.text_feat_map.output, [mapping] * 2, model.bbox_head.seen['text_token_mask']))
                 for value in [model.decoder.seen['memory_text'], model.bbox_head.seen['memory_text'],
                               *[branch.seen for branch in model.bbox_head.cls_branches]]:
                     self.assertIs(value, final)
             self.assert_nested_equal(actual, expected)
 
-    def test_nearest_etf_receives_raw_means_of_final_enhancer_output(self):
+    def test_nearest_etf_receives_raw_means_before_enhancer(self):
         model = fixture()
+        def check_before_enhancer(*args, **kwargs):
+            self.assertFalse(hasattr(model.encoder.text_layers[-1], 'output'))
+            return original_nearest(*args, **kwargs)
+        original_nearest = raw_mean.nearest_etf_loss
         with patch.object(raw_mean, 'nearest_etf_loss',
-                          wraps=raw_mean.nearest_etf_loss) as nearest:
+                          side_effect=check_before_enhancer) as nearest:
             losses, _ = run(model, samples())
         nearest.assert_called_once()
         tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
@@ -308,32 +338,55 @@ class RawMeanIntegrationTests(unittest.TestCase):
         final = model.encoder.text_layers[-1].output
         expected = torch.stack([
             torch.stack([row[mapping[c]].mean(0) for c in range(1, 7)])
-            for row in final])
+            for row in model.text_feat_map.output])
         actual = nearest.call_args.args[0]
         self.assertEqual(actual.shape, (2, 6, FEATURE_DIM))
         torch.testing.assert_close(actual, expected)
+        final_means = torch.stack([
+            torch.stack([row[mapping[c]].mean(0) for c in range(1, 7)])
+            for row in final])
+        self.assertFalse(torch.allclose(actual, final_means))
         torch.testing.assert_close(losses['loss_raw_mean_etf'],
                                    0.1 * raw_mean.nearest_etf_loss(expected))
 
-    def test_auxiliary_gradient_reaches_absent_classes_and_final_enhancer(self):
+    def test_auxiliary_gradient_reaches_only_projected_bert_tokens(self):
         model = fixture()
         losses, _ = run(model, samples())
         final = model.encoder.text_layers[-1].output
         final.retain_grad()
+        projected = model.text_feat_map.output
+        projected.retain_grad()
         losses['loss_raw_mean_etf'].backward()
         tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
         mapping = model._get_raw_mean_class_token_map(tokenized, spans)
         self.assertEqual(len(mapping), 6)
         for indices in mapping.values():
-            self.assertTrue((final.grad[:, indices].norm(dim=-1) > 0).all())
-        for p in [model.encoder.text_layers[-1].attn.in_proj_weight,
-                  model.encoder.fusion_layers[-1].projection.weight,
-                  model.text_feat_map.weight, model.language_model.embedding.weight]:
+            self.assertTrue((projected.grad[:, indices].norm(dim=-1) > 0).all())
+        selected = {i for indices in mapping.values() for i in indices}
+        unselected = [i for i in range(projected.size(1)) if i not in selected]
+        torch.testing.assert_close(projected.grad[:, unselected],
+                                   torch.zeros_like(projected.grad[:, unselected]))
+        for p in [model.text_feat_map.weight, model.language_model.embedding.weight]:
             self.assertIsNotNone(p.grad)
             self.assertTrue(torch.isfinite(p.grad).all())
             self.assertGreater(p.grad.abs().sum().item(), 0)
         self.assertIsNone(model.query_embedding.weight.grad)
-        self.assertTrue(all(p.grad is None for p in model.bbox_head.parameters()))
+        self.assertIsNone(final.grad)
+        for module in [model.encoder, model.backbone, model.decoder, model.bbox_head]:
+            self.assertTrue(all(p.grad is None for p in module.parameters()))
+
+    def test_detection_gradients_unchanged_by_auxiliary_branch(self):
+        gradients = []
+        for weight in [0., 0.1]:
+            model = fixture(weight=weight)
+            losses, _ = run(model, samples())
+            (losses['loss_cls'] + losses['loss_bbox']).backward()
+            gradients.append({name: p.grad for name, p in model.named_parameters()})
+            for module in [model.encoder, model.backbone, model.text_feat_map,
+                           model.language_model, model.bbox_head, *model.decoder.layers]:
+                self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                                    for p in module.parameters()))
+        self.assert_nested_equal(gradients[0], gradients[1])
 
     def test_shared_different_and_explicit_prompt_mapping(self):
         for mode in ['shared', 'different', 'explicit_list', 'explicit_dict']:
@@ -352,7 +405,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
                     losses, _ = run(model, data)
                 self.assertEqual(mapping.call_count, 1 if mode == 'shared' else 2)
                 self.assertTrue(torch.isfinite(losses['loss_raw_mean_etf']))
-                final = model.bbox_head.seen['memory_text']
+                projected = model.text_feat_map.output
                 _, caption, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 first = model.get_positive_map(model.language_model.tokenizer([caption]), spans)[0]
                 if mode == 'different':
@@ -361,7 +414,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
                 else:
                     last = first
                 torch.testing.assert_close(losses['loss_raw_mean_etf'],
-                    0.1 * raw_mean.raw_mean_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
+                    0.1 * raw_mean.raw_mean_etf_loss(projected, [first, last], model.bbox_head.seen['text_token_mask']))
 
     def test_disabled_and_inference_never_build_auxiliary_mapping_or_solve(self):
         model = fixture(weight=0.)
@@ -400,10 +453,13 @@ class RawMeanIntegrationTests(unittest.TestCase):
             cls = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef))
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
-        self.assertEqual(after.keys() - before.keys(), {'_get_raw_mean_class_token_map'})
-        for name in before.keys() - {'__init__', 'loss'}:
+        self.assertEqual(after.keys(), before.keys())
+        for name in before.keys() - {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder', 'loss'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
-        for path in [HEAD, LAYERS, 'mmdet/models/detectors/grounding_dino.py',
+        for path in ['mmdet/models/losses/nearest_etf_loss.py',
+                     'mmdet/models/layers/transformer/dino_layers.py',
+                     'mmdet/models/layers/transformer/grounding_dino_layers.py',
+                     'mmdet/models/detectors/grounding_dino.py',
                      'mmdet/datasets/coco.py', 'mmdet/engine/hooks/stage_lr_hook.py']:
             self.assertEqual(source(path), source(path, True), path)
         configs = list((ROOT / 'configs_cdfsod/final_configs_bs4').glob('*.py'))
@@ -412,7 +468,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
             self.assertEqual(new.count('raw_mean_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new.replace('    raw_mean_etf_loss_weight=0.1,\n', ''), source(rel, True))
+            self.assertEqual(new, source(rel, True))
 
 
 if __name__ == '__main__':

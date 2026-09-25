@@ -15,12 +15,13 @@ from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..losses.raw_mean_etf_loss import raw_mean_etf_loss
+from ..layers.transformer.grounding_dino_layers import (
+    GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
-    GroundingDinoTransformerDecoder_parallel_15_DNQueryRand, GroundingDinoTransformerEncoder)
+    GroundingDinoTransformerEncoder)
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
-import random
 
 
 def clean_label_name(name: str) -> str:
@@ -71,7 +72,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
-        self.rand_dnquery_rate = rand_dnquery_rate
+        # Accept the legacy config option; serial decoding uses one DN batch.
         super().__init__(*args, **kwargs)
 
 
@@ -80,7 +81,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         self.positional_encoding = SinePositionalEncoding(
             **self.positional_encoding)
         self.encoder = GroundingDinoTransformerEncoder(**self.encoder)
-        self.decoder = GroundingDinoTransformerDecoder_parallel_15_DNQueryRand(**self.decoder)
+        self.decoder = GroundingDinoTransformerDecoder(**self.decoder)
         self.embed_dims = self.encoder.embed_dims
         self.query_embedding = nn.Embedding(self.num_queries, self.embed_dims)
         num_feats = self.positional_encoding.num_feats
@@ -400,48 +401,20 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
         if self.training:
             
-            dn_label_query_0, dn_bbox_query_0, dn_mask_0, dn_meta_0 = \
+            dn_label_query, dn_bbox_query, dn_mask, dn_meta = \
                 self.dn_query_generator(batch_data_samples)
-            query = torch.cat([dn_label_query_0, query], dim=1)
-            reference_points = torch.cat([dn_bbox_query_0, topk_coords_unact],
+            query = torch.cat([dn_label_query, query], dim=1)
+            reference_points = torch.cat([dn_bbox_query, topk_coords_unact],
                                          dim=1)
 
-            dn_label_querys = []
-            dn_bbox_querys = []
-            dn_masks = []
-            dn_metas = []
-            # Randomly decide for each layer whether to use its own DN query
-            for _ in range(self.decoder.num_layers):
-                # Randomly decide whether the current layer generates its own DN query
-                rand_use_own_dn_query = random.random() < self.rand_dnquery_rate
-                
-                if rand_use_own_dn_query:
-                    # This layer uses its own DN query
-                    dn_label_query_i, dn_bbox_query_i, dn_mask_i, dn_meta_i = \
-                        self.dn_query_generator(batch_data_samples)
-                    dn_label_querys.append(dn_label_query_i)
-                    dn_bbox_querys.append(dn_bbox_query_i)
-                    dn_masks.append(dn_mask_i)
-                    dn_metas.append(dn_meta_i)
-                else:
-                    # This layer does not use its own DN query, add None marker
-                    dn_label_querys.append(None)
-                    dn_bbox_querys.append(None)
-                    dn_masks.append(None)
-                    dn_metas.append(None)
-            
-            additional_dn_items = [dn_label_querys, dn_bbox_querys, dn_masks, dn_metas]
-
-            # Pass dn_meta of all layers to head_inputs_dict
             head_inputs_dict = dict(
                 enc_outputs_class=topk_score,
                 enc_outputs_coord=topk_coords,
-                dn_meta=dn_meta_0)
+                dn_meta=dn_meta)
 
         else:
             reference_points = topk_coords_unact
-            dn_mask_0, dn_meta_0 = None, None
-            additional_dn_items = None
+            dn_mask, dn_meta = None, None
 
             head_inputs_dict = dict()
 
@@ -451,18 +424,13 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             query=query,
             memory=memory,
             reference_points=reference_points,
-            dn_mask=dn_mask_0,
+            dn_mask=dn_mask,
             memory_text=memory_text,
-            text_attention_mask=~text_token_mask,
-            additional_dn_items=additional_dn_items
+            text_attention_mask=~text_token_mask
         )
         # NOTE DINO calculates encoder losses on scores and coordinates
         # of selected top-k encoder queries, while DeformDETR is of all
         # encoder queries.
-        # head_inputs_dict = dict(
-        #     enc_outputs_class=topk_score,
-        #     enc_outputs_coord=topk_coords,
-        #     dn_meta=dn_meta_0) if self.training else dict()
         # append text_feats to head_inputs_dict
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
@@ -477,7 +445,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                         level_start_index: Tensor,
                         valid_ratios: Tensor,
                         dn_mask: Optional[Tensor] = None,
-                        additional_dn_items: Optional[List[Tensor]] = None,
                         **kwargs) -> Dict:
         """Forward with Transformer decoder.
 
@@ -528,7 +495,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
             reg_branches=self.bbox_head.reg_branches,
-            additional_dn_items=additional_dn_items,
             **kwargs)
 
         if len(query) == self.num_queries:
@@ -769,6 +735,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
+        if class_token_maps is not None:
+            # ETF sees projected BERT tokens before any visual-text enhancement.
+            auxiliary_loss = raw_mean_etf_loss(
+                text_dict['embedded'], class_token_maps,
+                text_dict['text_token_mask'])
+
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
@@ -788,9 +760,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         if class_token_maps is not None:
-            auxiliary_loss = raw_mean_etf_loss(
-                head_inputs_dict['memory_text'], class_token_maps,
-                head_inputs_dict['text_token_mask'])
             losses['loss_raw_mean_etf'] = (
                 self.raw_mean_etf_loss_weight * auxiliary_loss)
         return losses

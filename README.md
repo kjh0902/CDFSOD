@@ -1,22 +1,24 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
-Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Raw Mean Prototype + Nearest ETF auxiliary loss를 사용한다.
+이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 실험**을 지원한다. 이 브랜치는
+ACL Progressive Fine-Tuning을 유지하면서 HED를 standard serial Grounding DINO decoder로
+교체하고, BERT + Linear 직후에 Raw Mean Prototype + Nearest ETF auxiliary loss를 적용한다.
+Augmentation, optimizer, scheduler, validation metric 및 checkpoint 설정은 유지한다.
+RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를 제공한다.
 
 ## Raw Mean Prototype + Nearest ETF auxiliary loss
 
-`grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
+`grounding_dino_acl`을 기반으로 하며 ACL progressive fine-tuning을 유지한다.
 LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
-`forward_encoder()`가 전체 Feature Enhancer를 통과한 뒤 반환하는 최종 `memory_text`를
-auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 사용하지 않는다.
+`loss()`에서 BERT 출력이 `text_feat_map` (Linear)을 통과한 직후의
+`text_dict['embedded']`를 auxiliary branch에서 읽는다. ETF 계산은 Feature Enhancer
+실행 전에 수행하며, detection에는 기존처럼 최종 enhancer `memory_text`를 전달한다.
 
 계산 순서는 다음과 같다 (`eps=1e-6`).
 
 ```text
 전체 dataset class prompt → 기존 tokens_positive / get_positive_map
-→ 최종 memory_text에서 class-name token 선택
+→ BERT → text_feat_map (Linear) → projected text features에서 class-name token 선택
 → class별 raw token 평균 p_c = sum(t_i) / token 수 [D]
 → 이미지별 prototype stack [B,C,D] (batch 평균 없음)
 → class dimension centering
@@ -30,7 +32,9 @@ token 하나인 class도 동일하게 처리한다. token별 L2 normalization �
 `nearest_etf_loss()`에 그대로 전달한다. 해당 함수의 class centering, 전체 matrix
 Frobenius normalization, nearest simplex ETF 계산 및 scalar loss의 batch 평균은
 변경하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
-연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
+연산은 projected text features를 통해 Linear와 BERT로 gradient를 전달한다.
+ETF 자체의 gradient는 Feature Enhancer, visual backbone, decoder, detection head에
+전달되지 않으며, detection loss의 기존 gradient 경로는 유지한다. Auxiliary
 계산은 FP32로 수행하며 FP64 입력은 보존한다.
 
 전체 class prompt는 기존 `CocoDataset(return_classes=True)`의 `metainfo.classes`에서
@@ -41,8 +45,30 @@ class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 toke
 처리한다. `C >= 2`, `D >= C-1`이 필요하다.
 
 원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
-contrastive classification으로 전달된다. GT positive map, classification target,
-HED, inference 경로 및 checkpoint parameter key는 유지된다.
+contrastive classification으로 전달된다. GT positive map, classification target 및
+checkpoint parameter key는 유지된다.
+
+## Standard serial decoder와 progressive fine-tuning
+
+`grounding_dino_acl_serial_decoder`의 serial 전환 커밋 `4118d18`에서 decoder 관련
+변경만 반영했다. Qwen/support-caption 기능은 도입하지 않는다. Detector의
+`_init_layers()`는 표준 `GroundingDinoTransformerDecoder`를 생성한다.
+
+```text
+Query → Decoder layer 1 → 2 → 3 → 4 → 5 → 6
+```
+
+각 layer는 직전 layer의 query와 갱신된 reference points를 입력받는다. 학습 시 DN
+query를 한 번만 생성하고 모든 layer에서 사용하며, 기존 layer별 학습 loss는 유지한다.
+추론은 마지막 layer의 class score와 bbox를 사용한다. HED의 parallel forward와
+레이어별 추가 DN query 생성은 제거했다.
+
+기존 detector/head 등록 이름과 decoder import alias는 config 호환을 위해 유지한다.
+`rand_dnquery_rate`는 호환용 인자로만 받아 사용하지 않는다. `BBoxHeadFirstHook6`,
+ReduceOnPlateau scheduler, Stage 1/Stage 2 전환, optimizer 및 18개 실험 config는
+변경하지 않는다.
+
+## ETF 설정과 검증
 
 18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
 
@@ -67,10 +93,12 @@ CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-회귀 테스트는 실제 prompt mapping, detector 메서드, encoder loop, HED head forward를
-사용하고 무거운 dependency는 작은 test double로 대체한다. 기준 ACL commit은
-`8926970ebff1a549088b0a4c87c272e1a70fe0dd`이다. 동일 난수 상태에서 base 및 loss
-활성화/비활성화의 detection 출력·positive map·HED 입력을 비교한다. CUDA 테스트는
+회귀 테스트는 실제 prompt mapping, detector 메서드, encoder/serial decoder loop와
+detection head 메서드를 사용하고 무거운 dependency는 작은 test double로 대체한다.
+변경 기준 commit은 `17fd88bbf5beb7711ab97c00d6f84381a1ad65bd`이다. ETF의 입력 위치와
+gradient 범위, 6개 decoder layer의 순차 실행, 단일 DN 생성 및 마지막 layer 추론을
+검증한다. 동일 난수 상태의 serial 모델에서 ETF 활성화/비활성화에 따른 detection
+출력·positive map·입력·gradient 일치도 검증한다. CUDA 테스트는
 CUDA가 없으면 skip한다. 이 테스트는 실제 MMCV/CUDA 학습이나 mAP 평가를 대체하지 않는다.
 
 ## 지원 환경
