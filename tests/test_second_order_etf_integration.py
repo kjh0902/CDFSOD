@@ -20,7 +20,7 @@ from torch import nn
 
 from test_second_order_etf_loss import ROOT, second
 
-BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
+BASE = '7fbec8da7f6cab0546449021c0437b2284db4257'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/grounding_dino_layers_HED.py'
@@ -37,7 +37,8 @@ def source(path, base=False):
 def execute(nodes, **extra):
     env = dict(torch=torch, nn=nn, math=math, copy=copy, re=re,
                random=random, warnings=warnings,
-               second_order_etf_loss=second.second_order_etf_loss)
+               second_order_etf_loss=second.raw_mean_etf_loss,
+               raw_mean_etf_loss=second.raw_mean_etf_loss, Tensor=torch.Tensor)
     env.update(extra)
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0)] + nodes, type_ignores=[])
@@ -111,7 +112,7 @@ class Language(nn.Module):
     def __init__(self):
         super().__init__()
         self.tokenizer = Tokenizer()
-        self.embedding = nn.Embedding(128, 4)
+        self.embedding = nn.Embedding(128, 8)
         self.pad_to_max = False
         self.max_tokens = 64
 
@@ -129,7 +130,7 @@ class Language(nn.Module):
 class Fusion(nn.Module):
     def __init__(self):
         super().__init__()
-        self.projection = nn.Linear(4, 4)
+        self.projection = nn.Linear(8, 8)
 
     def forward(self, visual_feature, lang_feature, **kw):
         return (visual_feature + lang_feature.mean(1, keepdim=True) * 0.05,
@@ -140,7 +141,7 @@ class TextLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.self_attn_cfg = SimpleNamespace(num_heads=1)
-        self.attn = nn.MultiheadAttention(4, 1, batch_first=True)
+        self.attn = nn.MultiheadAttention(8, 1, batch_first=True)
 
     def forward(self, query, query_pos, attn_mask, **kw):
         self.output = query + self.attn(query + query_pos, query + query_pos,
@@ -155,7 +156,7 @@ class VisualLayer(nn.Module):
 
 class Encoder(nn.Module):
     forward = method(LAYERS, 'GroundingDinoTransformerEncoder', 'forward',
-                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, 4).float() * 0.01)
+                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, 8).float() * 0.01)
     get_encoder_reference_points = staticmethod(lambda *a, **kw: None)
 
     def __init__(self):
@@ -192,7 +193,7 @@ class Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.cls_branches = nn.ModuleList([Classifier() for _ in range(7)])
-        self.reg_branches = nn.ModuleList([nn.Linear(4, 4) for _ in range(7)])
+        self.reg_branches = nn.ModuleList([nn.Linear(8, 4) for _ in range(7)])
 
     def loss(self, batch_data_samples, **kw):
         self.seen = kw
@@ -220,14 +221,14 @@ def fixture(base=False, weight=0.1):
     if not base:
         model.second_order_etf_loss_weight = weight
     model.language_model = Language()
-    model.text_feat_map = nn.Linear(4, 4)
+    model.text_feat_map = nn.Linear(8, 8)
     model.encoder = Encoder()
     model.decoder = Decoder()
     model.bbox_head = Head()
-    model.query_embedding = nn.Embedding(3, 4)
+    model.query_embedding = nn.Embedding(3, 8)
     model.num_queries = 3
     model.test_cfg = {}
-    features = torch.randn(2, 5, 4)
+    features = torch.randn(2, 5, 8)
     model.extract_feat = lambda _: (features,)
     model.pre_transformer = lambda *a: (dict(
         feat=features, feat_mask=torch.zeros(2, 5, dtype=torch.bool),
@@ -236,8 +237,8 @@ def fixture(base=False, weight=0.1):
         dict(memory_mask=torch.zeros(2, 5, dtype=torch.bool),
              spatial_shapes=torch.tensor([[1, 5]]), level_start_index=torch.tensor([0]),
              valid_ratios=torch.ones(2, 1, 2)))
-    model.gen_encoder_output_proposals = lambda memory, *a: (memory, torch.zeros_like(memory))
-    model.dn_query_generator = lambda _: (torch.randn(2, 1, 4), torch.randn(2, 1, 4),
+    model.gen_encoder_output_proposals = lambda memory, *a: (memory, memory.new_zeros(*memory.shape[:2], 4))
+    model.dn_query_generator = lambda _: (torch.randn(2, 1, 8), torch.randn(2, 1, 4),
                                            None, dict(num_denoising_queries=1))
     return model
 
@@ -279,8 +280,6 @@ class SecondOrderIntegrationTests(unittest.TestCase):
     def test_base_detection_and_shared_inputs_unchanged_with_loss_enabled_or_disabled(self):
         base = fixture(base=True)
         _, expected = run(base, samples())
-        # Serial decoding intentionally drops the per-layer HED DN batches.
-        expected['decoder'].pop('additional_dn_items')
         for weight in [0., 0.1]:
             model = fixture(weight=weight)
             losses, actual = run(model, samples())
@@ -291,7 +290,7 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                 tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 mapping = model._get_second_order_class_token_map(tokenized, spans)
                 final = model.encoder.text_layers[-1].output
-                torch.testing.assert_close(auxiliary, weight * second.second_order_etf_loss(
+                torch.testing.assert_close(auxiliary, weight * second.raw_mean_etf_loss(
                     final, [mapping] * 2, model.bbox_head.seen['text_token_mask']))
                 for value in [model.decoder.seen['memory_text'], model.bbox_head.seen['memory_text'],
                               *[branch.seen for branch in model.bbox_head.cls_branches]]:
@@ -344,12 +343,12 @@ class SecondOrderIntegrationTests(unittest.TestCase):
                 else:
                     last = first
                 torch.testing.assert_close(losses['loss_second_order_etf'],
-                    0.1 * second.second_order_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
+                    0.1 * second.raw_mean_etf_loss(final, [first, last], model.bbox_head.seen['text_token_mask']))
 
     def test_disabled_and_inference_never_build_auxiliary_mapping_or_solve(self):
         model = fixture(weight=0.)
         with patch.object(model, '_get_second_order_class_token_map', side_effect=AssertionError), \
-                patch.dict(Detector.loss.__globals__, second_order_etf_loss=lambda *a: self.fail('ETF called')):
+                patch.dict(Detector.loss.__globals__, raw_mean_etf_loss=lambda *a: self.fail('ETF called')):
             losses, _ = run(model, samples())
             self.assertNotIn('loss_second_order_etf', losses)
             model.second_order_etf_loss_weight = 0.1
@@ -383,7 +382,7 @@ class SecondOrderIntegrationTests(unittest.TestCase):
             cls = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef))
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
-        self.assertEqual(after.keys() - before.keys(), {'_get_second_order_class_token_map'})
+        self.assertEqual(after.keys() - before.keys(), {'set_raw_mean_etf_stage'})
         for name in before.keys() - {'__init__', 'loss', '_init_layers',
                                      'pre_decoder', 'forward_decoder'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
@@ -397,8 +396,11 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for path in configs:
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
-            self.assertEqual(new.count('second_order_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new.replace('    second_order_etf_loss_weight=0.1,\n', ''), source(rel, True))
+            self.assertEqual(new.count('raw_mean_etf_loss_weight=1.0,'), 1)
+            restored = new.replace('raw_mean_etf_loss_weight=1.0,\n    stagewise_raw_mean_etf=True,', 'second_order_etf_loss_weight=0.1,')
+            restored = restored.replace("type='StagewiseRawMeanETFHook',\n        stage2_fe_lr_mult=0.5,", "type='BBoxHeadFirstHook6',")
+            restored = restored.replace('patience_unfrozen=6,', 'patience_unfrozen=8,')
+            self.assertEqual(restored, source(rel, True))
 
 
 if __name__ == '__main__':

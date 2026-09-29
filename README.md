@@ -1,70 +1,147 @@
-# FT-FSOD: CD-FSOD 실험 저장소
+# FT-FSOD: Stagewise Raw Mean Simplex ETF
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
-Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Second-Order Simplex ETF auxiliary loss를 추가한다.
+이 실험 브랜치는 `codex/acl-raw-mean-etf-no-hed`의 serial decoder와 scaled dot
+product classifier를 유지하면서, ACL progressive fine-tuning stage에 따라
+**같은 Raw Mean ETF loss의 입력 위치만 전환**한다. HED를 복원하지 않는다.
 
-## Second-Order Simplex ETF auxiliary loss
+| 학습 구간 | ETF 입력 | ETF loss |
+|---|---|---|
+| Stage 1 | BERT → `text_feat_map` 이후, FE 이전 token | BERT Raw Mean ETF만 적용 |
+| Stage 2 | 전체 Feature Enhancer의 최종 `memory_text` | FE Raw Mean ETF만 적용 |
 
-`grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
-LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
-`forward_encoder()`가 전체 Feature Enhancer를 통과한 뒤 반환하는 최종 `memory_text`를
-auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 사용하지 않는다.
+전환은 기존과 동일하게 language-model LR이 초기값의 절반 이하가 된 다음 epoch
+시작에 일어난다. FE unfreeze와 ETF 위치 변경은 하나의 hook에서 함께 수행한다.
+두 위치의 ETF를 동시에 더하지 않으며 ramp/cross-fade를 사용하지 않는다.
 
-계산 순서는 다음과 같다 (`eps=1e-6`).
+## Raw Mean 정의와 gradient
+
+`mmdet/models/losses/raw_mean_etf_loss.py`의 공통 계산을 두 stage에서 사용한다.
 
 ```text
 전체 dataset class prompt → 기존 tokens_positive / get_positive_map
-→ 최종 memory_text에서 class-name token 선택
-→ 각 token t / (||t||₂ + eps)
-→ class별 T̂ᵀT̂ / token 수 = M_c [D,D]
-→ flatten 및 stack [B,C,D²]
-→ class dimension centering
-→ sample별 전체 [C,D²] matrix Frobenius normalization (norm.clamp_min(eps))
-→ sample별 nearest Simplex ETF target (Helmert basis + reduced Procrustes SVD)
+→ 해당 위치의 class-name token을 raw mean하여 [B,C,D]
+→ class 방향 centering
+→ sample별 전체 [C,D] matrix Frobenius normalization
+→ nearest Simplex ETF (Helmert basis + reduced Procrustes SVD)
 → squared Frobenius distance → batch mean
 ```
 
-token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하지 않으며, 각 `M_c`를
-개별 L2/Frobenius normalize하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
-연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
-계산은 FP32로 수행하며 FP64 입력은 보존한다.
+Token별 또는 class vector별 normalization은 없다. SVD target만 `no_grad`이고
+mean/centering/matrix normalization에는 gradient가 흐른다. FP32에서 계산하며
+FP64 입력은 보존한다. 이미지에 GT가 없는 class도 포함한다. `C>=2`, `D>=C-1`이며
+누락/중복/범위 밖 token, padding, prompt truncation은 오류로 처리한다.
 
-전체 class prompt는 기존 `CocoDataset(return_classes=True)`의 `metainfo.classes`에서
-온다. GT label로 span을 선택하기 전 전체 class mapping을 보관하므로 NEU-DET은 GT가
-일부이거나 비어 있어도 항상 6개 class를 사용한다. 명시적 `tokens_positive` 역시 모든
-class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
-class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 token은 오류로
-처리한다. `C >= 2`, `D² >= C-1`이 필요하다.
+Stage 1에서 ETF 자체의 gradient는 BERT와 projection에만 흐른다. Stage 2에서는
+FE 및 그에 연결된 text/visual 입력 경로에도 흐른다. Detection loss는 별도로
+기존 경로를 학습한다. Detection용 token, GT positive map, inference는 변경하지 않는다.
 
-원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
-contrastive classification으로 전달된다. GT positive map, classification target,
-HED, inference 경로 및 checkpoint parameter key는 유지된다.
+## Freeze 범위와 설정
 
-18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
+**Stage 1의 frozen/trainable module 범위는 원래 `BBoxHeadFirstHook6`와 같다.**
+`encoder.*`와 기존 Other group을 LR=0으로 두고, backbone, language_model,
+text_feat_map, neck, decoder, bbox_head, dn_query_generator는 기존대로 학습한다.
+`requires_grad=False`로 바꾸지 않으므로 clipping과 optimizer moment 동작도 보존한다.
+
+18개 few-shot config는 다음 설정을 사용한다.
 
 ```python
-second_order_etf_loss_weight=0.1
+model = dict(raw_mean_etf_loss_weight=1.0, stagewise_raw_mean_etf=True)
+custom_hooks = [dict(
+    type='StagewiseRawMeanETFHook',
+    adjust_scheduler_patience=True,
+    patience_frozen=3,
+    patience_unfrozen=6,
+    stage2_fe_lr_mult=0.5,
+)]
 ```
 
-loss key는 `loss_second_order_etf`이며, 로그 값에는 weight가 이미 반영된다.
-옵션을 생략한 모델 생성자의 기본값은 `0.0`이다. config에서 `0.0`으로 설정하면
-auxiliary mapping 생성 및 ETF 계산을 생략한다. `tools/train.py` 실행 시에도
-`--cfg-options model.second_order_etf_loss_weight=0.0`으로 비활성화하거나 weight를
-변경할 수 있다. 공통 pretraining config에는 이 옵션을 추가하지 않았다.
+| 항목 | 기존 로그 설정 | 새 설정 |
+|---|---:|---:|
+| ETF λ (두 stage 공통) | 1.0 | 1.0 |
+| AdamW 기본 LR / weight decay | 1e-4 / 0.05 | 유지 |
+| Backbone / BERT LR multiplier | 0.2 / 0.2 | 유지 |
+| Stage 2 FE LR | 전환 시 head LR | 전환 시 head LR × 0.5 |
+| Stage 1 / Stage 2 plateau patience | 3 / 8 | 3 / 6 |
+| Plateau factor / cooldown / min LR | 0.5 / 1 / 1e-6 | 유지 |
+| Gradient clipping max norm | 0.1 | 유지 |
 
-CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있다.
+FE 배율은 Stage 2 진입 시 `encoder.*` group에 한 번만 적용한다. 다른 Other
+group은 기존대로 head LR을 따르고, 이후에는 기존 scheduler가 각 LR을 줄인다.
+기본값에서 최초 전환 직후 head LR=5e-5, FE LR=2.5e-5, BERT/backbone LR=1e-5다.
+기존 파일의 ETF weight 기본값은 0.1이었으나 제공된 실행 로그의 실제 값은 1.0이다.
+새 config는 비교를 위해 **실험 로그의 λ=1.0**에 맞췄다.
+
+## 로그에 근거한 소폭 조정
+
+제공된 NEU-DET/UODD/Clipart1k × 1/5/10-shot × 두 위치의 총 18개 학습 실행을
+분석했다. 새 GPU 학습이나 hyperparameter sweep은 실행하지 않았다. 아래 값은
+검증된 최적값이 아니라 다음 실험의 공통 기본값이다.
+
+- NEU-DET 5-shot의 FE best mAP는 freeze 구간 23.6에서 unfreeze 구간 22.4로
+  낮아졌다. 두 위치의 전환 시점은 모두 152 iter였다. FE LR을 head의 절반으로
+  낮추어 전환 후 업데이트를 완화한다. 이는 과도한 LR이 원인이었다는 인과 증명은 아니다.
+- Clipart1k 5-shot FE는 best 이후 ETF가 0.3299→0.0963으로 감소했지만 mAP는
+  62.1→61.3으로 하락했다. Stage 2 patience를 8→6으로 줄여 plateau 이후 LR 감소를
+  조금 앞당긴다. 학습 epoch 수와 best-checkpoint 선택 규칙은 유지한다.
+- λ=1에서 ETF/detection loss 비율의 실행별 중앙값은 BERT 약 0.02~0.98%,
+  FE 약 0.10~3.78%다. 전체 grad norm은 약 55.6~1600.9로 clipping보다 크지만,
+  이는 ETF 전용 gradient가 아니다. 이 정보만으로 λ나 clipping을 크게 바꾸지 않는다.
+- 저장된 validation 항목은 mAP/AP50/AP75/size AP이며 **validation loss는 없다**.
+  ETF/detection gradient 방향이나 module별 비율도 없으므로 추정값을 관측값처럼
+  해석하지 않는다. 데이터셋별 tuning이나 평가 split 변경은 하지 않는다.
+
+로그의 `loss_raw_mean_etf`는 weight가 반영된 유일한 ETF 학습 loss다.
+`etf_raw`, `etf_to_detection_ratio`(weighted ETF / 전체 detection loss), `etf_stage`는
+분리된 detached 진단값이며 총학습 loss에 중복 합산되지 않는다. λ=0이면 ETF 계산을
+생략하고 stage만 기록한다. Hook은 초기화·전환·재개 및 매 epoch의 위치, λ,
+epoch/iteration과 module별 실제 LR을 기록한다.
+
+## 실행, override와 resume
+
+기존 `run_cdfsod.sh` 인터페이스를 사용한다. GPU 학습은 준비된 Linux 환경에서 실행한다.
+
+```bash
+bash run_cdfsod.sh --dataset NEU-DET --shot 5 --dry-run
+bash run_cdfsod.sh --dataset NEU-DET --shot 5 --gpu 0
+bash run_cdfsod.sh --dataset NEU-DET --shot 5 --gpu 0 --resume
+```
+
+새 실행의 출력 디렉터리는 이전 실험과 분리한다. 직접 train.py를 호출하면
+기존 CLI의 `--cfg-options`로 설정을 변경할 수 있다. 예를 들어 **stagewise ETF를
+유지하면서 LR/patience만 기존 정책으로 복원**하려면:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_5shot.py \
+  --work-dir exp_stagewise_etf/NEU-DET/5shot \
+  --cfg-options custom_hooks.0.stage2_fe_lr_mult=1.0 custom_hooks.0.patience_unfrozen=8
+```
+
+`model.raw_mean_etf_loss_weight=0.0`은 ETF를 끄며, 다른 양수로 바꾸면 두 stage에
+같은 λ를 적용한다. `stagewise_raw_mean_etf=True`에는 전용 hook이 필수다.
+기존 `second_order_etf_loss_weight`는 고정 FE Raw Mean 호환 옵션으로 유지한다.
+새 weight와 동시에 지정하거나 stagewise 모드와 함께 사용하면 오류를 낸다.
+
+Checkpoint metadata에 stage, 초기 LR 기준, parameter group 식별 정보와 전환
+시점을 저장한다. `--resume`는 optimizer/scheduler 상태를 복원하며 Stage 2를
+Stage 1로 되돌리거나 FE LR 배율을 다시 적용하지 않는다. LR 감소 직후 저장된
+Stage 1 checkpoint는 다음 epoch 시작에 한 번 전환한다. 일반 `load_from`은
+가중치 초기화로 취급하여 Stage 1부터 시작한다. Stage metadata가 없는 기존
+checkpoint는 stagewise `--resume`를 지원하지 않으며 `resume=False`와
+`load_from`으로 새 실행을 시작해야 한다. Model state_dict parameter key는 동일하다.
+
+## 검증
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-회귀 테스트는 실제 prompt mapping, detector 메서드, encoder loop, HED head forward를
-사용하고 무거운 dependency는 작은 test double로 대체한다. 기준 ACL commit은
-`8926970ebff1a549088b0a4c87c272e1a70fe0dd`이다. 동일 난수 상태에서 base 및 loss
-활성화/비활성화의 detection 출력·positive map·HED 입력을 비교한다. CUDA 테스트는
-CUDA가 없으면 skip한다. 이 테스트는 실제 MMCV/CUDA 학습이나 mAP 평가를 대체하지 않는다.
+CPU PyTorch와 MMEngine 0.10.7로 수학, source 선택, ETF 단독 gradient, Stage 1
+freeze 동등성, AdamW step, 실제 plateau scheduler, stage 경계 resume 및 실제
+`Runner.save_checkpoint/resume`를 검증한다. Detector/encoder 경로 테스트는
+production 메서드와 가벼운 모듈을 사용하며 MMCV/CUDA 전체 학습을 대체하지 않는다.
+기존 second-order fixture는 raw mean 조건에 맞게 수정했다. CUDA가 없는 환경의
+CUDA 전용 테스트는 skip한다. 새 GPU 학습 성능은 아직 검증하지 않았다.
 
 ## 지원 환경
 

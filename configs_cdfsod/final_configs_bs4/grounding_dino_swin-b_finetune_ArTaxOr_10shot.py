@@ -29,7 +29,8 @@ metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 model = dict(
     type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
     rand_dnquery_rate=0.5,
-    second_order_etf_loss_weight=0.1,
+    raw_mean_etf_loss_weight=1.0,
+    stagewise_raw_mean_etf=True,
     bbox_head=dict(
         type='GroundingDINOHead_ParallelDecoder_DN',
         num_classes=num_classes))
@@ -179,10 +180,11 @@ default_hooks = dict(checkpoint=dict(max_keep_ckpts=1, save_best='auto'))
 
 custom_hooks = [
     dict(
-        type='BBoxHeadFirstHook6',
+        type='StagewiseRawMeanETFHook',
+        stage2_fe_lr_mult=0.5,
         adjust_scheduler_patience=True,
         patience_frozen=3,
-        patience_unfrozen=8,
+        patience_unfrozen=6,
     )
 ]
 load_from = MMGDINOB_PATH

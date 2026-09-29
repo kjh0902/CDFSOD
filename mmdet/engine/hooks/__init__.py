@@ -18,6 +18,7 @@ from .yolox_mode_switch_hook import YOLOXModeSwitchHook
 from .augmentation_switch_hook_lr import AugmentationSwitchHookLR
 from .augmentation_switch_hook_lr_inverse import AugmentationSwitchHookLR_Inverse
 from .stage_lr_hook import BBoxHeadFirstHook6, StageWiseFreezeHook
+from .stagewise_raw_mean_etf_hook import StagewiseRawMeanETFHook
 __all__ = [
     'AugmentationSwitchHook', 'YOLOXModeSwitchHook', 'SyncNormHook', 'CheckInvalidLossHook',
     'SetEpochInfoHook', 'MemoryProfilerHook', 'DetVisualizationHook',
@@ -26,5 +27,5 @@ __all__ = [
     'GroundingVisualizationHook', 'EpochEMAHook', 'DisablePixmixHook',
     'AutoLoadBestCheckpointHook', 'AugmentationSwitchHookLR', 
     'AugmentationSwitchHookLR_Inverse', 
-    'BBoxHeadFirstHook6', 'StageWiseFreezeHook'
+    'BBoxHeadFirstHook6', 'StageWiseFreezeHook', 'StagewiseRawMeanETFHook'
 ]

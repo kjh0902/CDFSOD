@@ -14,7 +14,7 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.second_order_etf_loss import second_order_etf_loss
+from ..losses.raw_mean_etf_loss import raw_mean_etf_loss
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
@@ -61,14 +61,28 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 second_order_etf_loss_weight=0.0,
+                 second_order_etf_loss_weight=None,
+                 raw_mean_etf_loss_weight=None,
+                 stagewise_raw_mean_etf=False,
                  **kwargs) -> None:
 
-        if (not math.isfinite(second_order_etf_loss_weight)
-                or second_order_etf_loss_weight < 0):
-            raise ValueError(
-                'second_order_etf_loss_weight must be finite and nonnegative.')
-        self.second_order_etf_loss_weight = float(second_order_etf_loss_weight)
+        if (second_order_etf_loss_weight is not None
+                and raw_mean_etf_loss_weight is not None):
+            raise ValueError('Specify only one ETF weight: raw_mean_etf_loss_weight '
+                             'or legacy second_order_etf_loss_weight.')
+        for name, value in [('second_order_etf_loss_weight', second_order_etf_loss_weight),
+                            ('raw_mean_etf_loss_weight', raw_mean_etf_loss_weight)]:
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f'{name} must be finite and nonnegative.')
+        self.second_order_etf_loss_weight = float(second_order_etf_loss_weight or 0.)
+        self.raw_mean_etf_loss_weight = float(raw_mean_etf_loss_weight or 0.)
+        self.stagewise_raw_mean_etf = stagewise_raw_mean_etf
+        if stagewise_raw_mean_etf and second_order_etf_loss_weight is not None:
+            raise ValueError('Stagewise ETF requires raw_mean_etf_loss_weight; '
+                             'the legacy weight is for fixed FE ETF only.')
+        # Hook state is deliberately not a model buffer: checkpoint keys stay
+        # compatible with pretrained detectors and inference needs no hook.
+        self.raw_mean_etf_stage = None
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -630,6 +644,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             data_sample.pred_instances = pred_instances
         return batch_data_samples
 
+    def set_raw_mean_etf_stage(self, stage: int) -> None:
+        """Synchronize the auxiliary input with the progressive training hook."""
+        if isinstance(stage, bool) or stage not in (1, 2):
+            raise ValueError('Raw mean ETF stage must be 1 or 2.')
+        self.raw_mean_etf_stage = stage
+
     def _get_second_order_class_token_map(self, tokenized, tokens_positive):
         """Reuse ACL's mapping for all classes, before selecting GT labels."""
         classes = self.bbox_head.num_classes
@@ -658,6 +678,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
+        if self.stagewise_raw_mean_etf and self.raw_mean_etf_stage is None:
+            raise RuntimeError('Stagewise ETF requires StagewiseRawMeanETFHook '
+                               'to initialize its training stage.')
+        etf_weight = (self.raw_mean_etf_loss_weight
+                      or self.second_order_etf_loss_weight)
+        bert_etf = self.stagewise_raw_mean_etf and self.raw_mean_etf_stage == 1
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]
@@ -667,7 +693,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.second_order_etf_loss_weight > 0 else None
+        class_token_maps = [] if etf_weight > 0 else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -735,6 +761,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
+        if class_token_maps is not None and bert_etf:
+            auxiliary_loss = raw_mean_etf_loss(
+                text_dict['embedded'], class_token_maps,
+                text_dict['text_token_mask'])
+
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
@@ -754,10 +785,25 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         if class_token_maps is not None:
-            auxiliary_loss = second_order_etf_loss(
-                head_inputs_dict['memory_text'], class_token_maps,
-                head_inputs_dict['text_token_mask'])
-            losses['loss_second_order_etf'] = (
-                self.second_order_etf_loss_weight * auxiliary_loss)
+            if not bert_etf:
+                auxiliary_loss = raw_mean_etf_loss(
+                    head_inputs_dict['memory_text'], class_token_maps,
+                    head_inputs_dict['text_token_mask'])
+            weighted_etf = etf_weight * auxiliary_loss
+            if self.second_order_etf_loss_weight > 0:
+                losses['loss_second_order_etf'] = weighted_etf
+            else:
+                # Match MMEngine's loss reduction, without retaining another
+                # detection graph. Diagnostic keys must not contain "loss".
+                detection_total = sum(
+                    (value.detach().mean() if isinstance(value, Tensor) else
+                     sum(v.detach().mean() for v in value))
+                    for key, value in losses.items() if 'loss' in key)
+                losses['loss_raw_mean_etf'] = weighted_etf
+                losses['etf_raw'] = auxiliary_loss.detach()
+                losses['etf_to_detection_ratio'] = (
+                    weighted_etf.detach() / detection_total.clamp_min(1e-12))
+        if self.stagewise_raw_mean_etf:
+            losses['etf_stage'] = batch_inputs.new_tensor(float(self.raw_mean_etf_stage))
         return losses
 
