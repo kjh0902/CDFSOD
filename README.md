@@ -1,9 +1,13 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
-Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스만
-정리했다.
+이 브랜치는 `grounding_dino_acl`을 기준으로 HED를 제거하고 기본 **serial Grounding DINO**에
+**GT region–text contrastive loss** 하나를 추가한 실험이다. Progressive Fine-Tuning,
+augmentation, optimizer, scheduler, validation 및 checkpoint 설정은 유지한다.
+
+18개 CDFSOD finetuning config의 초기 가중치는 `lambda_region_text=0.01`이며,
+`model.lambda_region_text=0`으로 보조 손실을 완전히 비활성화할 수 있다.
+객체별 RoIAlign, 전체 class negative, 실행 방법과 검증 범위는
+[실험 설명](EXPERIMENT_REGION_TEXT.md)을 참고한다.
 
 ## 지원 환경
 

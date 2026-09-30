@@ -22,10 +22,12 @@ num_classes = len(class_names)
 metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 
 model = dict(
-    type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
-    rand_dnquery_rate=0.5,
+    type='GroundingDINO',
+    lambda_region_text=0.01,
+    region_text_roi_size=7,
+    region_text_featmap_strides=(8, 16, 32, 64),
     bbox_head=dict(
-        type='GroundingDINOHead_ParallelDecoder_DN',
+        type='GroundingDINOHead',
         num_classes=num_classes))
 
 train_pipeline = [

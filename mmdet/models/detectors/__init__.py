@@ -58,7 +58,6 @@ from .yolact import YOLACT
 from .yolo import YOLOV3
 from .yolof import YOLOF
 from .yolox import YOLOX
-from .grounding_dino_HED import GroundingDINO_ParallelDecoder_15_DNQuery_rand
 
 
 __all__ = [
@@ -74,5 +73,4 @@ __all__ = [
     'RTMDet', 'Detectron2Wrapper', 'CrowdDet', 'CondInst', 'BoxInst',
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
     'DDQDETR', 'GroundingDINO',
-    'GroundingDINO_ParallelDecoder_15_DNQuery_rand',
 ]

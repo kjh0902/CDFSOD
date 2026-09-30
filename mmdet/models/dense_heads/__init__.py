@@ -28,7 +28,6 @@ from .ga_rpn_head import GARPNHead
 from .gfl_head import GFLHead
 
 from .grounding_dino_head import GroundingDINOHead
-from .grounding_dino_head_HED import GroundingDINOHead_ParallelDecoder_DN
 
 from .guided_anchor_head import FeatureAdaption, GuidedAnchorHead
 from .lad_head import LADHead
@@ -72,5 +71,4 @@ __all__ = [
     'CondInstMaskHead', 'RTMDetInsHead', 'RTMDetInsSepBNHead',
     'BoxInstBboxHead', 'BoxInstMaskHead', 'ConditionalDETRHead', 'DINOHead',
     'ATSSVLFusionHead', 'DABDETRHead', 'DDQDETRHead', 'GroundingDINOHead',
-    'GroundingDINOHead_ParallelDecoder_DN',
 ]

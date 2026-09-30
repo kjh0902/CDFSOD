@@ -22,7 +22,6 @@ from .utils import (MLP, AdaptivePadding, ConditionalAttention, DynamicConv,
 from .grounding_dino_layers import (GroundingDinoTransformerDecoder,
                                     GroundingDinoTransformerDecoderLayer,
                                     GroundingDinoTransformerEncoder)
-from .grounding_dino_layers_HED import (GroundingDinoTransformerDecoder_parallel_15_DNQueryRand)
 
 __all__ = [
     'nlc_to_nchw', 'nchw_to_nlc', 'AdaptivePadding', 'PatchEmbed',
@@ -40,5 +39,4 @@ __all__ = [
     'Mask2FormerTransformerDecoderLayer', 'Mask2FormerTransformerDecoder',
     'GroundingDinoTransformerDecoderLayer', 'GroundingDinoTransformerEncoder',
     'GroundingDinoTransformerDecoder',
-    'GroundingDinoTransformerDecoder_parallel_15_DNQueryRand',
 ]

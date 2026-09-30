@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import math
 import re
 import warnings
 from typing import Dict, Optional, Tuple, Union
@@ -12,6 +13,7 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
+from ..losses.region_text_loss import region_text_loss
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
@@ -56,8 +58,22 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 lambda_region_text=0.0,
+                 region_text_roi_size=7,
+                 region_text_featmap_strides=(8, 16, 32, 64),
                  **kwargs) -> None:
 
+        if not math.isfinite(lambda_region_text) or lambda_region_text < 0:
+            raise ValueError('lambda_region_text must be finite and nonnegative.')
+        if not isinstance(region_text_roi_size, int) or region_text_roi_size < 1:
+            raise ValueError('region_text_roi_size must be a positive integer.')
+        if (not region_text_featmap_strides or any(
+                not math.isfinite(s) or s <= 0
+                for s in region_text_featmap_strides)):
+            raise ValueError('region_text_featmap_strides must be positive.')
+        self.lambda_region_text = float(lambda_region_text)
+        self.region_text_roi_size = region_text_roi_size
+        self.region_text_featmap_strides = tuple(region_text_featmap_strides)
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -314,6 +330,11 @@ class GroundingDINO(DINO):
 
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
+        if self.training and self.lambda_region_text > 0:
+            head_inputs_dict['region_text_spatial_shapes'] = (
+                encoder_inputs_dict['spatial_shapes'])
+            head_inputs_dict['region_text_level_start_index'] = (
+                encoder_inputs_dict['level_start_index'])
         decoder_inputs_dict.update(tmp_dec_in)
 
         decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
@@ -412,9 +433,38 @@ class GroundingDINO(DINO):
             enc_outputs_coord=topk_coords,
             dn_meta=dn_meta) if self.training else dict()
         # append text_feats to head_inputs_dict
+        if self.training and self.lambda_region_text > 0:
+            # The exact tensor scored above, after proposal masking, fc and norm.
+            head_inputs_dict['region_text_output_memory'] = output_memory
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
         return decoder_inputs_dict, head_inputs_dict
+
+    def _get_class_token_map(self, tokenized, tokens_positive):
+        """Reuse ACL's mapping for all classes, before selecting GT labels."""
+        classes = self.bbox_head.num_classes
+        if isinstance(tokens_positive, dict):
+            if set(tokens_positive) != set(range(classes)):
+                raise ValueError(
+                    'Region-text loss requires all dataset class IDs 0..C-1.')
+            tokens_positive = [tokens_positive[c] for c in range(classes)]
+        if (not isinstance(tokens_positive, (list, tuple))
+                or len(tokens_positive) != classes or classes < 1):
+            raise ValueError(
+                'Region-text loss requires spans for every dataset class (C >= 1).')
+        # Mapping tokenization is untruncated; BERT tokenization is truncated.
+        # Reject long prompts before create_positive_map can clip class spans.
+        max_length = min(
+            self.language_model.max_tokens,
+            self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len)
+        if tokenized['attention_mask'].sum(-1).max().item() > max_length:
+            raise ValueError(
+                'Region-text loss requires a complete, untruncated all-class prompt.')
+        mapping, _ = self.get_positive_map(tokenized, tokens_positive)
+        if any(not indices for indices in mapping.values()):
+            raise ValueError(
+                'Region-text loss found a dataset class without class-name tokens.')
+        return mapping
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
@@ -426,6 +476,13 @@ class GroundingDINO(DINO):
             data_samples.gt_instances.labels
             for data_samples in batch_data_samples
         ]
+
+        class_token_maps = [] if self.lambda_region_text > 0 else None
+        if class_token_maps is not None:
+            for labels in gt_labels:
+                if (labels.ndim != 1 or labels.dtype != torch.long
+                        or ((labels < 0) | (labels >= self.bbox_head.num_classes)).any()):
+                    raise ValueError('Region-text loss requires GT labels in 0..C-1.')
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -440,6 +497,9 @@ class GroundingDINO(DINO):
                     padding='max_length'
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt')
+                if class_token_maps is not None:
+                    class_token_maps.append(self._get_class_token_map(
+                        tokenized, token_positive))
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
@@ -457,6 +517,9 @@ class GroundingDINO(DINO):
                     self.get_tokens_and_prompts(
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
+                if class_token_maps is not None:
+                    mapping = self._get_class_token_map(tokenized, tokens_positive)
+                    class_token_maps.extend([mapping] * len(batch_inputs))
                 for gt_label in gt_labels:
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -469,6 +532,9 @@ class GroundingDINO(DINO):
                     tokenized, caption_string, tokens_positive, _ = \
                         self.get_tokens_and_prompts(
                             text_prompt, True)
+                    if class_token_maps is not None:
+                        class_token_maps.append(self._get_class_token_map(
+                            tokenized, tokens_positive))
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
@@ -497,8 +563,23 @@ class GroundingDINO(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
+        region_inputs = None
+        if class_token_maps is not None:
+            region_inputs = dict(
+                output_memory=head_inputs_dict.pop('region_text_output_memory'),
+                spatial_shapes=head_inputs_dict.pop('region_text_spatial_shapes'),
+                level_start_index=head_inputs_dict.pop('region_text_level_start_index'))
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
+        if region_inputs is not None:
+            losses['loss_region_text'] = self.lambda_region_text * region_text_loss(
+                **region_inputs,
+                memory_text=head_inputs_dict['memory_text'],
+                text_token_mask=head_inputs_dict['text_token_mask'],
+                class_token_maps=class_token_maps,
+                batch_data_samples=batch_data_samples,
+                featmap_strides=self.region_text_featmap_strides,
+                roi_size=self.region_text_roi_size)
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
