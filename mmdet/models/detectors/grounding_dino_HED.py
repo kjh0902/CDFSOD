@@ -20,7 +20,7 @@ from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerEncoder)
-from ..losses.nearest_etf_loss import nearest_etf_loss
+from ..losses.raw_mean_etf_loss import raw_mean_etf_loss
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -64,7 +64,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
                  use_class_name_token_prototypes: bool = False,
-                 nearest_etf_loss_weight: float = 0.0,
+                 nearest_etf_loss_weight: float = 1.0,
                  support_caption_file: Optional[str] = None,
                  support_class_names: Optional[Sequence[str]] = None,
                  **kwargs) -> None:
@@ -277,6 +277,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self._find_class_name_token_positions(
                 self.support_tokenized['offset_mapping'],
                 prompt_class_spans)
+        num_class_tokens = sum(map(
+            len, self.support_prompt_class_token_positions))
+        if num_class_tokens > max_text_len:
+            raise ValueError('Support class-name subword count exceeds '
+                             'max_text_len.')
         self.support_prompt_bank = ordered_bank
 
     def _format_support_prompt(
@@ -348,34 +353,42 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         return outputs.last_hidden_state
 
     def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Pool contextualized class-name tokens before all enhancer stages."""
+        """Select class-name subwords before projection and all enhancer stages.
+
+        The legacy prototype option/method names are retained for compatibility.
+        Detection uses individual tokens; only the auxiliary ETF branch pools.
+        """
         self.build_support_prompt_bank()
         bert_device = next(self.language_model.parameters()).device
         tokenizer_input = self._prepare_cached_tokenized(bert_device)
         hidden_states = self._encode_support_prompt_features(tokenizer_input)
-        class_prototypes = torch.stack([
-            hidden_states[prompt_idx, token_positions].mean(dim=0)
+        class_tokens = torch.cat([
+            hidden_states[prompt_idx, token_positions]
             for prompt_idx, token_positions in enumerate(
                 self.support_prompt_class_token_positions)
-        ])
+        ], dim=0)
         if self.text_feat_map is not None:
-            class_prototypes = self.text_feat_map(class_prototypes)
-        class_prototypes = class_prototypes.to(device)
-        num_classes = class_prototypes.size(0)
-        # Preserve independent prompt attention: each class is now one token,
-        # with its position reset to zero inside its own prompt.
+            class_tokens = self.text_feat_map(class_tokens)
+        class_tokens = class_tokens.to(device)
+        prompt_ids, positions = [], []
+        for prompt_idx, token_positions in enumerate(
+                self.support_prompt_class_token_positions):
+            prompt_ids.extend([prompt_idx] * len(token_positions))
+            positions.extend(token_positions)
+        prompt_ids = torch.tensor(prompt_ids, device=device)
+        num_tokens = class_tokens.size(0)
         return dict(
-            embedded=class_prototypes.unsqueeze(0).expand(batch_size, -1, -1),
+            embedded=class_tokens.unsqueeze(0).expand(batch_size, -1, -1),
             text_token_mask=torch.ones(
-                batch_size, num_classes, dtype=torch.bool, device=device),
-            masks=torch.eye(num_classes, dtype=torch.bool, device=device)
+                batch_size, num_tokens, dtype=torch.bool, device=device),
+            masks=(prompt_ids[:, None] == prompt_ids[None, :])
                 .unsqueeze(0).expand(batch_size, -1, -1),
-            position_ids=torch.zeros(
-                batch_size, num_classes, dtype=torch.long, device=device))
+            position_ids=torch.tensor(positions, dtype=torch.long, device=device)
+                .unsqueeze(0).expand(batch_size, -1))
 
     def build_prototype_positive_maps(self, gt_labels: List[Tensor],
                                       device) -> List[Tensor]:
-        """Mark the single prototype of each ground-truth class positive."""
+        """Mark every retained subword of each ground-truth class positive."""
         token_positive_map = self.build_prototype_token_positive_map()
         max_text_len = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
@@ -391,10 +404,17 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         return positive_maps
 
     def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to their single prototype positions."""
+        """Map 1-based class ids to compact class-name token positions."""
         self.build_support_prompt_bank()
-        return {class_idx + 1: [position] for position, class_idx in
-                enumerate(self.support_prompt_labels.tolist())}
+        token_positive_map = {}
+        offset = 0
+        for class_idx, positions in zip(
+                self.support_prompt_labels.tolist(),
+                self.support_prompt_class_token_positions):
+            token_positive_map.setdefault(class_idx + 1, []).extend(
+                range(offset, offset + len(positions)))
+            offset += len(positions)
+        return token_positive_map
 
     def get_tokens_positive_and_prompts(
         self,
@@ -860,6 +880,14 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.use_class_name_token_prototypes:
             text_dict = self.build_prototype_text_dict(
                 len(batch_inputs), batch_inputs.device)
+            if self.nearest_etf_loss_weight > 0:
+                # Pool only for ETF, before visual-text enhancement. The
+                # detection branch keeps the original projected subwords.
+                class_token_map = self.build_prototype_token_positive_map()
+                auxiliary_loss = raw_mean_etf_loss(
+                    text_dict['embedded'],
+                    [class_token_map] * len(batch_inputs),
+                    text_dict['text_token_mask'])
             positive_maps = self.build_prototype_positive_maps(
                 gt_labels, batch_inputs.device)
             for i, data_samples in enumerate(batch_data_samples):
@@ -882,7 +910,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             if self.nearest_etf_loss_weight > 0:
                 losses['loss_nearest_etf'] = (
                     self.nearest_etf_loss_weight
-                    * nearest_etf_loss(head_inputs_dict['memory_text']))
+                    * auxiliary_loss)
             return losses
 
         if 'tokens_positive' in batch_data_samples[0]:

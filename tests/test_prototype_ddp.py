@@ -39,14 +39,17 @@ class PrototypeLoss(nn.Module):
 
     def forward(self, features):
         text = self.detector.build_prototype_text_dict(2, 'cpu')
+        auxiliary = sanity.raw_etf.raw_mean_etf_loss(
+            text['embedded'],
+            [self.detector.build_prototype_token_positive_map()] * 2,
+            text['text_token_mask'])
         output = self.detector.forward_encoder(
             feat=features, feat_mask=torch.zeros(2, 4, dtype=torch.bool),
             feat_pos=torch.zeros_like(features), spatial_shapes=torch.tensor([[2, 2]]),
             level_start_index=torch.tensor([0]), valid_ratios=torch.ones(2, 1, 2),
             text_dict=text)
         scores = output['memory'] @ output['memory_text'].transpose(1, 2)
-        return scores.square().mean() + 0.1 * sanity.etf.nearest_etf_loss(
-            output['memory_text'])
+        return scores.square().mean() + auxiliary
 
 
 @unittest.skipUnless(torch.distributed.is_available() and

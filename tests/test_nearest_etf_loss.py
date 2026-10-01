@@ -151,7 +151,7 @@ class NearestETFIntegrationTests(unittest.TestCase):
         self.model.encoder = sanity.recording_encoder()
         self.model.encoder.fusion_layers = nn.ModuleList([fusion_layer() for _ in range(6)])
 
-    def test_etf_alone_reaches_bert_projection_and_final_enhancer(self):
+    def test_etf_alone_reaches_bert_projection_but_not_enhancer(self):
         model = self.model
         text = model.build_prototype_text_dict(2, 'cpu')
         text['embedded'].retain_grad()
@@ -162,19 +162,18 @@ class NearestETFIntegrationTests(unittest.TestCase):
             text_dict=text)
         final = output['memory_text']
         final.retain_grad()
-        loss = etf.nearest_etf_loss(final)
+        loss = sanity.raw_etf.raw_mean_etf_loss(
+            text['embedded'], [model.build_prototype_token_positive_map()] * 2,
+            text['text_token_mask'])
         self.assertGreater(loss.item(), 1e-6)
         loss.backward()
-        for tensor in [final, text['embedded'], model.text_feat_map.weight,
-                       model.language_model.language_backbone.body.model.embedding.weight,
-                       model.encoder.text_layers[-1].attn.in_proj_weight]:
+        for tensor in [text['embedded'], model.text_feat_map.weight,
+                       model.language_model.language_backbone.body.model.embedding.weight]:
             self.assertIsNotNone(tensor.grad)
             self.assertTrue(torch.isfinite(tensor.grad).all())
             self.assertGreater(tensor.grad.abs().sum().item(), 0)
-        fusion_grads = [p.grad for p in model.encoder.fusion_layers[-1].parameters()
-                        if p.grad is not None]
-        self.assertTrue(all(torch.isfinite(g).all() for g in fusion_grads))
-        self.assertGreater(sum(g.abs().sum().item() for g in fusion_grads), 0)
+        self.assertIsNone(final.grad)
+        self.assertTrue(all(p.grad is None for p in model.encoder.parameters()))
 
     def test_loss_addition_preserves_memory_consumers_and_detection_outputs(self):
         model = self.model
@@ -200,7 +199,7 @@ class NearestETFIntegrationTests(unittest.TestCase):
             def __call__(self, memory, memory_text, mask):
                 seen[self.stage] = memory_text
                 scores = memory @ memory_text.transpose(1, 2)
-                return torch.cat([scores, scores.new_full((*scores.shape[:2], 5), -float('inf'))], -1)
+                return torch.cat([scores, scores.new_full((*scores.shape[:2], 8 - memory_text.size(1)), -float('inf'))], -1)
 
         model.bbox_head.cls_branches = [Classifier('classification'), Classifier('selection')]
         model.bbox_head.reg_branches = [lambda x: x.new_zeros(*x.shape[:2], 4)] * 2
@@ -221,7 +220,7 @@ class NearestETFIntegrationTests(unittest.TestCase):
             scores, boxes = head_forward(model.bbox_head, kw['hidden_states'], kw['references'],
                                          kw['memory_text'], kw['text_token_mask'])
             seen['scores'], seen['boxes'] = scores, boxes
-            return dict(loss_cls=scores[..., :3].square().mean(), loss_bbox=boxes.mean())
+            return dict(loss_cls=scores[..., :5].square().mean(), loss_bbox=boxes.mean())
 
         model.bbox_head.loss = head_loss
         samples = [SimpleNamespace(text=tuple(model.support_class_names),
@@ -230,7 +229,7 @@ class NearestETFIntegrationTests(unittest.TestCase):
         base = model.loss(images, samples)
         baseline = {key: value.detach().clone() for key, value in seen.items()}
         state_keys = model.state_dict().keys()
-        model.nearest_etf_loss_weight = 0.1
+        model.nearest_etf_loss_weight = 1.0
         updated = model.loss(images, samples)
         self.assertEqual(set(updated), set(base) | {'loss_nearest_etf'})
         for key in base:
@@ -240,14 +239,26 @@ class NearestETFIntegrationTests(unittest.TestCase):
             self.assertIs(seen[stage], final)
         for key in baseline:
             torch.testing.assert_close(seen[key], baseline[key], rtol=0, atol=0)
-        torch.testing.assert_close(updated['loss_nearest_etf'], 0.1 * etf.nearest_etf_loss(final))
+        raw_text = model.build_prototype_text_dict(2, 'cpu')
+        expected_etf = sanity.raw_etf.raw_mean_etf_loss(
+            raw_text['embedded'], [model.build_prototype_token_positive_map()] * 2,
+            raw_text['text_token_mask'])
+        torch.testing.assert_close(updated['loss_nearest_etf'], expected_etf)
+        self.assertEqual(final.shape, (2, 5, 3))
+        updated['loss_nearest_etf'].backward(retain_graph=True)
+        self.assertGreater(model.text_feat_map.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.language_model.language_backbone.body.model.embedding.weight.grad.abs().sum().item(), 0)
+        self.assertTrue(all(p.grad is None for p in model.encoder.parameters()))
+        model.zero_grad(set_to_none=True)
+        sum(updated.values()).backward()
+        self.assertGreater(model.encoder.text_layers[-1].attn.in_proj_weight.grad.abs().sum().item(), 0)
         self.assertEqual(state_keys, model.state_dict().keys())
 
         loss_globals = sanity.Detector.loss.__globals__
-        with patch.dict(loss_globals, nearest_etf_loss=lambda *_: self.fail('Unexpected ETF solve')):
+        with patch.dict(loss_globals, raw_mean_etf_loss=lambda *_: self.fail('Unexpected ETF solve')):
             model.nearest_etf_loss_weight = 0
             self.assertNotIn('loss_nearest_etf', model.loss(images, samples))
-            model.nearest_etf_loss_weight = 0.1
+            model.nearest_etf_loss_weight = 1.0
             model.eval()
 
             class Prediction:
@@ -260,7 +271,7 @@ class NearestETFIntegrationTests(unittest.TestCase):
             model.predict(images, samples)
 
     def test_existing_architecture_and_nonprototype_loss_are_unchanged(self):
-        base = 'bb6dcd23fabb26cdc8e03587a723888368ccf0ab'
+        base = '2c0892a2f35da0813182720049b0866f553f394e'
         path = sanity.DETECTOR
         old = ast.parse(subprocess.check_output(['git', 'show', f'{base}:{path}'],
                                                cwd=sanity.ROOT).decode())
@@ -270,7 +281,9 @@ class NearestETFIntegrationTests(unittest.TestCase):
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(old), methods(new)
         self.assertEqual(before.keys(), after.keys())
-        for name in before.keys() - {'__init__', 'loss'}:
+        for name in before.keys() - {'__init__', 'loss', 'build_support_prompt_bank',
+                                      'build_prototype_text_dict', 'build_prototype_positive_maps',
+                                      'build_prototype_token_positive_map'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         for methods_dict in [before, after]:
             loss = copy.deepcopy(methods_dict['loss'])
