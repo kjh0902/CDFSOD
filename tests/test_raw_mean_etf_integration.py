@@ -468,7 +468,26 @@ class RawMeanIntegrationTests(unittest.TestCase):
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
             self.assertEqual(new.count('raw_mean_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new, source(rel, True))
+            # Only the training policy changes in the three-stage branch.
+            # Compare all remaining AST, including model, data and checkpoint
+            # settings, against the original ETF integration baseline.
+            def without_training_policy(text):
+                tree = ast.parse(text)
+                tree.body = [n for n in tree.body if not (
+                    isinstance(n, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id in
+                        {'_base_', 'param_scheduler', 'custom_hooks', 'max_epochs'}
+                        for t in n.targets))]
+                for node in tree.body:
+                    if (isinstance(node, ast.Assign) and any(
+                            isinstance(t, ast.Name) and t.id == 'optim_wrapper'
+                            for t in node.targets)):
+                        for kw in node.value.keywords:
+                            if kw.arg == 'type':
+                                kw.value = ast.Constant('OptimWrapper')
+                return ast.dump(tree)
+            self.assertEqual(without_training_policy(new),
+                             without_training_policy(source(rel, True)))
 
 
 if __name__ == '__main__':

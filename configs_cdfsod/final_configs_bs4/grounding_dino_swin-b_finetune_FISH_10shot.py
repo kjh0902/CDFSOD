@@ -1,4 +1,4 @@
-_base_ = '../grounding_dino_swin-b_pretrain_all.py'
+_base_ = '../grounding_dino_swin-b_three_stage.py'
 import os
 from src_path import CDFSOD_PATH, MMGDINOB_PATH
 
@@ -136,7 +136,7 @@ test_evaluator = dict(
 
 optim_wrapper = dict(
     _delete_=True,
-    type='OptimWrapper',
+    type='ActiveParamOptimWrapper',
     optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(
@@ -146,7 +146,7 @@ optim_wrapper = dict(
             'language_model': dict(lr_mult=0.2),
         }))
 
-max_epochs = 16
+max_epochs = 100
 train_cfg = dict(
     type='EpochBasedTrainLoop', 
     max_epochs=max_epochs, 
@@ -155,29 +155,7 @@ train_cfg = dict(
 
 auto_scale_lr = dict(base_batch_size=10)
 
-param_scheduler = [
-    dict(
-        type='ReduceOnPlateauParamScheduler',
-        param_name='lr',
-        monitor='coco/bbox_mAP',
-        rule='greater',
-        factor=0.5,
-        patience=5,
-        threshold=1e-4,
-        threshold_rule='rel',
-        cooldown=1,
-        min_value=1e-6,
-        verbose=True)
-]
 
 default_hooks = dict(checkpoint=dict(max_keep_ckpts=1, save_best='auto')) 
 
-custom_hooks = [
-    dict(
-        type='BBoxHeadFirstHook6',
-        adjust_scheduler_patience=True,
-        patience_frozen=3,
-        patience_unfrozen=8,
-    )
-]
 load_from = MMGDINOB_PATH

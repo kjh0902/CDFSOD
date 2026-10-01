@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from .three_stage_progressive_finetuning_hook import ThreeStageProgressiveFinetuningHook
 from .augmentation_switch_hook import AugmentationSwitchHook
 from .auto_load_best_checkpoint_hook import AutoLoadBestCheckpointHook
 from .checkloss_hook import CheckInvalidLossHook
@@ -26,5 +27,6 @@ __all__ = [
     'GroundingVisualizationHook', 'EpochEMAHook', 'DisablePixmixHook',
     'AutoLoadBestCheckpointHook', 'AugmentationSwitchHookLR', 
     'AugmentationSwitchHookLR_Inverse', 
-    'BBoxHeadFirstHook6', 'StageWiseFreezeHook'
+    'BBoxHeadFirstHook6', 'StageWiseFreezeHook',
+    'ThreeStageProgressiveFinetuningHook'
 ]

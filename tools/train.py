@@ -97,7 +97,11 @@ def main():
 
     # enable automatic-mixed-precision training
     if args.amp is True:
-        cfg.optim_wrapper.type = 'AmpOptimWrapper'
+        cfg.optim_wrapper.type = (
+            'ActiveParamAmpOptimWrapper'
+            if cfg.optim_wrapper.type in (
+                'ActiveParamOptimWrapper', 'ActiveParamAmpOptimWrapper')
+            else 'AmpOptimWrapper')
         cfg.optim_wrapper.loss_scale = 'dynamic'
 
     # enable automatically scaling LR

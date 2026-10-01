@@ -252,6 +252,57 @@ exp_cdfsod_results/
 python analyze_results_cdfsod.py
 ```
 
+## Raw Mean ETF 3-stage fine-tuning
+
+`final_configs_bs4`의 18개 dataset/shot config는 공통
+`configs_cdfsod/grounding_dino_swin-b_three_stage.py` 정책을 사용한다.
+Raw Mean ETF는 Linear(768→256) 이후, Feature Enhancer 이전의 class-name
+token raw mean에 적용하며 weight는 0.1이다. ETF와 serial detection 구조는
+기반 커밋 `1ae964e`와 동일하다.
+
+| Stage | BERT 업데이트 | Swin-B 업데이트 | Patience | Plateau 동작 |
+|---|---|---|---:|---|
+| 1 | 없음 | 없음 | 3 | 기준 LR × 0.5, Stage 2 |
+| 2 | encoder layer 6–11 | stages 2–3 및 norm2/norm3 (0-based) | 5 | 기준 LR × 0.5, Stage 3 |
+| 3 | 전체 | 전체 | 8 | 추가 LR 감소 없이 조기 종료 |
+
+Linear, Neck, Feature Enhancer, Decoder, Detection Head 및 나머지 모듈은
+처음부터 학습한다. Swin downsample은 소속 stage의 정책을 따른다.
+freeze는 LR=0으로만 처리하며 requires_grad, train/eval mode, backward,
+DDP 동기화 및 activation checkpointing을 바꾸지 않는다.
+
+`ActiveParamOptimWrapper`는 **실제 LR>0인 그룹의 gradient만 모아 하나의
+global norm**으로 clipping한다 (`max_norm=0.1`, `norm_type=2`). Frozen
+gradient는 norm 계산과 clipping에서 제외하지만 제거하지 않으므로 AdamW의
+momentum/step 누적은 계속된다. `train/grad_norm`은 활성 gradient의 clipping 전
+norm이다. `--amp`는 같은 clipping 정책의 `ActiveParamAmpOptimWrapper`를 사용한다.
+
+Plateau는 validation의 `coco/bbox_mAP`, 상대 threshold `1e-4`, cooldown 1을
+사용한다. MMEngine의 `bad_count > patience` 규칙이므로 cooldown을 제외한
+연속 미개선 4/6/9회에 동작한다. 새 stage는 다음 validation에서 자체 best를
+설정한다. optimizer와 DDP wrapper는 재생성하지 않으며 rollback도 하지 않는다.
+모든 config의 최대 epoch는 100이다 (기존 FISH 16, clipart1k 50도 100으로 통일).
+
+기본 일반 LR은 `1e-4 → 5e-5 → 2.5e-5`이며 BERT/Swin은 기존 0.2 배율을
+유지한다. Frozen 그룹의 기준 LR도 감소하므로 unfreeze 시 올바른 LR을 받는다.
+두 번 감소한 기준 LR이 하한 `1e-6`보다 작아지는 설정은 시작 시 오류로 알린다.
+로그에는 stage, 업데이트 활성/비활성 파라미터 수, 실제 LR과 plateau 사유를 남긴다.
+
+기존 MMEngine checkpoint 저장 정책과 best checkpoint를 유지한다. 별도 resume
+checkpoint는 생성하지 않는다. 이 정책에서는 `--resume`을 지원하지 않으며,
+`load_from`으로 가중치를 읽으면 새로운 Stage 1 학습을 시작한다.
+
+CPU PyTorch와 MMEngine 0.10.7이 있는 환경에서 테스트:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+새 테스트는 큰 frozen gradient의 clipping 격리, 단계별 업데이트와 optimizer
+상태 유지, 18개 config 및 2-process Gloo DDP를 검증한다. DDP 테스트는 경량
+모델과 reentrant checkpoint를 사용하며, 실제 Swin-B/BERT 및 MMCV CUDA ops의
+전체 학습이나 GPU AMP 실행을 대체하지 않는다.
+
 ## 문제 해결
 
 - `please install fairscale`: `python -m pip install -r requirements.txt`를 실행한다.
