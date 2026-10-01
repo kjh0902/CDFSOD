@@ -59,7 +59,7 @@ class GroundingDINO(DINO):
                  *args,
                  use_autocast=False,
                  lambda_region_text=0.0,
-                 region_text_roi_size=7,
+                 region_text_roi_size=3,
                  region_text_featmap_strides=(8, 16, 32, 64),
                  **kwargs) -> None:
 

@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Object-wise, all-class raw-dot-product alignment after query projection."""
 
+import math
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -33,18 +35,25 @@ def class_name_prototypes(memory_text, class_token_maps, text_token_mask):
 
 
 def pool_gt_regions(output_memory, spatial_shapes, level_start_index,
-                    batch_data_samples, featmap_strides, roi_size=7):
-    """RoIAlign every object at every level, then mean over space and levels.
+                    batch_data_samples, featmap_strides, roi_size=3):
+    """RoIAlign each object on one FPN level, then mean over space.
 
     GT xyxy boxes are already in augmented/resized input pixel coordinates.
     Use the actual feature strides (Swin-B/ChannelMapper: 8,16,32,64), not
     img_shape ratios: the latter stretch boxes in padded or rounded-up maps.
-    Averaging levels is parameter-free and preserves one anchor per object.
+    Assign by floor(4 + log2(sqrt(w*h) / 224)), clamped to the
+    available pyramid levels. A 224px square uses stride 16 (P4).
+    Feature strides must form an increasing, octave-spaced pyramid.
     """
     shapes = spatial_shapes.tolist()
     starts = level_start_index.tolist()
     if len(shapes) != len(starts) or len(shapes) != len(featmap_strides):
         raise ValueError('Shapes, level starts and feature strides must agree.')
+    if (not featmap_strides or any(
+            not math.isfinite(s) or s <= 0 for s in featmap_strides)
+            or any(b != 2 * a for a, b in
+                   zip(featmap_strides, featmap_strides[1:]))):
+        raise ValueError('Feature strides must be positive and double per level.')
     expected_start = 0
     for (height, width), start in zip(shapes, starts):
         if start != expected_start or height <= 0 or width <= 0:
@@ -75,23 +84,33 @@ def pool_gt_regions(output_memory, spatial_shapes, level_start_index,
     if len(rois) == 0:
         return output_memory.new_empty((0, output_memory.shape[-1])), labels, image_ids
 
-    pooled_levels = []
-    for (height, width), start, stride in zip(shapes, starts, featmap_strides):
+    scale = ((rois[:, 3] - rois[:, 1]) *
+             (rois[:, 4] - rois[:, 2])).sqrt()
+    finest_scale = 224.0 * featmap_strides[0] / 16.0
+    levels = torch.floor(torch.log2(scale / finest_scale + 1e-6))
+    levels = levels.clamp(min=0, max=len(shapes) - 1).long()
+    pooled = output_memory.new_zeros(
+        (len(rois), output_memory.shape[-1]), dtype=torch.float32)
+    for level, ((height, width), start, stride) in enumerate(
+            zip(shapes, starts, featmap_strides)):
+        selected = torch.where(levels == level)[0]
+        if selected.numel() == 0:
+            continue
         feature = output_memory[:, start:start + height * width]
         feature = feature.transpose(1, 2).reshape(
             output_memory.shape[0], output_memory.shape[2], height, width)
         # FP32 avoids half precision overflow without changing raw-dot geometry.
-        regions = roi_align(feature.float(), rois, output_size=roi_size,
+        regions = roi_align(feature.float(), rois[selected], output_size=roi_size,
                             spatial_scale=1.0 / stride, sampling_ratio=2,
                             aligned=True)
-        pooled_levels.append(regions.mean(dim=(-2, -1)))
-    return torch.stack(pooled_levels).mean(dim=0), labels, image_ids
+        pooled[selected] = regions.mean(dim=(-2, -1))
+    return pooled, labels, image_ids
 
 
 def region_text_loss(output_memory, memory_text, spatial_shapes,
                      level_start_index, text_token_mask, class_token_maps,
                      batch_data_samples, featmap_strides=(8, 16, 32, 64),
-                     roi_size=7):
+                     roi_size=3):
     """Mean CE over GT objects, using all dataset classes for each image.
 
     No normalization, temperature, projection, class balancing or stop-gradient.

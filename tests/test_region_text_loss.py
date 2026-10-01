@@ -32,7 +32,7 @@ def fixture():
         class_token_maps=[{1: [1, 2], 2: [4], 3: [6]}] * 2,
         batch_data_samples=[sample([[0, 0, 4, 4], [3, 2, 7, 8]], [0, 0]),
                             sample([[1, 0, 6, 7]], [1])],
-        featmap_strides=(2, 4), roi_size=7)
+        featmap_strides=(2, 4), roi_size=3)
 
 
 class RegionLossTest(unittest.TestCase):
@@ -61,13 +61,13 @@ class RegionLossTest(unittest.TestCase):
         # A class absent from both images is still a negative and gets gradients.
         actual.backward()
         self.assertGreater(d['memory_text'].grad[:, 6].abs().sum(), 0)
-        for start, end in [(0, 16), (16, 20)]:
-            self.assertGreater(d['output_memory'].grad[:, start:end].abs().sum(), 0)
+        self.assertGreater(d['output_memory'].grad[:, :16].abs().sum(), 0)
+        self.assertEqual(d['output_memory'].grad[:, 16:].abs().sum(), 0)
         # This is intentionally not equal-image or equal-class weighting.
         per = F.cross_entropy(logits, labels, reduction='none')
         self.assertFalse(torch.isclose(actual, (per[:2].mean() + per[2]) / 2))
 
-    def test_analytic_roi_coordinates_and_level_mean(self):
+    def test_analytic_roi_coordinates_on_selected_level(self):
         # Linear ramps have exact bilinear means. Padding/image size metadata
         # must not rescale these post-augmentation boxes a second time.
         y, x = torch.meshgrid(torch.arange(6.), torch.arange(8.), indexing='ij')
@@ -81,10 +81,64 @@ class RegionLossTest(unittest.TestCase):
         s.scale_factor = (0.5, 0.5)
         pooled, _, _ = region.pool_gt_regions(
             memory, torch.tensor([[6, 8], [3, 4]]), torch.tensor([0, 48]),
-            [s], (2, 4), 7)
+            [s], (2, 4))
         # Box centers / stride - 0.5, using aligned=True.
-        expected = torch.tensor([[(16.5 + 105.5) / 2], [(18.5 + 106.5) / 2]])
+        expected = torch.tensor([[16.5], [18.5]])
         torch.testing.assert_close(pooled, expected)
+
+    def test_fpn_assignment_boundaries_order_and_gradients(self):
+        # P3..P6: thresholds 224, 448, 896; clamp both ends.
+        sides = [896., 2., 447., 224., 223., 448., 895., 1200.]
+        expected_levels = [3, 0, 1, 1, 0, 2, 2, 3]
+        shapes = [(160, 160), (80, 80), (40, 40), (20, 20)]
+        starts = [0, 25600, 32000, 33600]
+        memory = torch.cat([torch.full((2, h * w, 1), float(i + 1))
+                            for i, (h, w) in enumerate(shapes)], dim=1)
+        memory.requires_grad_()
+        boxes = [[0, 0, side, side] for side in sides]
+        # Non-square box with the same area as a 224px square must select P4.
+        boxes.append([0, 0, 112, 448])
+        expected_levels.append(1)
+        samples = [sample(boxes[:4], [0, 1, 2, 3]),
+                   sample(boxes[4:], [4, 5, 6, 7, 8])]
+        with patch.object(region, 'roi_align', wraps=region.roi_align) as align:
+            pooled, labels, ids = region.pool_gt_regions(
+                memory, torch.tensor(shapes), torch.tensor(starts), samples,
+                (8, 16, 32, 64))
+        torch.testing.assert_close(pooled[:, 0], torch.tensor(expected_levels).float() + 1)
+        self.assertEqual(labels.tolist(), list(range(9)))
+        self.assertEqual(ids.tolist(), [0] * 4 + [1] * 5)
+        self.assertEqual(align.call_count, 4)
+        self.assertEqual(sum(len(c.args[1]) for c in align.call_args_list), 9)
+        for level, call in enumerate(align.call_args_list):
+            indices = [i for i, target in enumerate(expected_levels) if target == level]
+            torch.testing.assert_close(call.args[1][:, 1:], torch.tensor(boxes)[indices])
+            self.assertEqual(call.kwargs['output_size'], 3)
+            self.assertEqual(call.kwargs['spatial_scale'], 1 / (8 * 2 ** level))
+        # Each object's gradient reaches exactly its own level and image.
+        for i, level in enumerate(expected_levels):
+            grad, = torch.autograd.grad(pooled[i].sum(), memory, retain_graph=True)
+            image = ids[i].item()
+            for j, ((h, w), start) in enumerate(zip(shapes, starts)):
+                magnitude = grad[image, start:start + h * w].abs().sum()
+                if j == level:
+                    self.assertGreater(magnitude, 0)
+                else:
+                    self.assertEqual(magnitude, 0)
+            self.assertEqual(grad[1 - image].abs().sum(), 0)
+
+    def test_unused_levels_skip_roi_align_and_single_level_clamps(self):
+        d = fixture()
+        with patch.object(region, 'roi_align', wraps=region.roi_align) as align:
+            region.region_text_loss(**d)
+        self.assertEqual(align.call_count, 1)
+        d['output_memory'] = d['output_memory'][:, :16]
+        d['spatial_shapes'] = torch.tensor([[4, 4]])
+        d['level_start_index'] = torch.tensor([0])
+        d['featmap_strides'] = (2,)
+        with patch.object(region, 'roi_align', wraps=region.roi_align) as align:
+            self.assertTrue(torch.isfinite(region.region_text_loss(**d)))
+        self.assertEqual(align.call_count, 1)
 
     def test_empty_and_single_class(self):
         for single in (False, True):
@@ -133,6 +187,8 @@ class RegionLossTest(unittest.TestCase):
     def test_rejects_bad_feature_layout_and_boxes(self):
         for key, value in [('level_start_index', torch.tensor([0, 15])),
                            ('featmap_strides', (2,)),
+                           ('featmap_strides', (2, 8)),
+                           ('featmap_strides', (0, 0)),
                            ('spatial_shapes', torch.tensor([[3, 4], [2, 2]]))]:
             d = fixture()
             d[key] = value

@@ -196,7 +196,7 @@ def build(baseline=False, weight=0):
     model = cls.__new__(cls)
     nn.Module.__init__(model)
     model.lambda_region_text = weight
-    model.region_text_roi_size = 7
+    model.region_text_roi_size = 3
     model.region_text_featmap_strides = (2, 4)
     model.language_model = Language()
     model._special_tokens = '. '
@@ -363,42 +363,69 @@ class IntegrationTest(unittest.TestCase):
         for previous, current in zip(model.decoder.layers, model.decoder.layers[1:]):
             torch.testing.assert_close(previous.outputs[0], current.inputs[0], rtol=0, atol=0)
 
-    def test_progressive_ft_freeze_and_transition(self):
-        # Execute the unmodified ACL hook, including its real parameter grouping.
-        hook_env = dict(nn=nn, is_model_wrapper=lambda _: False)
-        hook = node(source('mmdet/engine/hooks/stage_lr_hook.py'), 'BBoxHeadFirstHook6')
-        hook.bases = []
-        hook.decorator_list = []
-        execute([hook], hook_env)
-        groups = []
-        for baseline in (True, False):
-            model, _ = build(baseline=baseline, weight=.01)
-            optimizer = torch.optim.AdamW([
-                dict(params=[p], lr=.001) for p in model.parameters()])
-            runner = NS(model=model, optim_wrapper=NS(optimizer=optimizer), epoch=0,
-                        logger=NS(info=lambda *args: None, warning=lambda *args: None),
-                        param_schedulers=[NS(patience=5)])
-            policy = hook_env['BBoxHeadFirstHook6'](True, 3, 8)
-            policy.before_train(runner)
-            groups.append((policy._head_groups, policy._lang_model_groups,
-                           policy._backbone_groups, policy._other_groups))
-            self.assertEqual(runner.param_schedulers[0].patience, 3)
-            if not baseline:
-                frozen = [p.clone() for i in policy._other_groups
-                          for p in optimizer.param_groups[i]['params']]
+    def test_progressive_ft_all_trainable_and_transition(self):
+        for hook_name in ('BBoxHeadFirstHook6', 'StageWiseFreezeHook'):
+            with self.subTest(hook=hook_name):
+                hook_env = dict(nn=nn, is_model_wrapper=lambda _: False)
+                hook = node(source('mmdet/engine/hooks/stage_lr_hook.py'), hook_name)
+                hook.bases = []
+                hook.decorator_list = []
+                execute([hook], hook_env)
+                model, _ = build(weight=.01)
+                optimizer = torch.optim.SGD([
+                    dict(params=[p], lr=.0002 if n.startswith('language_model')
+                         else .001) for n, p in model.named_parameters()])
+                original_lrs = [g['lr'] for g in optimizer.param_groups]
+                runner = NS(model=model, optim_wrapper=NS(optimizer=optimizer), epoch=0,
+                            logger=NS(info=lambda *args: None, warning=lambda *args: None),
+                            param_schedulers=[NS(patience=5)])
+                progressive = hook_name == 'BBoxHeadFirstHook6'
+                policy = (hook_env[hook_name](True, 3, 8) if progressive
+                          else hook_env[hook_name](stage1_epochs=2))
+                policy.before_train(runner)
+                self.assertEqual([g['lr'] for g in optimizer.param_groups], original_lrs)
+                self.assertTrue(all(p.requires_grad for p in model.parameters()))
+                self.assertTrue(policy._other_groups)
+                policy.before_train_epoch(runner)
+                self.assertFalse(policy._stage2_started)
+                if progressive:
+                    self.assertEqual(runner.param_schedulers[0].patience, 3)
+                # A real auxiliary backward/SGD step updates FE and projection in Stage 1.
+                params = [model.encoder.visual.weight, model.encoder.text.weight,
+                          model.memory_trans_fc.weight, model.memory_trans_norm.weight]
+                before = [p.detach().clone() for p in params]
                 model.loss(torch.randn(2, 20, 8), samples())['loss_region_text'].backward()
                 optimizer.step()
-                after = [p for i in policy._other_groups
-                         for p in optimizer.param_groups[i]['params']]
-                assert_same(self, frozen, after)
-            for i in policy._lang_model_groups:
-                optimizer.param_groups[i]['lr'] *= .5
-            policy.before_train_epoch(runner)
-            self.assertTrue(policy._stage2_started)
-            self.assertEqual(runner.param_schedulers[0].patience, 8)
-            for i in policy._other_groups:
-                self.assertEqual(optimizer.param_groups[i]['lr'], .001)
-        self.assertEqual(*groups)
+                for old, param in zip(before, params):
+                    self.assertGreater(param.grad.abs().sum(), 0)
+                    self.assertFalse(torch.equal(old, param))
+                # Every formerly frozen parameter can update, including those outside
+                # the auxiliary path. No weight decay can mask a zero learning rate.
+                optimizer.zero_grad()
+                before = [p.detach().clone() for p in model.parameters()]
+                sum(p.sum() for p in model.parameters()).backward()
+                optimizer.step()
+                for old, param in zip(before, model.parameters()):
+                    self.assertFalse(torch.equal(old, param))
+                # Mimic the existing validation-plateau LR reduction.
+                for group in optimizer.param_groups:
+                    group['lr'] *= .5
+                runner.epoch = 2
+                policy.before_train_epoch(runner)
+                self.assertTrue(policy._stage2_started)
+                if progressive:
+                    self.assertEqual(runner.param_schedulers[0].patience, 8)
+                for i in policy._other_groups:
+                    self.assertEqual(optimizer.param_groups[i]['lr'], .0005)
+                for i in policy._lang_model_groups:
+                    self.assertEqual(optimizer.param_groups[i]['lr'], .0001)
+                self.assertTrue(all(p.requires_grad for p in model.parameters()))
+                # Stage 2 setup is one-shot; later scheduler changes survive.
+                for group in optimizer.param_groups:
+                    group['lr'] *= .5
+                lrs = [g['lr'] for g in optimizer.param_groups]
+                policy.before_train_epoch(runner)
+                self.assertEqual([g['lr'] for g in optimizer.param_groups], lrs)
 
 
 class ScopeTest(unittest.TestCase):
@@ -424,9 +451,9 @@ class ScopeTest(unittest.TestCase):
                 return ast.dump(tree)
             self.assertEqual(without_model(before), without_model(after), rel)
             self.assertIn('lambda_region_text=0.01', source(rel))
+            self.assertIn('region_text_roi_size=3', source(rel))
             self.assertNotIn('ParallelDecoder', source(rel))
-        hook = 'mmdet/engine/hooks/stage_lr_hook.py'
-        self.assertEqual(source(hook), source(hook, True))
+
 
 
 if __name__ == '__main__':

@@ -18,8 +18,13 @@ HED 전용 detector/head/layer 파일, 등록 이름, 사용하지 않던 parall
   `memory_trans_norm`을 적용한 **동일한 `output_memory` tensor**를 사용한다.
   이 tensor가 language-guided query selection의 classification branch에도 입력된다.
 - `spatial_shapes`와 `level_start_index`로 모든 spatial level을 복원한다.
-  각 GT box를 **모든 level**에서 7×7 RoIAlign(`aligned=True`, sampling ratio 2)한 후
-  공간 평균과 level 평균을 취한다. 결과는 **GT 객체마다 [256] 벡터 하나**다.
+  각 GT box의 크기 `s = sqrt(width * height)`로 FPN level을 선택한다.
+  `k = floor(4 + log2(s / 224))`를 사용 가능한 P3~P6으로 제한한다.
+  stride `(8,16,32,64)`에서 크기 구간은 각각 `<224`, `[224,448)`,
+  `[448,896)`, `>=896` pixel이다. 구현은 경계 안정성을 위해 log2 입력에
+  작은 epsilon을 더한다. 선택된 **한 level에서만 3×3 RoIAlign**
+  (`aligned=True`, sampling ratio 2)과 공간 평균을 수행하며 level 평균은 없다.
+  결과는 원래 GT 순서를 유지한 **GT 객체마다 [256] 벡터 하나**다.
   같은 class의 여러 객체를 합치지 않는다.
 - Box는 현재 `batch_data_samples.gt_instances.bboxes`의 augmented/resized xyxy
   pixel 좌표를 그대로 사용한다. `scale_factor`나 원본 크기로 재변환하지 않는다.
@@ -50,14 +55,15 @@ HED 전용 detector/head/layer 파일, 등록 이름, 사용하지 않던 parall
 model = dict(
     type='GroundingDINO',
     lambda_region_text=0.01,
-    region_text_roi_size=7,
+    region_text_roi_size=3,
     region_text_featmap_strides=(8, 16, 32, 64),
     bbox_head=dict(type='GroundingDINOHead', num_classes=num_classes))
 ```
 
 초기값 0.01은 raw dot-product 보조 손실의 작은 시작 가중치이며 튜닝된 값이 아니다.
 로그의 `loss_region_text`는 **가중치가 적용된** 항이다. Backbone/neck의 stride를
-변경하면 `region_text_featmap_strides`도 맞춰야 한다.
+변경하면 `region_text_featmap_strides`도 맞춰야 한다. Stride는 양수이며
+level마다 두 배가 되는 순서여야 한다. 기준 scale은 stride 16에서 224 pixel이다.
 
 ```bash
 # Region-text experiment
@@ -70,11 +76,15 @@ python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_fin
 0일 때는 all-class mapping, RoIAlign, 보조 loss 및 추가 head payload를 생성하지 않는다.
 Inference에는 가중치와 무관하게 보조 경로가 없다.
 
-`BBoxHeadFirstHook6`, optimizer, scheduler, augmentation, validation 및 checkpoint
-설정은 기준 branch와 동일하다. 기존 hook은 Stage 1에서 `other` group(encoder,
-`memory_trans_*` 등)의 LR을 0으로 두고, language-model LR이 원래 값의 절반 이하로
-내려가면 해당 group을 head LR로 전환한다. 이 정책을 변경하지 않는다.
-따라서 gradient가 계산되더라도 LR=0인 parameter는 기존 정책대로 갱신되지 않는다.
+`BBoxHeadFirstHook6`는 Stage 1에서 **모든 parameter group의 설정된 LR을 유지**한다.
+기존에 LR=0으로 동결하던 `other` group(Feature Enhancer/encoder,
+`memory_trans_*` 등)도 Stage 1부터 학습하며, `requires_grad=False`를 설정하지 않는다.
+Language-model LR이 원래 값의 절반 이하로 내려가면 Stage 2로 전환하고
+`other` group에 현재 head LR을 적용하는 기존 제어 흐름은 유지한다.
+Validation plateau scheduler와 patience(이 설정에서는 Stage 1: 3, Stage 2: 8),
+optimizer, augmentation, validation 및 checkpoint 설정도 유지한다.
+`patience_frozen`/`patience_unfrozen` 이름은 config 호환성을 위해 유지한다.
+Epoch 기반 대안 `StageWiseFreezeHook`에도 동일하게 Stage 1 동결 제거를 적용했다.
 
 ## 검증
 
@@ -82,11 +92,13 @@ Inference에는 가중치와 무관하게 보조 경로가 없다.
 python -m unittest discover -s tests -v
 ```
 
-로컬 PyTorch 2.14.0 CPU / torchvision 0.29.0 CPU에서 **19개 테스트 통과**.
+로컬 PyTorch 2.14.0 CPU / torchvision 0.29.0 CPU에서 **21개 테스트 통과**.
 MMEngine 0.10.7로 18개 config의 상속/파싱도 확인했다.
 
-수치 테스트는 실제 torchvision RoIAlign forward/backward를 사용해 좌표와 level
-평균, 객체 단위 평균, absent-class negative, class-name raw mean, 양쪽 gradient,
+수치 테스트는 실제 torchvision RoIAlign forward/backward를 사용해 좌표, FPN 경계와
+clamping, 비정방형 box, 객체당 한 level 선택, GT 순서, 미사용 level의 호출 생략,
+선택된 level/image로만 흐르는 gradient, 객체 단위 평균, absent-class negative,
+class-name raw mean, 양쪽 gradient,
 AMP, empty GT, 단일 class, 잘린 prompt와 DDP 분모를 검사한다.
 
 통합 회귀는 기준 commit의 독립된 원본 serial detector 메서드와 현재 구현을
@@ -95,7 +107,8 @@ AMP, empty GT, 단일 class, 잘린 prompt와 DDP 분모를 검사한다.
 reduction은 소형 fixture로 대체한다. 공유 prompt/서로 다른 prompt/명시적 span,
 empty/nonempty GT에서 `lambda=0`의 head 입력·출력, fixture loss 및 RNG가 bitwise
 일치한다. 활성화된 보조 경로의 정확한 tensor 연결과 gradient, 실제 Progressive FT
-hook의 LR=0 유지 및 Stage 2 전환도 검사한다. 원본 detection head의 소스와 config의
+hook의 Stage 1 FE/projection 실제 SGD 갱신, 모든 그룹의 trainability,
+Stage 2 전환 및 patience 유지도 검사한다. 원본 detection head의 소스와 config의
 나머지 설정이 바뀌지 않았다는 검사도 포함한다.
 
 **로컬에는 MMCV/CUDA 실행 환경이 없어 실제 전체 모델의 detection loss 회귀나

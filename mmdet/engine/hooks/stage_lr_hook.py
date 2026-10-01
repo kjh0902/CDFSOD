@@ -9,19 +9,15 @@ from mmengine.registry import HOOKS
 class BBoxHeadFirstHook6(Hook):
     """Hook for implementing two-stage training.
 
-    Stage 1: Only train bbox_head, language_model and related components, 
-             freeze all other components.
-    Stage 2: Unfreeze all components and set specific learning rates for 
-             different components.
-        - Backbone learning rate matches the final learning rate of language_model.
-        - Other components (e.g., neck) learning rate matches the final 
-          learning rate of bbox_head.
+    Stage 1: All components train at their configured learning rates.
+    Stage 2: Other components (including the Feature Enhancer) follow
+             the current head LR; remaining groups keep their scheduler LR.
 
     Args:
         adjust_scheduler_patience (bool): Whether to adjust scheduler patience 
-            when unfreezing backbone.
-        patience_frozen (int): Patience value when backbone is frozen.
-        patience_unfrozen (int): Patience value after backbone is unfrozen.
+            at the Stage 1/Stage 2 transition.
+        patience_frozen (int): Stage 1 patience (legacy argument name).
+        patience_unfrozen (int): Stage 2 patience (legacy argument name).
     
     Note:
         This Hook relies on the configuration file setting different parameter 
@@ -64,12 +60,12 @@ class BBoxHeadFirstHook6(Hook):
         # 3. Set learning rates for Stage 1
         self._set_stage1_lr(runner)
         
-        # 4. If patience adjustment is enabled, set initial patience to frozen state value
+        # 4. If patience adjustment is enabled, set initial Stage 1 patience
         if self.adjust_scheduler_patience:
             self._adjust_scheduler_patience(runner, self.patience_frozen)
 
     def before_train_epoch(self, runner) -> None:
-        """Check learning rate changes, unfreeze all components when language model's lr drops to half of original lr."""
+        """Enter Stage 2 when language model LR drops to half its original LR."""
         if self._stage2_started:
             return
             
@@ -126,7 +122,7 @@ class BBoxHeadFirstHook6(Hook):
         return current_lr <= original_lr * 0.5
 
     def _set_stage2_lr(self, runner):
-        """Stage 2: Unfreeze all components and set learning rates according to specific rules."""
+        """Stage 2: Update group learning rates while all components remain trainable."""
         runner.logger.info('Setting LRs for Stage 2...')
         optimizer = runner.optim_wrapper.optimizer
 
@@ -154,10 +150,10 @@ class BBoxHeadFirstHook6(Hook):
             optimizer.param_groups[group_idx]['lr'] = current_head_lr
         runner.logger.info(f'  - Other groups LR set to match BboxHead: {current_head_lr:.8f}')
 
-        # 3. If patience adjustment is enabled, change patience to unfrozen state value
+        # 3. If patience adjustment is enabled, set Stage 2 patience
         if self.adjust_scheduler_patience:
             self._adjust_scheduler_patience(runner, self.patience_unfrozen)
-            runner.logger.info(f'  - Scheduler patience adjusted to {self.patience_unfrozen} (unfrozen state)')
+            runner.logger.info(f'  - Scheduler patience adjusted to {self.patience_unfrozen} (Stage 2)')
 
         # 4. Log final learning rate settings
         runner.logger.info('Stage 2 LR setting completed:')
@@ -193,26 +189,12 @@ class BBoxHeadFirstHook6(Hook):
 
 
     def _set_stage1_lr(self, runner):
-        """Stage 1: bbox_head and language_model use specified learning rates, other components are frozen."""
+        """Stage 1: Train every group at its configured learning rate."""
         runner.logger.info('Setting LRs for Stage 1...')
         optimizer = runner.optim_wrapper.optimizer
-        
-        # Set learning rates for trainable groups
-        trainable_groups = self._backbone_groups + self._head_groups + self._lang_model_groups
-        for group_idx in trainable_groups:
-            base_lr = self._original_lrs[group_idx]
+        for group_idx, base_lr in self._original_lrs.items():
             optimizer.param_groups[group_idx]['lr'] = base_lr
-            # runner.logger.info(
-                # f'  - Group {group_idx} (Trainable) LR set to {base_lr:.8f} ')
-
-        # Freeze other groups
-        frozen_groups = self._other_groups
-        for group_idx in frozen_groups:
-            base_lr = self._original_lrs[group_idx]
-            optimizer.param_groups[group_idx]['lr'] = 0.0
-            # runner.logger.info(
-                # f'  - Group {group_idx} (Frozen) LR set to 0.0 '
-                # f'(base: {base_lr:.6f})')
+        runner.logger.info('Stage 1: all parameter groups retain their configured LR.')
 
     def after_train_epoch(self, runner) -> None:
         """Print current learning rate status once after each epoch."""
@@ -238,13 +220,11 @@ class BBoxHeadFirstHook6(Hook):
 class StageWiseFreezeHook(Hook):
     """Hook for implementing explicit epoch-based two-stage training.
 
-    This hook allows explicit control over which components are trainable in
-    each stage, with stage transitions based on specific epoch numbers.
+    All components are trainable in both stages.
 
-    Stage 1 (epoch 0 to stage1_epochs):
-
-    Stage 2 (epoch stage1_epochs to max_epochs):
-        - Unfreeze all components
+    Stage 1 (epoch 0 to stage1_epochs): Use configured learning rates.
+    Stage 2 (epoch stage1_epochs to max_epochs): Other groups follow
+        the current head LR; remaining groups keep their scheduler LR.
 
     Args:
         stage1_epochs (int): Number of epochs for Stage 1 training.
@@ -257,8 +237,8 @@ class StageWiseFreezeHook(Hook):
           'decoder', 'dn_query_generator'
         - other: all other parameters
 
-        Freezing is implemented by setting lr=0 only (no requires_grad=False),
-        same as BBoxHeadFirstHook6, to avoid DDP "unused parameters" errors.
+        The legacy class name is retained for config compatibility.
+        Neither this hook nor BBoxHeadFirstHook6 freezes modules.
     """
 
     def __init__(self, stage1_epochs: int = 50):
@@ -341,28 +321,15 @@ class StageWiseFreezeHook(Hook):
                         f'Other={self._other_groups}')
 
     def _set_stage1_lr(self, runner):
-        """Stage 1: backbone, decoder and language_model use base lr; only other is frozen via lr=0.
-
-        Aligned with BBoxHeadFirstHook6: only 'other' has lr=0 in Stage 1.
-        """
+        """Stage 1: Train every group at its configured learning rate."""
         runner.logger.info('Setting LRs for Stage 1...')
         optimizer = runner.optim_wrapper.optimizer
-
-        # Trainable: backbone, decoder, language_model (same as BBoxHeadFirstHook6)
-        trainable_groups = self._backbone_groups + self._head_groups + self._lang_model_groups
-        for group_idx in trainable_groups:
-            base_lr = self._original_lrs[group_idx]
+        for group_idx, base_lr in self._original_lrs.items():
             optimizer.param_groups[group_idx]['lr'] = base_lr
-
-        # Freeze other groups only (lr=0)
-        for group_idx in self._other_groups:
-            base_lr = self._original_lrs[group_idx]
-            optimizer.param_groups[group_idx]['lr'] = 0.0
-
-        runner.logger.info('Stage 1 configuration completed: backbone, decoder, language_model trainable; only other frozen (lr=0)')
+        runner.logger.info('Stage 1: all parameter groups retain their configured LR.')
 
     def _set_stage2_lr(self, runner):
-        """Stage 2: Unfreeze all components and set learning rates according to specific rules."""
+        """Stage 2: Update group learning rates while all components remain trainable."""
         runner.logger.info('Setting LRs for Stage 2...')
         optimizer = runner.optim_wrapper.optimizer
 
