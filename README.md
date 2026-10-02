@@ -264,6 +264,10 @@ python analyze_results_cdfsod.py
 - MMCV 빌드 OOM: `MAX_JOBS=1 bash scripts/install_rtx5090.sh`로 재실행한다.
 - `Address already in use`: `--port`에 사용 중이지 않은 값을 지정한다.
 - CUDA OOM: config를 변경하기 전에 `nvidia-smi`로 GPU 0의 다른 process를 확인한다.
+- 마지막 validation 직후 `munmap_chunk(): invalid pointer` / SIGABRT:
+  [종료 처리 수정과 재현·진단 절차](UODD_SHUTDOWN.md)를 참고한다.
+  최신 train/test 진입점은 분산 process group을 명시적으로 해제한다.
+  해당 네이티브 오류의 원인 확정에는 실행 서버의 재현 결과 또는 backtrace가 필요하다.
 
 ## 원본 및 인용
 

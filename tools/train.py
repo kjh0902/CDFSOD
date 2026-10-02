@@ -2,6 +2,7 @@
 import sys
 
 import argparse
+import faulthandler
 import os
 import os.path as osp
 
@@ -15,6 +16,7 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet.utils import setup_cache_size_limit_of_dynamo
+from mmdet.utils.distributed_runtime import distributed_runtime
 import os
 import random
 import numpy as np
@@ -120,18 +122,23 @@ def main():
         cfg.resume = True
         cfg.load_from = args.resume
 
-    # build the runner from config
-    if 'runner_type' not in cfg:
-        # build the default runner
-        runner = Runner.from_cfg(cfg)
-    else:
-        # build customized runner from the registry
-        # if 'runner_type' is set in the cfg
-        runner = RUNNERS.build(cfg)
+    # Keep cleanup inside main(), while the runner and Python runtime are alive.
+    with distributed_runtime():
+        # build the runner from config
+        if 'runner_type' not in cfg:
+            # build the default runner
+            runner = Runner.from_cfg(cfg)
+        else:
+            # build customized runner from the registry
+            # if 'runner_type' is set in the cfg
+            runner = RUNNERS.build(cfg)
 
-    # start training
-    runner.train()
+        # Includes final validation, checkpoint hooks and after_run hooks.
+        runner.train()
+        runner.logger.info('Runner.train() completed; starting shutdown.')
 
 
 if __name__ == '__main__':
+    # SIGABRT is not a Python exception. Keep stack dumping active through exit.
+    faulthandler.enable(all_threads=True)
     main()
