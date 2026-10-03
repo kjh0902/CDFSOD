@@ -241,10 +241,10 @@ class Prediction:
         return 1
 
 
-def fixture(weight=0.1):
+def fixture(weight=0.1, fe_weight=0.0):
     torch.manual_seed(29)
-    model = Detector(language_model={})
-    model.raw_mean_etf_loss_weight = weight
+    model = Detector(language_model={}, bert_raw_mean_etf_loss_weight=weight,
+                     fe_raw_mean_etf_loss_weight=fe_weight)
     model.language_model = Language()
     model.text_feat_map = Projection(FEATURE_DIM, FEATURE_DIM)
     model.encoder = Encoder()
@@ -312,7 +312,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
             self.assertEqual(base.state_dict().keys(), model.state_dict().keys())
             if weight:
                 actual['losses'] = dict(losses)
-                auxiliary = actual['losses'].pop('loss_raw_mean_etf')
+                auxiliary = actual['losses'].pop('loss_bert_raw_mean_etf')
                 tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 mapping = model._get_raw_mean_class_token_map(tokenized, spans)
                 final = model.encoder.text_layers[-1].output
@@ -346,7 +346,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
             torch.stack([row[mapping[c]].mean(0) for c in range(1, 7)])
             for row in final])
         self.assertFalse(torch.allclose(actual, final_means))
-        torch.testing.assert_close(losses['loss_raw_mean_etf'],
+        torch.testing.assert_close(losses['loss_bert_raw_mean_etf'],
                                    0.1 * raw_mean.nearest_etf_loss(expected))
 
     def test_auxiliary_gradient_reaches_only_projected_bert_tokens(self):
@@ -356,7 +356,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
         final.retain_grad()
         projected = model.text_feat_map.output
         projected.retain_grad()
-        losses['loss_raw_mean_etf'].backward()
+        losses['loss_bert_raw_mean_etf'].backward()
         tokenized, _, spans, _ = model.get_tokens_and_prompts(NAMES, True)
         mapping = model._get_raw_mean_class_token_map(tokenized, spans)
         self.assertEqual(len(mapping), 6)
@@ -404,7 +404,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
                                   wraps=model._get_raw_mean_class_token_map) as mapping:
                     losses, _ = run(model, data)
                 self.assertEqual(mapping.call_count, 1 if mode == 'shared' else 2)
-                self.assertTrue(torch.isfinite(losses['loss_raw_mean_etf']))
+                self.assertTrue(torch.isfinite(losses['loss_bert_raw_mean_etf']))
                 projected = model.text_feat_map.output
                 _, caption, spans, _ = model.get_tokens_and_prompts(NAMES, True)
                 first = model.get_positive_map(model.language_model.tokenizer([caption]), spans)[0]
@@ -413,7 +413,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
                     last = model.get_positive_map(tok, spans)[0]
                 else:
                     last = first
-                torch.testing.assert_close(losses['loss_raw_mean_etf'],
+                torch.testing.assert_close(losses['loss_bert_raw_mean_etf'],
                     0.1 * raw_mean.raw_mean_etf_loss(projected, [first, last], model.bbox_head.seen['text_token_mask']))
 
     def test_disabled_and_inference_never_build_auxiliary_mapping_or_solve(self):
@@ -421,8 +421,8 @@ class RawMeanIntegrationTests(unittest.TestCase):
         with patch.object(model, '_get_raw_mean_class_token_map', side_effect=AssertionError), \
                 patch.dict(Detector.loss.__globals__, raw_mean_etf_loss=lambda *a: self.fail('ETF called')):
             losses, _ = run(model, samples())
-            self.assertNotIn('loss_raw_mean_etf', losses)
-            model.raw_mean_etf_loss_weight = 0.1
+            self.assertNotIn('loss_bert_raw_mean_etf', losses)
+            model.bert_raw_mean_etf_loss_weight = 0.1
             model.eval()
             result = model.predict(torch.zeros(2, 3, 4, 4), samples())
             self.assertEqual(result[0].pred_instances.label_names, ['crazing'])
@@ -440,13 +440,13 @@ class RawMeanIntegrationTests(unittest.TestCase):
         model.language_model.max_tokens = 64
         model.language_model.pad_to_max = True
         losses, _ = run(model, samples())
-        self.assertTrue(torch.isfinite(losses['loss_raw_mean_etf']))
+        self.assertTrue(torch.isfinite(losses['loss_bert_raw_mean_etf']))
 
     def test_constructor_weight_validation(self):
-        self.assertEqual(Detector(language_model={}).raw_mean_etf_loss_weight, 0.)
+        self.assertEqual(Detector(language_model={}).bert_raw_mean_etf_loss_weight, 0.)
         for weight in [-1, float('nan'), float('inf')]:
             with self.assertRaises(ValueError):
-                Detector(language_model={}, raw_mean_etf_loss_weight=weight)
+                Detector(language_model={}, bert_raw_mean_etf_loss_weight=weight)
 
     def test_architecture_and_all_configs_preserve_base(self):
         def methods(text):
@@ -467,8 +467,12 @@ class RawMeanIntegrationTests(unittest.TestCase):
         for path in configs:
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
-            self.assertEqual(new.count('raw_mean_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new, source(rel, True))
+            self.assertEqual(new.count('bert_raw_mean_etf_loss_weight=0.1,'), 1)
+            self.assertEqual(new.count('fe_raw_mean_etf_loss_weight=0.1,'), 1)
+            restored = new.replace(
+                'bert_raw_mean_etf_loss_weight=0.1,\n    fe_raw_mean_etf_loss_weight=0.1,',
+                'raw_mean_etf_loss_weight=0.1,')
+            self.assertEqual(restored, source(rel, True))
 
 
 if __name__ == '__main__':

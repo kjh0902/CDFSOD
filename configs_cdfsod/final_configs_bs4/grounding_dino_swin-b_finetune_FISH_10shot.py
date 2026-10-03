@@ -24,7 +24,8 @@ metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 model = dict(
     type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
     rand_dnquery_rate=0.5,
-    raw_mean_etf_loss_weight=0.1,
+    bert_raw_mean_etf_loss_weight=0.1,
+    fe_raw_mean_etf_loss_weight=0.1,
     bbox_head=dict(
         type='GroundingDINOHead_ParallelDecoder_DN',
         num_classes=num_classes))

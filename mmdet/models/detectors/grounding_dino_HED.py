@@ -61,14 +61,17 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 raw_mean_etf_loss_weight=0.0,
+                 bert_raw_mean_etf_loss_weight=0.0,
+                 fe_raw_mean_etf_loss_weight=0.0,
                  **kwargs) -> None:
 
-        if (not math.isfinite(raw_mean_etf_loss_weight)
-                or raw_mean_etf_loss_weight < 0):
-            raise ValueError(
-                'raw_mean_etf_loss_weight must be finite and nonnegative.')
-        self.raw_mean_etf_loss_weight = float(raw_mean_etf_loss_weight)
+        for name, weight in [
+                ('bert_raw_mean_etf_loss_weight', bert_raw_mean_etf_loss_weight),
+                ('fe_raw_mean_etf_loss_weight', fe_raw_mean_etf_loss_weight)]:
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(f'{name} must be finite and nonnegative.')
+        self.bert_raw_mean_etf_loss_weight = float(bert_raw_mean_etf_loss_weight)
+        self.fe_raw_mean_etf_loss_weight = float(fe_raw_mean_etf_loss_weight)
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -667,7 +670,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.raw_mean_etf_loss_weight > 0 else None
+        class_token_maps = [] if (
+            self.bert_raw_mean_etf_loss_weight > 0
+            or self.fe_raw_mean_etf_loss_weight > 0) else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -735,9 +740,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
-        if class_token_maps is not None:
+        if self.bert_raw_mean_etf_loss_weight > 0:
             # ETF sees projected BERT tokens before any visual-text enhancement.
-            auxiliary_loss = raw_mean_etf_loss(
+            bert_auxiliary_loss = raw_mean_etf_loss(
                 text_dict['embedded'], class_token_maps,
                 text_dict['text_token_mask'])
 
@@ -759,8 +764,16 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        if class_token_maps is not None:
-            losses['loss_raw_mean_etf'] = (
-                self.raw_mean_etf_loss_weight * auxiliary_loss)
+        if self.bert_raw_mean_etf_loss_weight > 0:
+            losses['loss_bert_raw_mean_etf'] = (
+                self.bert_raw_mean_etf_loss_weight * bert_auxiliary_loss)
+        if self.fe_raw_mean_etf_loss_weight > 0:
+            # Reuse the same all-class mapping on the final enhancer tokens.
+            # Stage 1 freezes FE via lr=0; keep its graph for BERT/backbone grads.
+            fe_auxiliary_loss = raw_mean_etf_loss(
+                head_inputs_dict['memory_text'], class_token_maps,
+                head_inputs_dict['text_token_mask'])
+            losses['loss_fe_raw_mean_etf'] = (
+                self.fe_raw_mean_etf_loss_weight * fe_auxiliary_loss)
         return losses
 
