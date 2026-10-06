@@ -15,6 +15,7 @@ Required:
 Options:
   --gpu ID         Physical GPU ID (default: 0; this repository supports GPU 0 only)
   --port PORT      torch.distributed rendezvous port (default: 29500)
+  --etf-loss-weight W  Override model.raw_mean_etf_loss_weight (config default: 1.0; 0 disables)
   --resume         Resume from the latest checkpoint in the experiment directory
   --dry-run        Validate arguments and print resolved paths without running
   -h, --help       Show this help
@@ -25,6 +26,7 @@ DATASET=""
 SHOT=""
 GPU_ID="0"
 PORT="29500"
+ETF_LOSS_WEIGHT=""
 RESUME=false
 DRY_RUN=false
 
@@ -48,6 +50,11 @@ while [[ $# -gt 0 ]]; do
     --port)
       [[ $# -ge 2 ]] || { echo "[ERROR] --port requires a value." >&2; exit 2; }
       PORT="$2"
+      shift 2
+      ;;
+    --etf-loss-weight|--raw-mean-etf-loss-weight)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "[ERROR] $1 requires a value." >&2; exit 2; }
+      ETF_LOSS_WEIGHT="$2"
       shift 2
       ;;
     --resume)
@@ -123,6 +130,11 @@ if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   exit 2
 fi
 
+if [[ -n "${ETF_LOSS_WEIGHT}" && ! "${ETF_LOSS_WEIGHT}" =~ ^\+?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]]; then
+  echo "[ERROR] --etf-loss-weight must be a nonnegative finite number." >&2
+  exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${REPO_ROOT}/configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_${CONFIG_DATASET}_${SHOT}shot.py"
 WORK_DIR="${REPO_ROOT}/exp_cdfsod_results/${OUTPUT_DATASET}/${SHOT}shot"
@@ -133,6 +145,9 @@ if [[ ! -f "${CONFIG}" ]]; then
 fi
 
 TRAIN_ARGS=()
+if [[ -n "${ETF_LOSS_WEIGHT}" ]]; then
+  TRAIN_ARGS+=(--cfg-options "model.raw_mean_etf_loss_weight=${ETF_LOSS_WEIGHT}")
+fi
 if [[ "${RESUME}" == true ]]; then
   TRAIN_ARGS+=(--resume)
 fi
@@ -142,6 +157,11 @@ echo "Shot    : ${SHOT}"
 echo "GPU     : ${GPU_ID}"
 echo "Config  : ${CONFIG}"
 echo "Output  : ${WORK_DIR}"
+if [[ -n "${ETF_LOSS_WEIGHT}" ]]; then
+  echo "ETF wt  : ${ETF_LOSS_WEIGHT} (CLI override)"
+else
+  echo "ETF wt  : from config (default: 1.0)"
+fi
 
 if [[ "${DRY_RUN}" == true ]]; then
   echo "[OK] Dry run completed."

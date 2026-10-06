@@ -2,8 +2,8 @@
 
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스만
-정리했다.
+설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후에 **Raw Mean Simplex ETF
+보조 loss**를 추가했다. HED parallel decoder와 기존 detection 경로는 그대로 사용한다.
 
 ## 지원 환경
 
@@ -134,6 +134,43 @@ bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
 ```
 
 실행할 config와 결과 경로만 확인하려면 `--dry-run`을 추가한다.
+
+### BERT Raw Mean Simplex ETF loss
+
+전체 dataset class의 class-name token을 `text_feat_map` 직후 클래스별로 평균한다.
+Token과 개별 class prototype에 L2 정규화를 적용하지 않는다. 각 이미지의 전체 class
+prototype 행렬을 class 축으로 centering하고, 행렬 전체의 Frobenius norm으로 정규화한 뒤
+SVD로 구한 nearest Simplex ETF와의 제곱 Frobenius 거리를 계산한다. SVD target은
+detach하며, loss는 이미지별로 계산해 batch 평균을 낸다.
+
+GT에 없는 클래스와 empty-GT 이미지도 전체 class loss에 포함된다. BERT와
+`text_feat_map`에는 gradient가 흐르며, 기존 Progressive Fine-Tuning hook의 freeze/unfreeze
+설정을 따른다. Feature enhancer, HED decoder 및 detection head 입력은 변경하지 않는다.
+학습 loss dict에 `loss_raw_mean_etf`가 추가되며, inference에서는 계산하지 않는다.
+
+기본 weight는 **1.0**이다. 각 finetune config의 `model.raw_mean_etf_loss_weight`를 수정하거나
+CLI에서 덮어쓸 수 있다. `0`은 ETF mapping과 loss 계산을 모두 비활성화한다.
+
+```bash
+bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 --etf-loss-weight 0.1
+
+python tools/train.py \
+  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
+  --cfg-options model.raw_mean_etf_loss_weight=0.1
+```
+
+ETF를 켠 학습 prompt는 `bbox_head.num_classes`개의 모든 dataset class를 포함해야 한다.
+일부 클래스만 제공하거나 class token이 잘리는 prompt는 오류로 처리한다. 명시적인
+`tokens_positive`도 모든 클래스의 span을 제공해야 한다. 필요한 feature 차원은 `D >= C - 1`이다.
+FISH처럼 클래스가 하나뿐인 dataset은 클래스 간 ETF 구조를 정의할 수 없으므로,
+ETF 항을 gradient가 0인 zero loss로 처리한다. Weight 기본값은 동일하게 1.0이다.
+
+CPU PyTorch만으로 수치, gradient 및 HED 회귀 검사를 실행할 수 있다. 전체 GPU 학습 검사는
+별도로 학습 환경에서 실행해야 한다.
+
+```bash
+python -m unittest discover -s tests -p 'test_*etf*.py' -v
+```
 
 ## 4. 결과 구조와 집계
 
