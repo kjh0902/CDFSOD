@@ -1,84 +1,84 @@
-# FT-FSOD: CD-FSOD 실험 저장소
+# FT-FSOD: Background-anchored Nearest Deformed ETF
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
-Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지한다. `grounding_dino_acl_qwen` 브랜치는 offline Qwen 설명을
-BERT class-name prototype으로 바꾸는 텍스트 입력 경로를 추가한다.
+이 브랜치는 `grounding_dino_acl_serial_decoder` (`4118d18`)에서 시작한다.
+ACL Progressive Fine-Tuning과 standard serial Grounding DINO decoder를 유지하고,
+최종 Feature Enhancer(FE) output에 background-anchored nearest deformed ETF 보조
+loss를 적용한다. 기존 optimizer, scheduler, augmentation, validation 및 checkpoint
+설정은 유지한다. 입력은 foreground class name과 `background`만 사용하며 설명 JSON이나
+별도 설명 생성 모델은 필요하지 않다.
 
-## Offline Qwen class descriptions
+## Background anchor와 foreground detection
 
-Qwen은 support GT bbox crop들을 class별로 함께 보고 공통 시각 설명 한 개를 생성한다.
-검증/test 이미지는 사용하지 않는다. JSON만 detector에 전달하며 Qwen 모델은 detector,
-optimizer, checkpoint에 포함되지 않는다. 구현은 `codex/qwen3-vl-visual-descriptions`의
-`26a352b`에서 crop 생성기와 BERT prototype 경로를 이식했다.
+기존 `class_a. class_b. ...` prompt 뒤에 `background. `를 추가하고,
+BERT → `text_feat_map` → 모든 FE layer를 통과시킨다. 학습과 추론 모두 같은 경로를
+사용한다. 최종 `memory_text`에서 class-name subword만 raw mean하여 foreground
+`p_c`와 background `p_bg`를 얻는다. 구두점, 특수 토큰, padding은 pooling에서 제외한다.
+Token/class별 L2 normalization은 적용하지 않는다.
 
-먼저 학습 환경과 별도로 preprocessing 환경을 준비한다. 다음은 저장소의 CUDA 12.8
-PyTorch 버전과 Qwen3-VL을 지원하는 Transformers 버전을 사용하는 예시다.
+FE 직후 추가된 background 구간과 구두점을 제거하고 원래 foreground prompt의 token
+순서, `[SEP]` 위치와 padding mask를 복원한다. Background는 query selection, decoder
+cross-attention/classification, positive map 및 prediction label에 포함되지 않는다.
+Detection class 수와 label mapping은 기존 foreground C개 그대로다.
 
-```bash
-conda create -n qwen-offline python=3.10 -y
-conda activate qwen-offline
-python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install transformers==4.57.1 pillow==11.3.0
+Image별 loss는 다음과 같다.
 
-export CDFSOD_PATH=/path/to/datasets
-DATASET=NEU-DET
-for SHOT in 1 5 10; do
-  python tools/generate_instance_captions.py \
-    --dataset-root "${CDFSOD_PATH}/${DATASET}" \
-    --ann-file "annotations/${SHOT}_shot.json" \
-    --img-prefix train \
-    --output "annotations/${SHOT}_shot_captions.json" \
-    --model-name Qwen/Qwen3-VL-8B-Instruct \
-    --device cuda --batch-size 1
-done
+```text
+Q[c] = p_c - p_bg
+Q_hat = Q / max(||Q||_F, 1e-6)
+s[c] = 1 + alpha * present[c]
+A = diag(s) E
+A_hat = A / ||A||_F
+U, singular_values, Vh = svd(Q_hat.T @ A_hat, full_matrices=False)
+R = U @ Vh
+T = A_hat @ R.T
+L = mean_b sum_c,d (Q_hat[b,c,d] - T[b,c,d])**2
 ```
 
-`--batch-size`는 class 수다. class의 모든 crop을 한 요청에 넣으므로 필요한 메모리는
-crop 수와 해상도에 따라 달라진다. 이 예시는 실제 Qwen/GPU 실행 검증을 포함하지 않는다.
-`DATASET`은 `ArTaxOr`, `DIOR`, `FISH`, `NEU-DET`, `UODD`, `clipart1k` 중 선택한다.
-각 shot의 support annotation을 별도로 처리해야 한다.
+`E`는 foreground C개에 대한 Helmert basis 기반 canonical Simplex ETF다.
+Background를 ETF vertex에 포함하지 않는다. `present`는 augmentation 이후 image의
+GT labels로 판단하는 binary presence이며 instance count를 사용하지 않는다.
+`Q`와 deformation 이후 `A`는 class-mean centering하지 않고, matrix 전체에 대해서만
+Frobenius normalization한다. 모두 present 또는 모두 absent이면 공통 row scaling은
+normalization으로 상쇄된다.
 
-JSON은 아래 형식이며 생성기는 `ann_ids`, `image_ids`, `bboxes`, `file_names`도 보존한다.
-설정의 모든 class에 정확히 하나의 비어 있지 않은 설명이 필요하다. 누락, 중복, 알 수 없는
-class, 잘못된 bbox는 오류로 처리한다. JSON category ID가 아닌 `category_name`으로 매칭하며
-prototype 순서는 config의 `class_names`를 따른다.
+SVD와 target solve만 `no_grad`로 처리한다. `p_bg`는 detach하지 않으며 보조 loss의
+feature gradient는 BERT, projection과 FE까지 흐른다. ACL이 FE를 LR=0으로 유지하는
+단계에서도 graph는 유지한다. Geometry는 autocast를 끄고 FP32로 계산하고 FP64 입력은
+보존한다. C≥2일 때 D≥C−1이 필요하며 rank-deficient 입력에도 유효한 SVD 해를 사용한다.
+FISH처럼 C=1이면 background 경로는 유지하고 보조 loss만 미분 가능한 0으로 반환한다.
 
-```json
-{"captions": [{"category_id": 1, "category_name": "crazing", "caption": "Thin branching lines across a rough surface."}]}
+## Hyperparameter와 실행
+
+18개 finetune config 모두 다음 옵션을 사용한다. Alpha와 weight는 dataset, class 수,
+image의 present class 수 및 학습 단계와 무관한 constant scalar다.
+
+```python
+use_background_anchor=True
+bg_anchored_etf_alpha=0.5
+bg_anchored_etf_loss_weight=0.1
 ```
 
-위 JSON은 단일 entry 예시다. 학습에는 해당 데이터셋의 모든 class entry가 필요하다.
-18개 finetune config는 각자 `annotations/{shot}_shot_captions.json`을 지정한다.
+Alpha=0.5는 present class의 상대 크기를 50% 증가시키고, weight=0.1은 detection loss에
+더하는 보조 항의 가중치다. 학습 로그의 이름은 `loss_bg_anchored_nearest_deformed_etf`다.
+유한한 음이 아닌 scalar만 허용한다. 기존 CLI로 재정의할 수 있다.
 
 ```bash
-conda activate ft-fsod
-python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py
-# 다른 JSON 사용 시 (평가 시에도 동일한 override 사용)
 python tools/train.py configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_5shot.py \
-  --cfg-options model.support_caption_file=/absolute/path/5_shot_captions.json
+  --cfg-options model.bg_anchored_etf_alpha=0.25 model.bg_anchored_etf_loss_weight=0.05
 ```
 
-BERT는 정리된 class name과 설명을 `class_name: description.`으로 class마다 독립적으로
-인코딩한다. 문장 전체 attention을 사용하고 class-name subword의 마지막 hidden state만
-평균한 뒤 `text_feat_map`을 적용한다. 설명 토큰 자체는 detection token으로 전달하지 않는다.
-BERT/projection gradient와 기존 ACL 학습 단계별 LR 정책을 유지한다. 학습·평가 feature
-cache는 사용하지 않으며 텍스트/tokenization만 재사용한다. 긴 설명은 기존 BERT token 제한에
-따라 잘리고 class name이 잘리면 오류가 발생한다.
+Weight=0은 background의 FE 참여를 유지하면서 SVD/보조 loss 계산만 생략한다.
+`model.use_background_anchor=False`는 background 추가와 보조 loss를 모두 끄고 기존
+class-name detection 경로를 사용한다. 모델 옵션의 기본 flag는 False이며, finetune
+config에서 True로 활성화한다. 추론에는 GT labels나 SVD 계산이 필요하지 않다.
 
-기존 class-name 텍스트 경로로 비교하려면
-`--cfg-options model.use_class_name_token_prototypes=False`를 사용한다.
-HED decoder, DN query, detection loss, Progressive Fine-Tuning hook은 기준 ACL 코드 그대로다.
-
-가벼운 CPU sanity check (PyTorch와 Pillow 필요, MMDetection 확장/모델 다운로드 불필요):
+CPU 검증에는 PyTorch만 필요하며 MMDetection 확장이나 사전학습 모델 다운로드는
+필요하지 않다. 테스트는 실제 detector 메서드와 FE layer loop를 작은 attention 대역에
+연결해 gradient, background 분리 및 detection 인터페이스를 검증한다.
 
 ```bash
-python -m unittest discover -s tests -p test_qwen_offline_sanity.py -v
+python -m unittest discover -s tests -v
 ```
-
-실제 detector 메서드에 작은 BERT 대역을 연결해 pooling/gradient/shape/positive map을 검사하고,
-mock Qwen으로 crop·JSON 경로를 검사한다. 기준 ACL commit과 핵심 메서드 및 hook/decoder/head,
-18개 config의 텍스트 옵션 외 설정이 동일한지도 확인한다. 전체 detector/GPU 학습 검증은 별도다.
 
 ## 지원 환경
 

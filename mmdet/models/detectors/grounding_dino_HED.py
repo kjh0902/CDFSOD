@@ -1,10 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-import json
-from collections import defaultdict
 import re
 import warnings
-from typing import Dict, Optional, Tuple, Union, List, Sequence
+from numbers import Integral
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +18,8 @@ from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerEncoder)
+from ..losses.background_anchored_etf_loss import (
+    background_anchored_etf_loss, validate_nonnegative_scalar)
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -61,22 +62,24 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 use_class_name_token_prototypes: bool = False,
-                 support_caption_file: Optional[str] = None,
-                 support_class_names: Optional[Sequence[str]] = None,
+                 use_background_anchor: bool = False,
+                 bg_anchored_etf_alpha: float = 0.5,
+                 bg_anchored_etf_loss_weight: float = 0.1,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
-        # Accept the legacy config option; serial decoding uses one DN batch.
-        self.use_class_name_token_prototypes = use_class_name_token_prototypes
-        self.support_caption_file = support_caption_file
-        self.support_class_names = list(support_class_names or [])
-        self.support_prompt_bank = None
+        # Accept the legacy DN config option; serial decoding uses one DN batch.
+        if not isinstance(use_background_anchor, bool):
+            raise ValueError('use_background_anchor must be boolean.')
+        validate_nonnegative_scalar(bg_anchored_etf_alpha, 'bg_anchored_etf_alpha')
+        validate_nonnegative_scalar(
+            bg_anchored_etf_loss_weight, 'bg_anchored_etf_loss_weight')
+        self.use_background_anchor = use_background_anchor
+        self.bg_anchored_etf_alpha = float(bg_anchored_etf_alpha)
+        self.bg_anchored_etf_loss_weight = float(bg_anchored_etf_loss_weight)
         super().__init__(*args, **kwargs)
-        if self.use_class_name_token_prototypes:
-            self.build_support_prompt_bank()
 
 
     def _init_layers(self) -> None:
@@ -208,221 +211,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             positive_map, plus=1)
         return positive_map_label_to_token, positive_map
 
-    def build_support_prompt_bank(self) -> None:
-        """Read support captions once and cache class-name token positions."""
-        if self.support_prompt_bank is not None:
-            return
-        if not self.support_caption_file:
-            raise ValueError('support_caption_file is required when '
-                             'support enriched class tokens are enabled.')
-
-        with open(self.support_caption_file, 'r', encoding='utf-8') as f:
-            caption_data = json.load(f)
-
-        if (not self.support_class_names or
-                len(set(self.support_class_names)) != len(self.support_class_names)):
-            raise ValueError('support_class_names must be nonempty and unique.')
-        max_text_len = self.bbox_head.cls_branches[
-            self.decoder.num_layers].max_text_len
-        if len(self.support_class_names) > max_text_len:
-            raise ValueError('Support class count exceeds max_text_len.')
-        if not isinstance(caption_data, dict):
-            raise ValueError('Expected a class-name-to-description object '
-                             'in support JSON.')
-        class_to_idx = {name: i for i, name in enumerate(self.support_class_names)}
-        prompt_bank = defaultdict(list)
-        span_bank = defaultdict(list)
-        for class_name, caption in caption_data.items():
-            if class_name not in class_to_idx:
-                raise ValueError(f'Unknown support class: {class_name}')
-            if (not isinstance(caption, str) or
-                    not caption.strip().rstrip('.').strip()):
-                raise ValueError(f'Empty description for class: {class_name}')
-            class_idx = class_to_idx[class_name]
-            if prompt_bank[class_idx]:
-                raise ValueError(f'Duplicate description for class: {class_name}')
-            prompt, class_span = self._format_support_prompt(class_name, caption)
-            prompt_bank[class_idx].append(prompt)
-            span_bank[class_idx].append(class_span)
-        for class_idx, class_name in enumerate(self.support_class_names):
-            if not prompt_bank[class_idx]:
-                raise ValueError(f'Missing description for class: {class_name}')
-
-        prompt_texts = []
-        prompt_labels = []
-        prompt_class_spans = []
-        ordered_bank = {}
-        for class_idx in range(len(self.support_class_names)):
-            ordered_bank[class_idx] = prompt_bank[class_idx]
-            for prompt, class_span in zip(prompt_bank[class_idx],
-                                          span_bank[class_idx]):
-                prompt_texts.append(prompt)
-                prompt_labels.append(class_idx)
-                prompt_class_spans.append(class_span)
-
-        self.support_prompt_texts = prompt_texts
-        self.support_prompt_labels = torch.tensor(prompt_labels,
-                                                  dtype=torch.long)
-        self.support_prompt_class_spans = prompt_class_spans
-        self.support_tokenized = self._tokenize_support_prompts(prompt_texts)
-        self.support_prompt_class_token_positions = \
-            self._find_class_name_token_positions(
-                self.support_tokenized['offset_mapping'],
-                prompt_class_spans)
-        num_class_tokens = sum(map(
-            len, self.support_prompt_class_token_positions))
-        if num_class_tokens > max_text_len:
-            raise ValueError('Support class-name subword count exceeds '
-                             'max_text_len.')
-        self.support_prompt_bank = ordered_bank
-
-    def _format_support_prompt(
-            self, class_name: str,
-            visual_description: str) -> Tuple[str, Tuple[int, int]]:
-        clean_class_name = clean_label_name(class_name).strip()
-        if visual_description:
-            description = visual_description.strip().rstrip('.')
-            prompt = f'{clean_class_name}: {description}.'
-        else:
-            prompt = clean_class_name + '.'
-        return prompt, (0, len(clean_class_name))
-
-    def _tokenize_support_prompts(self, prompts: Sequence[str]) -> dict:
-        tokenized = self.language_model.tokenizer.batch_encode_plus(
-            list(prompts),
-            max_length=self.language_model.max_tokens,
-            padding='max_length' if self.language_model.pad_to_max else
-            'longest',
-            return_offsets_mapping=True,
-            return_special_tokens_mask=True,
-            return_tensors='pt',
-            truncation=True)
-        return dict(tokenized)
-
-    def _find_class_name_token_positions(self, offset_mapping: Tensor,
-                                         class_spans: Sequence[Tuple[int,
-                                                                    int]]):
-        token_positions = []
-        for prompt_idx, (span_start, span_end) in enumerate(class_spans):
-            positions = []
-            for token_idx, (token_start, token_end) in enumerate(
-                    offset_mapping[prompt_idx].tolist()):
-                if token_end <= token_start:
-                    continue
-                if token_start < span_end and token_end > span_start:
-                    positions.append(token_idx)
-            if len(positions) == 0:
-                prompt = self.support_prompt_texts[prompt_idx]
-                raise RuntimeError(
-                    f'No class-name tokens found for prompt: {prompt}')
-            if offset_mapping[prompt_idx, positions[-1], 1] < span_end:
-                raise RuntimeError('Class name was truncated in support prompt: '
-                                   f'{self.support_prompt_texts[prompt_idx]}')
-            token_positions.append(positions)
-        return token_positions
-
-    def _prepare_cached_tokenized(self, device) -> dict:
-        tokenized = {
-            key: value.to(device)
-            for key, value in self.support_tokenized.items()
-            if key != 'offset_mapping'
-        }
-        return {
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-            'token_type_ids': tokenized.get('token_type_ids', None)
-        }
-
-    def _encode_support_prompt_features(self, tokenizer_input: dict) -> Tensor:
-        """Encode enriched prompts with standard BERT row-wise attention."""
-        bert = self.language_model.language_backbone.body.model
-        outputs = bert(
-            input_ids=tokenizer_input['input_ids'],
-            attention_mask=tokenizer_input['attention_mask'],
-            token_type_ids=tokenizer_input.get('token_type_ids', None),
-            output_hidden_states=False,
-            return_dict=True)
-        return outputs.last_hidden_state
-
-    def build_prototype_text_dict(self, batch_size: int, device) -> Dict:
-        """Build full prompt memory; defer class-name filtering until encoding.
-
-        The legacy prototype configuration name is retained for compatibility,
-        but class-name subwords are never pooled.
-        """
-        self.build_support_prompt_bank()
-        bert_device = next(self.language_model.parameters()).device
-        tokenizer_input = self._prepare_cached_tokenized(bert_device)
-        hidden_states = self._encode_support_prompt_features(tokenizer_input)
-        valid_tokens = tokenizer_input['attention_mask'].bool()
-        prompt_features = hidden_states[valid_tokens]
-        if self.text_feat_map is not None:
-            prompt_features = self.text_feat_map(prompt_features)
-        prompt_features = prompt_features.to(device)
-        prompt_ids, positions, class_token_indices = [], [], []
-        offset = 0
-        for prompt_idx, attention_mask in enumerate(
-                self.support_tokenized['attention_mask']):
-            valid_positions = attention_mask.nonzero(as_tuple=True)[0].tolist()
-            num_prompt_tokens = len(valid_positions)
-            prompt_ids.extend([prompt_idx] * num_prompt_tokens)
-            positions.extend(range(num_prompt_tokens))
-            class_token_indices.extend(
-                offset + valid_positions.index(token_idx)
-                for token_idx in self.support_prompt_class_token_positions[
-                    prompt_idx])
-            offset += num_prompt_tokens
-
-        prompt_ids = torch.tensor(prompt_ids, device=device)
-        class_token_indices = torch.tensor(
-            class_token_indices, dtype=torch.long, device=device)
-        embedded = prompt_features.unsqueeze(0).expand(batch_size, -1, -1)
-        text_token_mask = torch.ones(
-            batch_size, offset, dtype=torch.bool, device=device)
-        text_self_attention_masks = (
-            prompt_ids[:, None] == prompt_ids[None, :]
-        ).unsqueeze(0).expand(batch_size, -1, -1)
-        position_ids = torch.tensor(
-            positions, dtype=torch.long,
-            device=device).unsqueeze(0).expand(batch_size, -1)
-        text_dict = dict(
-            embedded=embedded,
-            text_token_mask=text_token_mask,
-            masks=text_self_attention_masks,
-            position_ids=position_ids,
-            class_token_indices=class_token_indices)
-
-        return text_dict
-
-    def build_prototype_positive_maps(self, gt_labels: List[Tensor],
-                                      device) -> List[Tensor]:
-        """Mark every retained subword of each ground-truth class positive."""
-        token_positive_map = self.build_prototype_token_positive_map()
-        max_text_len = self.bbox_head.cls_branches[
-            self.decoder.num_layers].max_text_len
-        positive_maps = []
-        for labels in gt_labels:
-            if ((labels < 0) | (labels >= len(self.support_class_names))).any():
-                raise ValueError('GT label is outside support_class_names.')
-            positive_map = torch.zeros(
-                labels.size(0), max_text_len, device=device)
-            for row_idx, label in enumerate(labels.detach().cpu().tolist()):
-                positive_map[row_idx, token_positive_map[label + 1]] = 1.0
-            positive_maps.append(positive_map)
-        return positive_maps
-
-    def build_prototype_token_positive_map(self) -> dict:
-        """Map 1-based class ids to positions in filtered class-name memory."""
-        self.build_support_prompt_bank()
-        token_positive_map = {}
-        offset = 0
-        for class_idx, positions in zip(
-                self.support_prompt_labels.tolist(),
-                self.support_prompt_class_token_positions):
-            token_positive_map.setdefault(class_idx + 1, []).extend(
-                range(offset, offset + len(positions)))
-            offset += len(positions)
-        return token_positive_map
 
     def get_tokens_positive_and_prompts(
         self,
@@ -532,6 +320,105 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             positive_map_chunked, \
             entities_chunked
 
+    def _class_name_token_indices(self, caption, offsets, spans):
+        """Resolve complete class-name spans, excluding punctuation/specials."""
+        if not isinstance(spans, (list, tuple)) or not spans:
+            raise ValueError('Expected nonempty class-name character spans.')
+        indices = set()
+        for span in spans:
+            if (not isinstance(span, (list, tuple)) or len(span) != 2
+                    or any(not isinstance(i, Integral) or isinstance(i, bool)
+                           for i in span)):
+                raise ValueError('Class-name spans must contain integer [start,end].')
+            start, end = span
+            if not 0 <= start < end <= len(caption):
+                raise ValueError('Class-name span is outside the caption.')
+            name_chars = [i for i in range(start, end) if caption[i].isalnum()]
+            if not name_chars:
+                raise ValueError('Class-name span contains no name characters.')
+            selected = [i for i, (a, b) in enumerate(offsets)
+                        if b > a and a < end and b > start
+                        and any(ch.isalnum() for ch in caption[max(a, start):min(b, end)])]
+            if (not selected or any(not any(offsets[i][0] <= pos < offsets[i][1]
+                                           for i in selected) for pos in name_chars)):
+                raise ValueError('Missing or truncated class-name tokens.')
+            indices.update(selected)
+        return sorted(indices)
+
+    def _prepare_background_text(self, captions, class_spans=None):
+        """Append a background block and record how to restore detection tokens.
+
+        Foreground token indices are unchanged. The extended prompt's final
+        [SEP] is gathered into the original [SEP] position after the FE; batch
+        padding is rebuilt to the original prompt length, never used as bg.
+        """
+        if not captions or any(not isinstance(c, str) or not c.strip()
+                               for c in captions):
+            raise ValueError('Background anchoring requires nonempty captions.')
+        if class_spans is not None and len(class_spans) != len(captions):
+            raise ValueError('Expected all-class spans for every sample.')
+        extended, background_spans = [], []
+        for caption in captions:
+            separator = ' ' if caption.rstrip().endswith('.') else '. '
+            start = len(caption) + len(separator)
+            extended.append(caption + separator + 'background. ')
+            background_spans.append([[start, start + len('background')]])
+        options = dict(
+            max_length=self.language_model.max_tokens,
+            padding='max_length' if self.language_model.pad_to_max else 'longest',
+            truncation=False, return_tensors='pt')
+        original = self.language_model.tokenizer(list(captions), **options)
+        tokenized = self.language_model.tokenizer(
+            extended, return_offsets_mapping=True, **options)
+        max_length = min(self.language_model.max_tokens,
+                         self.bbox_head.cls_branches[
+                             self.decoder.num_layers].max_text_len)
+        if tokenized['attention_mask'].sum(-1).max().item() > max_length:
+            raise ValueError('Background anchoring requires complete, untruncated '
+                             'foreground and background prompts.')
+        detection_indices, background_indices, class_maps = [], [], []
+        for b, caption in enumerate(captions):
+            original_length = int(original['attention_mask'][b].sum())
+            extended_length = int(tokenized['attention_mask'][b].sum())
+            if (not torch.equal(original['input_ids'][b, :original_length - 1],
+                                tokenized['input_ids'][b, :original_length - 1])
+                    or original['input_ids'][b, original_length - 1]
+                    != tokenized['input_ids'][b, extended_length - 1]):
+                raise ValueError('Adding background changed foreground token positions.')
+            detection_indices.append(list(range(original_length - 1))
+                                     + [extended_length - 1])
+            offsets = tokenized['offset_mapping'][b].tolist()
+            background_indices.append(self._class_name_token_indices(
+                extended[b], offsets, background_spans[b]))
+            if class_spans is not None:
+                spans = class_spans[b]
+                classes = self.bbox_head.num_classes
+                if isinstance(spans, dict):
+                    if set(spans) != set(range(classes)):
+                        raise ValueError('Expected all foreground class IDs 0..C-1.')
+                    spans = [spans[c] for c in range(classes)]
+                if not isinstance(spans, (list, tuple)) or len(spans) != classes:
+                    raise ValueError('Expected class-name spans for all foreground classes.')
+                class_maps.append({c + 1: self._class_name_token_indices(
+                    caption, offsets, name_spans)
+                    for c, name_spans in enumerate(spans)})
+        metadata = dict(
+            detection_token_indices=detection_indices,
+            detection_text_token_mask=original['attention_mask'].bool(),
+            background_token_indices=background_indices,
+            class_token_maps=class_maps)
+        return extended, metadata
+
+    def _encode_text(self, captions, class_spans=None):
+        metadata = {}
+        if self.use_background_anchor:
+            captions, metadata = self._prepare_background_text(captions, class_spans)
+        text_dict = self.language_model(list(captions))
+        if self.text_feat_map is not None:
+            text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        text_dict.update(metadata)
+        return text_dict
+
     def forward_transformer(
         self,
         img_feats: Tuple[Tensor],
@@ -544,12 +431,24 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         encoder_outputs_dict = self.forward_encoder(
             **encoder_inputs_dict, text_dict=text_dict)
 
+        # Keep full final-FE memory local to this call, outside the detection head.
+        etf_memory = encoder_outputs_dict.pop('etf_memory_text', None)
+        auxiliary_loss = None
+        if etf_memory is not None:
+            auxiliary_loss = background_anchored_etf_loss(
+                etf_memory, text_dict['class_token_maps'],
+                text_dict['background_token_indices'], text_dict['text_token_mask'],
+                [sample.gt_instances.labels for sample in batch_data_samples],
+                alpha=self.bg_anchored_etf_alpha)
+
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
         decoder_inputs_dict.update(tmp_dec_in)
 
         decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
         head_inputs_dict.update(decoder_outputs_dict)
+        if auxiliary_loss is not None:
+            head_inputs_dict['bg_anchored_etf_loss'] = auxiliary_loss
         return head_inputs_dict
 
     def forward_encoder(self, feat: Tensor, feat_mask: Tensor,
@@ -569,18 +468,25 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             text_attention_mask=~text_token_mask,
             position_ids=text_dict['position_ids'],
             text_self_attention_masks=text_dict['masks'])
-        if 'class_token_indices' in text_dict:
-            # All enhancer layers see full prompts. Query selection and every
-            # decoder branch see only individual class-name subwords.
-            indices = text_dict['class_token_indices']
-            memory_text = memory_text.index_select(1, indices)
-            text_token_mask = text_token_mask.index_select(1, indices)
+        etf_memory = None
+        if 'detection_token_indices' in text_dict:
+            if self.training and self.bg_anchored_etf_loss_weight > 0:
+                etf_memory = memory_text
+            text_token_mask = text_dict['detection_text_token_mask'].to(
+                device=memory_text.device)
+            length = text_token_mask.size(1)
+            memory_text = torch.stack([
+                torch.nn.functional.pad(
+                    row[indices], (0, 0, 0, length - len(indices)))
+                for row, indices in zip(memory_text, text_dict['detection_token_indices'])])
         encoder_outputs_dict = dict(
             memory=memory,
             memory_mask=feat_mask,
             spatial_shapes=spatial_shapes,
             memory_text=memory_text,
             text_token_mask=text_token_mask)
+        if etf_memory is not None:
+            encoder_outputs_dict['etf_memory_text'] = etf_memory
         return encoder_outputs_dict
 
     def pre_decoder(
@@ -735,32 +641,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         return decoder_outputs_dict
 
 
-
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
-        if self.use_class_name_token_prototypes:
-            visual_feats = self.extract_feat(batch_inputs)
-            text_dict = self.build_prototype_text_dict(
-                len(batch_inputs), batch_inputs.device)
-            token_positive_map = self.build_prototype_token_positive_map()
-            entities = self.support_class_names
-            for data_sample in batch_data_samples:
-                data_sample.token_positive_map = token_positive_map
-
-            head_inputs_dict = self.forward_transformer(
-                visual_feats, text_dict, batch_data_samples)
-            results_list = self.bbox_head.predict(
-                **head_inputs_dict,
-                rescale=rescale,
-                batch_data_samples=batch_data_samples)
-            for data_sample, pred_instances in zip(batch_data_samples,
-                                                   results_list):
-                if len(pred_instances) > 0:
-                    pred_instances.label_names = [
-                        entities[label.item()] if label.item() < len(entities)
-                        else 'unobject' for label in pred_instances.labels
-                    ]
-                data_sample.pred_instances = pred_instances
-            return batch_data_samples
 
         text_prompts = []
         enhanced_text_prompts = []
@@ -813,11 +694,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for b in range(len(text_prompts[0])):
                 text_prompts_once = [text_prompts[0][b]]
                 token_positive_maps_once = token_positive_maps[0][b]
-                text_dict = self.language_model(text_prompts_once)
-                # text feature map layer
-                if self.text_feat_map is not None:
-                    text_dict['embedded'] = self.text_feat_map(
-                        text_dict['embedded'])
+                text_dict = self._encode_text(text_prompts_once)
 
                 batch_data_samples[
                     0].token_positive_map = token_positive_maps_once
@@ -836,12 +713,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             results_list = [results_list[0].cat(results_list)]
             is_rec_tasks = [False] * len(results_list)
         else:
-            # extract text feats
-            text_dict = self.language_model(list(text_prompts))
-            # text feature map layer
-            if self.text_feat_map is not None:
-                text_dict['embedded'] = self.text_feat_map(
-                    text_dict['embedded'])
+            text_dict = self._encode_text(list(text_prompts))
 
             is_rec_tasks = []
             for i, data_samples in enumerate(batch_data_samples):
@@ -891,30 +763,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        if self.use_class_name_token_prototypes:
-            text_dict = self.build_prototype_text_dict(
-                len(batch_inputs), batch_inputs.device)
-            positive_maps = self.build_prototype_positive_maps(
-                gt_labels, batch_inputs.device)
-            for i, data_samples in enumerate(batch_data_samples):
-                positive_map = positive_maps[i].bool().float()
-                text_token_mask = text_dict['text_token_mask'][i].index_select(
-                    0, text_dict['class_token_indices'])
-                data_samples.gt_instances.positive_maps = positive_map
-                data_samples.gt_instances.text_token_mask = \
-                    text_token_mask.unsqueeze(0).repeat(
-                        len(positive_map), 1)
+        class_spans = [] if self.use_background_anchor else None
+        if self.use_background_anchor:
+            for labels in gt_labels:
+                if ((labels < 0) | (labels >= self.bbox_head.num_classes)).any():
+                    raise ValueError('GT label is outside foreground class IDs 0..C-1.')
 
-            if self.use_autocast:
-                with autocast(enabled=True):
-                    visual_features = self.extract_feat(batch_inputs)
-            else:
-                visual_features = self.extract_feat(batch_inputs)
-            head_inputs_dict = self.forward_transformer(
-                visual_features, text_dict, batch_data_samples)
-            losses = self.bbox_head.loss(
-                **head_inputs_dict, batch_data_samples=batch_data_samples)
-            return losses
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -929,6 +783,15 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     padding='max_length'
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt')
+                if class_spans is not None:
+                    classes = self.bbox_head.num_classes
+                    if (isinstance(token_positive, dict)
+                            and set(token_positive) != set(range(classes))):
+                        raise ValueError('Expected spans for all foreground class IDs 0..C-1.')
+                    if (not isinstance(token_positive, (dict, list, tuple))
+                            or len(token_positive) != classes):
+                        raise ValueError('Expected spans for all foreground classes.')
+                    class_spans.append(token_positive)
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
@@ -946,6 +809,8 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     self.get_tokens_and_prompts(
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
+                if class_spans is not None:
+                    class_spans.extend([tokens_positive] * len(batch_inputs))
                 for gt_label in gt_labels:
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -958,6 +823,8 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     tokenized, caption_string, tokens_positive, _ = \
                         self.get_tokens_and_prompts(
                             text_prompt, True)
+                    if class_spans is not None:
+                        class_spans.append(tokens_positive)
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
@@ -966,14 +833,14 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                     positive_maps.append(positive_map)
                     new_text_prompts.append(caption_string)
 
-        text_dict = self.language_model(new_text_prompts)
-        if self.text_feat_map is not None:
-            text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
+        text_dict = self._encode_text(new_text_prompts, class_spans)
 
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
-            text_token_mask = text_dict['text_token_mask'][i]
+            detection_mask = text_dict.get(
+                'detection_text_token_mask', text_dict['text_token_mask'])
+            text_token_mask = detection_mask[i].to(batch_inputs.device)
             data_samples.gt_instances.positive_maps = positive_map
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
@@ -986,7 +853,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
+        auxiliary_loss = head_inputs_dict.pop('bg_anchored_etf_loss', None)
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
+        if auxiliary_loss is not None:
+            losses['loss_bg_anchored_nearest_deformed_etf'] = (
+                self.bg_anchored_etf_loss_weight * auxiliary_loss)
         return losses
 

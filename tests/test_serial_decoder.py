@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = '7dd4f84'
+BASE = '4118d18c3eb59ad5eed51bc228aff1492cd624d5'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/'
@@ -39,29 +39,38 @@ def method(path, name, cls=None, **env):
 
 class SerialDecoderTests(unittest.TestCase):
     def test_non_decoder_methods_and_training_head_unchanged(self):
+        removed = {
+            'build_support_prompt_bank', '_format_support_prompt',
+            '_tokenize_support_prompts', '_find_class_name_token_positions',
+            '_prepare_cached_tokenized', '_encode_support_prompt_features',
+            'build_prototype_text_dict', 'build_prototype_positive_maps',
+            'build_prototype_token_positive_map'}
+        added = {'_class_name_token_indices', '_prepare_background_text', '_encode_text'}
         for path, cls, allowed in [
-            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder'}),
-            (HEAD, 'GroundingDINOHead_ParallelDecoder_DN', {'predict_by_feat'}),
+            (DETECTOR, None, {'__init__', 'forward_transformer', 'forward_encoder',
+                             'loss', 'predict'}),
+            (HEAD, 'GroundingDINOHead_ParallelDecoder_DN', set()),
             (LAYERS + 'grounding_dino_layers_HED.py', 'GroundingDinoTransformerEncoder', set()),
         ]:
             before = {n.name: n for n in cls_node(path, cls, True).body
                       if isinstance(n, ast.FunctionDef)}
             after = {n.name: n for n in cls_node(path, cls).body
                      if isinstance(n, ast.FunctionDef)}
-            self.assertEqual(before.keys(), after.keys())
-            for name in before.keys() - allowed:
+            self.assertEqual(before.keys() - (removed if path == DETECTOR else set()),
+                             after.keys() - (added if path == DETECTOR else set()))
+            for name in before.keys() & after.keys() - allowed:
                 self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         self.assertNotIn('additional_dn_items', source(DETECTOR))
         self.assertIn('self.decoder = GroundingDinoTransformerDecoder(', source(DETECTOR))
 
     def test_decoder_parameter_structure_unchanged(self):
-        old = cls_node(LAYERS + 'grounding_dino_layers_HED.py',
-                       'GroundingDinoTransformerDecoder_parallel_15_DNQueryRand', True)
+        old = cls_node(LAYERS + 'grounding_dino_layers.py',
+                       'GroundingDinoTransformerDecoder', True)
         new = cls_node(LAYERS + 'grounding_dino_layers.py', 'GroundingDinoTransformerDecoder')
         init = lambda n: next(x for x in n.body if isinstance(x, ast.FunctionDef)
                               and x.name == '_init_layers')
         self.assertEqual(ast.dump(init(old)), ast.dump(init(new)))
-        old_layer = cls_node(LAYERS + 'grounding_dino_layers_HED.py',
+        old_layer = cls_node(LAYERS + 'grounding_dino_layers.py',
                              'GroundingDinoTransformerDecoderLayer', True)
         new_layer = cls_node(LAYERS + 'grounding_dino_layers.py',
                              'GroundingDinoTransformerDecoderLayer')
