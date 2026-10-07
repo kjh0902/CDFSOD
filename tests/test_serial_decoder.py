@@ -1,5 +1,6 @@
 """CPU regression checks for the serial ACL decoder without MMCV extensions."""
 import ast
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -18,7 +19,17 @@ LAYERS = 'mmdet/models/layers/transformer/'
 
 def source(path, base=False):
     if base:
-        return subprocess.check_output(['git', 'show', f'{BASE}:{path}'], cwd=ROOT).decode()
+        text = subprocess.check_output(['git', 'show', f'{BASE}:{path}'], cwd=ROOT).decode()
+        # Compare historical snapshots after the auxiliary symbol rename.
+        for pattern, replacement in [
+            (r'\b\w+_etf_loss_weight\b', 'raw_mean_etf_loss_weight'),
+            (r'\b\w+_etf_loss\b', 'raw_mean_etf_loss'),
+            (r'\bloss_\w+_etf\b', 'loss_raw_mean_etf'),
+            (r'\b_get_\w+_class_token_map\b', '_get_raw_mean_class_token_map'),
+            (r'\b[\w-]+ ETF (requires|found)', r'Raw mean ETF \1'),
+        ]:
+            text = re.sub(pattern, replacement, text)
+        return text
     return (ROOT / path).read_text(encoding='utf-8')
 
 
@@ -38,10 +49,8 @@ def method(path, name, cls=None, **env):
 
 
 class SerialDecoderTests(unittest.TestCase):
-    def test_etf_progressive_finetuning_and_configs_unchanged(self):
+    def test_auxiliary_wiring_progressive_finetuning_and_configs_preserved(self):
         paths = [
-            'mmdet/models/losses/second_order_etf_loss.py',
-            'mmdet/models/losses/nearest_etf_loss.py',
             'mmdet/engine/hooks/stage_lr_hook.py',
             'mmdet/models/dense_heads/dino_head.py',
             'mmdet/models/layers/transformer/dino_layers.py',
@@ -51,10 +60,10 @@ class SerialDecoderTests(unittest.TestCase):
                   for p in (ROOT / 'configs_cdfsod').rglob('*.py')]
         for path in paths:
             self.assertEqual(source(path), source(path, True), path)
-        # Preserve the FE-to-ETF path verbatim, including its auxiliary weight.
+        # Preserve the FE-to-ETF wiring and weight apart from auxiliary names.
         before = cls_node(DETECTOR, base=True)
         after = cls_node(DETECTOR)
-        for name in ('loss', '_get_second_order_class_token_map',
+        for name in ('loss', '_get_raw_mean_class_token_map',
                      'forward_encoder', 'forward_transformer'):
             old = next(n for n in before.body if isinstance(n, ast.FunctionDef)
                        and n.name == name)

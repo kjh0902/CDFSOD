@@ -1,7 +1,4 @@
-"""Raw mean class geometry from final, token-level enhancer features.
-
-Legacy second-order names are retained for existing experiment configuration.
-"""
+"""Raw mean class prototypes from final Feature Enhancer memory_text."""
 import math
 from numbers import Integral
 
@@ -11,9 +8,9 @@ from torch import Tensor
 from .nearest_etf_loss import nearest_etf_loss
 
 
-def _second_order_representations(memory_text: Tensor, class_token_maps,
-                                  text_token_mask: Tensor,
-                                  eps: float = 1e-6) -> Tensor:
+def _raw_mean_class_prototypes(memory_text: Tensor, class_token_maps,
+                               text_token_mask: Tensor,
+                               eps: float = 1e-6) -> Tensor:
     """Build [B,C,D] raw means without token or class normalization.
 
     Maps use the existing get_positive_map convention: class keys 1..C and
@@ -66,15 +63,16 @@ def _second_order_representations(memory_text: Tensor, class_token_maps,
         return torch.stack(samples)
 
 
-def second_order_etf_loss(memory_text: Tensor, class_token_maps,
-                          text_token_mask: Tensor,
-                          eps: float = 1e-6) -> Tensor:
+def raw_mean_etf_loss(memory_text: Tensor, class_token_maps,
+                      text_token_mask: Tensor,
+                      eps: float = 1e-6) -> Tensor:
     """Mean independent per-image ETF distance, with a detached SVD target.
 
-    Raw token means, class centering and whole-matrix Frobenius normalization
-    remain differentiable. No token or individual class vector is normalized.
+    Raw token means and whole-matrix Frobenius normalization remain
+    differentiable. No class mean is subtracted, and no token or individual
+    class vector is normalized.
     The original memory_text and detection mappings are never modified.
     """
-    representations = _second_order_representations(
+    prototypes = _raw_mean_class_prototypes(
         memory_text, class_token_maps, text_token_mask, eps)
-    return nearest_etf_loss(representations, eps=eps)
+    return nearest_etf_loss(prototypes, eps=eps)

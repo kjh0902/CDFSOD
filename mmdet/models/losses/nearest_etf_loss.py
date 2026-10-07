@@ -59,18 +59,17 @@ def nearest_simplex_etf(normalized_prototypes: Tensor) -> Tensor:
 def nearest_etf_loss(prototypes: Tensor, eps: float = 1e-6) -> Tensor:
     """Mean per-sample squared Frobenius distance to the nearest simplex ETF.
 
-    Center across classes and normalize the *whole* matrix, never individual
-    class vectors. Gradients flow through this normalization but not through
-    the target solve. Clamp makes collapsed inputs finite (their target is
-    non-unique); no target or prototype is cached between calls.
+    Normalize the *whole* raw prototype matrix without subtracting the class
+    mean or normalizing individual class vectors. Gradients flow through this
+    normalization but not through the target solve. Clamp makes collapsed
+    inputs finite (their target is non-unique); nothing is cached between calls.
     """
     _validate_prototypes(prototypes)
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError('eps must be finite and positive.')
     with torch.autocast(device_type=prototypes.device.type, enabled=False):
         x = _geometry_precision(prototypes)
-        centered = x - x.mean(dim=1, keepdim=True)
-        norm = torch.linalg.vector_norm(centered, dim=(-2, -1), keepdim=True)
-        normalized = centered / norm.clamp_min(eps)
+        norm = torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True)
+        normalized = x / norm.clamp_min(eps)
         target = nearest_simplex_etf(normalized)
         return (normalized - target).square().sum(dim=(-2, -1)).mean()

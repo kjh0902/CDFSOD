@@ -14,7 +14,6 @@ spec.loader.exec_module(etf)
 
 
 def normalize(x):
-    x = x - x.mean(dim=1, keepdim=True)
     return x / torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True).clamp_min(1e-6)
 
 
@@ -41,13 +40,14 @@ class NearestETFGeometryTests(unittest.TestCase):
                 target = etf.nearest_simplex_etf(z.requires_grad_())
                 self.assert_etf(target)
                 actual = (z - target).square().sum((-2, -1))
-                # Centering gives one zero singular value when D >= C.
-                singular_values = torch.linalg.svdvals(z.detach())
+                # The simplex target lies in the class-centered subspace;
+                # the raw prototype's common component still contributes loss.
+                h = torch.eye(classes, dtype=z.dtype) - 1 / classes
+                singular_values = torch.linalg.svdvals(h @ z.detach())
                 optimum = z.square().sum((-2, -1)) + 1 - (
                     2 * singular_values.sum(-1) / (classes - 1)**0.5)
                 torch.testing.assert_close(actual, optimum)
                 if dimensions >= classes:
-                    h = torch.eye(classes, dtype=z.dtype) - 1 / classes
                     u, _, vh = torch.linalg.svd(z.detach().transpose(-2, -1) @ h,
                                                full_matrices=False)
                     official_target = ((u @ vh) @ h / (classes - 1)**0.5).transpose(-2, -1)
@@ -64,9 +64,8 @@ class NearestETFGeometryTests(unittest.TestCase):
         x = torch.randn(3, 5, 8, dtype=torch.float64)
         base = etf.nearest_etf_loss(x)
         rotation, _ = torch.linalg.qr(torch.randn(8, 8, dtype=x.dtype))
-        shifted = x + torch.randn(3, 1, 8, dtype=x.dtype)
         scaled = x * torch.tensor([0.2, 3., 12.], dtype=x.dtype)[:, None, None]
-        for transformed in [shifted, scaled, x @ rotation, x[:, [3, 0, 4, 1, 2]]]:
+        for transformed in [scaled, x @ rotation, x[:, [3, 0, 4, 1, 2]]]:
             torch.testing.assert_close(base, etf.nearest_etf_loss(transformed))
         individual = torch.stack([etf.nearest_etf_loss(row[None]) for row in x])
         torch.testing.assert_close(base, individual.mean())
@@ -74,7 +73,21 @@ class NearestETFGeometryTests(unittest.TestCase):
             etf.nearest_etf_loss(x)
         z = solve.call_args.args[0]
         torch.testing.assert_close(z, normalize(x))
+        torch.testing.assert_close(z.square().sum((-2, -1)), x.new_ones(3))
+        self.assertGreater(z.mean(1).norm().item(), 0.01)
         self.assertGreater(torch.linalg.vector_norm(z, dim=-1).std().item(), 0.01)
+
+    def test_common_class_component_is_not_subtracted(self):
+        target = etf.nearest_simplex_etf(torch.randn(1, 5, 8, dtype=torch.float64))
+        common = torch.full((1, 1, 8), 2., dtype=target.dtype)
+        shifted = target + common
+        z = normalize(shifted)
+        expected = (z - target).square().sum((-2, -1)).mean()
+        loss = etf.nearest_etf_loss(shifted)
+        torch.testing.assert_close(loss, expected)
+        self.assertGreater(loss.item(), 1.)
+        # The former centering would discard the common component entirely.
+        self.assertLess(etf.nearest_etf_loss(target).item(), 1e-25)
 
     def test_only_normalized_branch_has_gradient(self):
         x = torch.randn(2, 5, 8, dtype=torch.float64, requires_grad=True)
@@ -101,7 +114,8 @@ class NearestETFGeometryTests(unittest.TestCase):
             loss.backward()
             self.assertTrue(torch.isfinite(loss))
             self.assertTrue(torch.isfinite(x.grad).all())
-        self.assertAlmostEqual(etf.nearest_etf_loss(torch.ones_like(rank_one)).item(), 1.)
+        self.assertAlmostEqual(etf.nearest_etf_loss(torch.ones_like(rank_one)).item(), 2.)
+        self.assertAlmostEqual(etf.nearest_etf_loss(torch.zeros_like(rank_one)).item(), 1.)
 
     def test_input_validation(self):
         for shape in [(5, 8), (0, 5, 8), (2, 1, 8), (2, 5, 3)]:
