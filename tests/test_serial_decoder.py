@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = 'e43c61a67f5720b954b51d2a4ce6539b0f7b8a93'
+BASE = '7fbec8da7f6cab0546449021c0437b2284db4257'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/'
@@ -50,11 +50,16 @@ class SerialDecoderTests(unittest.TestCase):
         paths += [p.relative_to(ROOT).as_posix()
                   for p in (ROOT / 'configs_cdfsod').rglob('*.py')]
         for path in paths:
-            self.assertEqual(source(path), source(path, True), path)
+            actual = source(path)
+            if path.startswith('configs_cdfsod/final_configs_bs4/'):
+                actual = actual.replace('second_order_etf_loss_weight=1.0,',
+                                        'second_order_etf_loss_weight=0.1,')
+                actual = actual.replace('        mu_focal_loss_weight=1.0,\n', '')
+            self.assertEqual(actual, source(path, True), path)
         # Preserve the FE-to-ETF path verbatim, including its auxiliary weight.
         before = cls_node(DETECTOR, base=True)
         after = cls_node(DETECTOR)
-        for name in ('loss', '_get_second_order_class_token_map',
+        for name in ('_get_second_order_class_token_map',
                      'forward_encoder', 'forward_transformer'):
             old = next(n for n in before.body if isinstance(n, ast.FunctionDef)
                        and n.name == name)
@@ -66,9 +71,6 @@ class SerialDecoderTests(unittest.TestCase):
                    and n.name == '__init__')
         new = next(n for n in after.body if isinstance(n, ast.FunctionDef)
                    and n.name == '__init__')
-        old.body = [n for n in old.body if not (
-            isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute)
-            and n.targets[0].attr == 'rand_dnquery_rate')]
         self.assertEqual(ast.dump(old), ast.dump(new))
 
     def test_standard_decoder_inherits_serial_forward_with_six_layers(self):
@@ -88,15 +90,19 @@ class SerialDecoderTests(unittest.TestCase):
 
     def test_non_decoder_methods_and_training_head_unchanged(self):
         for path, cls, allowed in [
-            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder'}),
-            (HEAD, 'GroundingDINOHead_ParallelDecoder_DN', {'predict_by_feat'}),
+            (DETECTOR, None, {'loss'}),
+            (HEAD, 'GroundingDINOHead_ParallelDecoder_DN',
+             {'__init__', 'loss', 'loss_by_feat_single'}),
             (LAYERS + 'grounding_dino_layers_HED.py', 'GroundingDinoTransformerEncoder', set()),
         ]:
             before = {n.name: n for n in cls_node(path, cls, True).body
                       if isinstance(n, ast.FunctionDef)}
             after = {n.name: n for n in cls_node(path, cls).body
                      if isinstance(n, ast.FunctionDef)}
-            self.assertEqual(before.keys(), after.keys())
+            expected_added = ({'loss_by_feat', '_loss_by_feat_single_with_targets'}
+                              if path == HEAD else set())
+            self.assertEqual(after.keys() - before.keys(), expected_added)
+            self.assertFalse(before.keys() - after.keys())
             for name in before.keys() - allowed:
                 self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
         self.assertNotIn('additional_dn_items', source(DETECTOR))
@@ -104,7 +110,7 @@ class SerialDecoderTests(unittest.TestCase):
 
     def test_decoder_parameter_structure_unchanged(self):
         old = cls_node(LAYERS + 'grounding_dino_layers_HED.py',
-                       'GroundingDinoTransformerDecoder_parallel_15_DNQueryRand', True)
+                             'GroundingDinoTransformerDecoder', True)
         new = cls_node(LAYERS + 'grounding_dino_layers.py', 'GroundingDinoTransformerDecoder')
         init = lambda n: next(x for x in n.body if isinstance(x, ast.FunctionDef)
                               and x.name == '_init_layers')

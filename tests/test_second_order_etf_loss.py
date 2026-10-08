@@ -29,17 +29,16 @@ class SecondOrderGeometryTests(unittest.TestCase):
         self.maps = [{1: [1], 2: [2, 3], 3: [5, 6, 7]} for _ in range(2)]
         self.mask = torch.ones(2, 9, dtype=torch.bool)
 
-    def test_exact_outer_product_mean_without_class_normalization(self):
+    def test_exact_raw_token_mean_without_class_normalization(self):
         actual = second._second_order_representations(self.x, self.maps, self.mask)
         expected = []
         for row, mapping in zip(self.x, self.maps):
             classes = []
             for indices in mapping.values():
                 tokens = row[indices]
-                tokens = tokens / (tokens.norm(dim=-1, keepdim=True) + 1e-6)
-                classes.append(torch.stack([torch.outer(t, t) for t in tokens]).mean(0).flatten())
+                classes.append(tokens.mean(0))
             expected.append(torch.stack(classes))
-        self.assertEqual(actual.shape, (2, 3, 16))
+        self.assertEqual(actual.shape, (2, 3, 4))
         torch.testing.assert_close(actual, torch.stack(expected))
         self.assertGreater(actual.norm(dim=-1).std().item(), 0.01)
         with patch.object(second, 'nearest_etf_loss', wraps=etf.nearest_etf_loss) as loss:
@@ -49,13 +48,12 @@ class SecondOrderGeometryTests(unittest.TestCase):
         torch.testing.assert_close(actual, second._second_order_representations(
             self.x, reversed_maps, self.mask))
 
-    def test_opposite_tokens_do_not_cancel_and_zero_token_is_finite(self):
+    def test_opposite_tokens_cancel_and_zero_token_is_finite(self):
         x = torch.tensor([[[1., 0.], [-1., 0.], [0., 0.]]], requires_grad=True)
         maps = [{1: [0, 1], 2: [2]}]
         mask = torch.ones(1, 3, dtype=torch.bool)
         result = second._second_order_representations(x, maps, mask)
-        self.assertGreater(result[0, 0, 0].item(), 0.99)
-        torch.testing.assert_close(result[0, 1], torch.zeros(4))
+        torch.testing.assert_close(result, torch.zeros(1, 2, 2))
         loss = second.second_order_etf_loss(x, maps, mask)
         loss.backward()
         self.assertTrue(torch.isfinite(loss))

@@ -111,7 +111,7 @@ class Language(nn.Module):
     def __init__(self):
         super().__init__()
         self.tokenizer = Tokenizer()
-        self.embedding = nn.Embedding(128, 4)
+        self.embedding = nn.Embedding(128, 8)
         self.pad_to_max = False
         self.max_tokens = 64
 
@@ -129,7 +129,7 @@ class Language(nn.Module):
 class Fusion(nn.Module):
     def __init__(self):
         super().__init__()
-        self.projection = nn.Linear(4, 4)
+        self.projection = nn.Linear(8, 8)
 
     def forward(self, visual_feature, lang_feature, **kw):
         return (visual_feature + lang_feature.mean(1, keepdim=True) * 0.05,
@@ -140,7 +140,7 @@ class TextLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.self_attn_cfg = SimpleNamespace(num_heads=1)
-        self.attn = nn.MultiheadAttention(4, 1, batch_first=True)
+        self.attn = nn.MultiheadAttention(8, 1, batch_first=True)
 
     def forward(self, query, query_pos, attn_mask, **kw):
         self.output = query + self.attn(query + query_pos, query + query_pos,
@@ -155,7 +155,7 @@ class VisualLayer(nn.Module):
 
 class Encoder(nn.Module):
     forward = method(LAYERS, 'GroundingDinoTransformerEncoder', 'forward',
-                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, 4).float() * 0.01)
+                     get_text_sine_pos_embed=lambda x, **kw: x.expand(-1, -1, 8).float() * 0.01)
     get_encoder_reference_points = staticmethod(lambda *a, **kw: None)
 
     def __init__(self):
@@ -192,7 +192,7 @@ class Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.cls_branches = nn.ModuleList([Classifier() for _ in range(7)])
-        self.reg_branches = nn.ModuleList([nn.Linear(4, 4) for _ in range(7)])
+        self.reg_branches = nn.ModuleList([nn.Linear(8, 4) for _ in range(7)])
 
     def loss(self, batch_data_samples, **kw):
         self.seen = kw
@@ -220,14 +220,14 @@ def fixture(base=False, weight=0.1):
     if not base:
         model.second_order_etf_loss_weight = weight
     model.language_model = Language()
-    model.text_feat_map = nn.Linear(4, 4)
+    model.text_feat_map = nn.Linear(8, 8)
     model.encoder = Encoder()
     model.decoder = Decoder()
     model.bbox_head = Head()
-    model.query_embedding = nn.Embedding(3, 4)
+    model.query_embedding = nn.Embedding(3, 8)
     model.num_queries = 3
     model.test_cfg = {}
-    features = torch.randn(2, 5, 4)
+    features = torch.randn(2, 5, 8)
     model.extract_feat = lambda _: (features,)
     model.pre_transformer = lambda *a: (dict(
         feat=features, feat_mask=torch.zeros(2, 5, dtype=torch.bool),
@@ -236,8 +236,8 @@ def fixture(base=False, weight=0.1):
         dict(memory_mask=torch.zeros(2, 5, dtype=torch.bool),
              spatial_shapes=torch.tensor([[1, 5]]), level_start_index=torch.tensor([0]),
              valid_ratios=torch.ones(2, 1, 2)))
-    model.gen_encoder_output_proposals = lambda memory, *a: (memory, torch.zeros_like(memory))
-    model.dn_query_generator = lambda _: (torch.randn(2, 1, 4), torch.randn(2, 1, 4),
+    model.gen_encoder_output_proposals = lambda memory, *a: (memory, torch.zeros_like(memory[..., :4]))
+    model.dn_query_generator = lambda _: (torch.randn(2, 1, 8), torch.randn(2, 1, 4),
                                            None, dict(num_denoising_queries=1))
     return model
 
@@ -397,8 +397,11 @@ class SecondOrderIntegrationTests(unittest.TestCase):
         for path in configs:
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
-            self.assertEqual(new.count('second_order_etf_loss_weight=0.1,'), 1)
-            self.assertEqual(new.replace('    second_order_etf_loss_weight=0.1,\n', ''), source(rel, True))
+            self.assertEqual(new.count('second_order_etf_loss_weight=1.0,'), 1)
+            self.assertEqual(new.count('mu_focal_loss_weight=1.0,'), 1)
+            stripped = new.replace('    second_order_etf_loss_weight=1.0,\n', '')
+            stripped = stripped.replace('        mu_focal_loss_weight=1.0,\n', '')
+            self.assertEqual(stripped, source(rel, True))
 
 
 if __name__ == '__main__':

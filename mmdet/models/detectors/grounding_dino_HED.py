@@ -14,7 +14,8 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.second_order_etf_loss import second_order_etf_loss
+from ..losses.second_order_etf_loss import (
+    _second_order_representations, second_order_etf_loss)
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
@@ -667,7 +668,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.second_order_etf_loss_weight > 0 else None
+        use_mu_focal = getattr(self.bbox_head, 'mu_focal_loss_weight', 0.) > 0
+        class_token_maps = [] if (
+            self.second_order_etf_loss_weight > 0 or use_mu_focal) else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -751,9 +754,15 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
+        if use_mu_focal:
+            prototypes = _second_order_representations(
+                head_inputs_dict['memory_text'], class_token_maps,
+                head_inputs_dict['text_token_mask'])
+            head_inputs_dict['class_common'] = prototypes.mean(dim=1)
+
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        if class_token_maps is not None:
+        if self.second_order_etf_loss_weight > 0:
             auxiliary_loss = second_order_etf_loss(
                 head_inputs_dict['memory_text'], class_token_maps,
                 head_inputs_dict['text_token_mask'])

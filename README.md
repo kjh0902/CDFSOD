@@ -3,68 +3,47 @@
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
 설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Second-Order Simplex ETF auxiliary loss를 추가한다.
+제공하며, 이 브랜치는 아래의 Centered ETF와 Decoder Common Focal auxiliary loss를 추가한다.
 
-## Second-Order Simplex ETF auxiliary loss
+## Centered ETF + Decoder Common Focal auxiliary losses
 
-`grounding_dino_acl`을 기반으로 하며 기존 ACL/HED detection 구조를 유지한다.
-LLM/Qwen description, support caption, detection용 class prototype은 사용하지 않는다.
-`forward_encoder()`가 전체 Feature Enhancer를 통과한 뒤 반환하는 최종 `memory_text`를
-auxiliary branch에서 읽는다. BERT 출력이나 중간 enhancer 출력을 사용하지 않는다.
+이 브랜치는 7fbec8da7f6cab0546449021c0437b2284db4257의 serial ACL detector를
+기준으로 한다. 기존 detection loss, encoder query selection, decoder, token scoring,
+Hungarian cost, DN supervision 및 inference는 유지한다.
 
-계산 순서는 다음과 같다 (`eps=1e-6`).
+최종 Feature Enhancer의 memory_text에서 모든 dataset class의 class-name token을
+raw mean하여 p_c를 만든다. 클래스별 가중치는 동일하며 token normalization은 없다.
+mu = mean_c(p_c), d_c = p_c - mu를 사용한다. 기존 centered ETF는 sample별
+전체 residual matrix를 Frobenius normalize하고, detached SVD로 구한 per-image
+nearest Simplex ETF와의 squared distance를 batch mean한다. 기존 helper 및 legacy
+second_order_etf_loss 이름은 호환성을 위해 유지한다.
 
-```text
-전체 dataset class prompt → 기존 tokens_positive / get_positive_map
-→ 최종 memory_text에서 class-name token 선택
-→ 각 token t / (||t||₂ + eps)
-→ class별 T̂ᵀT̂ / token 수 = M_c [D,D]
-→ flatten 및 stack [B,C,D²]
-→ class dimension centering
-→ sample별 전체 [C,D²] matrix Frobenius normalization (norm.clamp_min(eps))
-→ sample별 nearest Simplex ETF target (Helmert basis + reduced Procrustes SVD)
-→ squared Frobenius distance → batch mean
-```
+Common Focal은 마지막 decoder layer의 일반 matching query에만 적용한다.
+z_mu = q @ mu / sqrt(D) + b_mu이며 독립적인 learnable b_mu의 초기값은
+-log(99)이다. 기존 최종-layer Hungarian assignment의 bbox weights에서
+matched=1 / unmatched=0 target을 함께 반환하므로 추가 matching은 하지 않는다.
+Sigmoid Focal의 alpha=0.25, gamma=2.0이며 기존 classification과 같은
+positive-count/background-weight 및 distributed average factor를 사용한다.
+Common logits는 AMP에서도 FP32로 계산하고 query, raw means 및 bias에 gradient를
+전달한다. DN query, 중간 decoder layer, encoder 및 inference에는 Common Focal을
+적용하지 않는다. GT가 없는 이미지의 일반 query는 모두 negative이다.
 
-token 하나인 class도 동일하게 처리한다. token들을 먼저 평균하지 않으며, 각 `M_c`를
-개별 L2/Frobenius normalize하지 않는다. SVD target solve만 `no_grad`이고, 앞선 모든
-연산은 final `memory_text` 및 Feature Enhancer로 gradient를 전달한다. auxiliary
-계산은 FP32로 수행하며 FP64 입력은 보존한다.
+18개 few-shot config는 model.second_order_etf_loss_weight=1.0과
+model.bbox_head.mu_focal_loss_weight=1.0을 사용한다. 로그의
+loss_second_order_etf, loss_mu_focal에는 각각 weight가 이미 반영된다.
+모델 생성자의 두 기본값은 기존 config 호환성을 위해 0.0이며 독립적으로
+비활성화할 수 있다. Common Focal이 활성화되면 ETF weight가 0이어도 all-class
+mapping을 생성한다. 공통 pretraining config는 변경하지 않는다.
 
-전체 class prompt는 기존 `CocoDataset(return_classes=True)`의 `metainfo.classes`에서
-온다. GT label로 span을 선택하기 전 전체 class mapping을 보관하므로 NEU-DET은 GT가
-일부이거나 비어 있어도 항상 6개 class를 사용한다. 명시적 `tokens_positive` 역시 모든
-class의 span을 class 순서로 제공해야 한다 (dict는 0..C-1 key).
-class 수 불일치, 누락된 token, prompt truncation, padding/범위 밖 token은 오류로
-처리한다. `C >= 2`, `D² >= C-1`이 필요하다.
+CPU regression tests는 다음 명령으로 실행한다.
 
-원래 token-level `memory_text`는 변경 없이 query selection, cross-modality decoder,
-contrastive classification으로 전달된다. GT positive map, classification target,
-HED, inference 경로 및 checkpoint parameter key는 유지된다.
+    python -m unittest discover -s tests -p 'test_*.py' -v
 
-18개 few-shot config의 `model`에는 다음 옵션이 기본 적용되어 있다.
-
-```python
-second_order_etf_loss_weight=0.1
-```
-
-loss key는 `loss_second_order_etf`이며, 로그 값에는 weight가 이미 반영된다.
-옵션을 생략한 모델 생성자의 기본값은 `0.0`이다. config에서 `0.0`으로 설정하면
-auxiliary mapping 생성 및 ETF 계산을 생략한다. `tools/train.py` 실행 시에도
-`--cfg-options model.second_order_etf_loss_weight=0.0`으로 비활성화하거나 weight를
-변경할 수 있다. 공통 pretraining config에는 이 옵션을 추가하지 않았다.
-
-CPU PyTorch만으로 수학·gradient·ACL 회귀 테스트를 실행할 수 있다.
-
-```bash
-python -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-회귀 테스트는 실제 prompt mapping, detector 메서드, encoder loop, HED head forward를
-사용하고 무거운 dependency는 작은 test double로 대체한다. 기준 ACL commit은
-`8926970ebff1a549088b0a4c87c272e1a70fe0dd`이다. 동일 난수 상태에서 base 및 loss
-활성화/비활성화의 detection 출력·positive map·HED 입력을 비교한다. CUDA 테스트는
-CUDA가 없으면 skip한다. 이 테스트는 실제 MMCV/CUDA 학습이나 mAP 평가를 대체하지 않는다.
+실제 production method와 CPU PyTorch를 사용하고, MMCV base 초기화,
+Hungarian solver 및 box loss 일부는 test double로 대체한다. 추가 assignment 부재,
+기존 detection/DN loss 및 출력 보존, final-layer target 재사용, raw class mean,
+DN 제외, gradient, empty GT, AMP와 weight/config를 검증한다.
+전체 CUDA 학습이나 mAP 평가를 대체하지 않는다.
 
 ## 지원 환경
 
