@@ -54,7 +54,12 @@ class SerialDecoderTests(unittest.TestCase):
             if path.startswith('configs_cdfsod/final_configs_bs4/'):
                 actual = actual.replace('second_order_etf_loss_weight=1.0,',
                                         'second_order_etf_loss_weight=0.1,')
-                actual = actual.replace('        mu_focal_loss_weight=1.0,\n', '')
+                for option in ('enc_mu_quality_loss_weight=0.1',
+                               'dec_mu_quality_loss_weight=0.1',
+                               'common_quality_topk=5',
+                               'common_quality_ignore_iou_thr=0.5',
+                               'common_quality_beta=2.0'):
+                    actual = actual.replace('        ' + option + ',\n', '')
             self.assertEqual(actual, source(path, True), path)
         # Preserve the FE-to-ETF path verbatim, including its auxiliary weight.
         before = cls_node(DETECTOR, base=True)
@@ -90,7 +95,7 @@ class SerialDecoderTests(unittest.TestCase):
 
     def test_non_decoder_methods_and_training_head_unchanged(self):
         for path, cls, allowed in [
-            (DETECTOR, None, {'loss'}),
+            (DETECTOR, None, {'loss', 'pre_decoder'}),
             (HEAD, 'GroundingDINOHead_ParallelDecoder_DN',
              {'__init__', 'loss', 'loss_by_feat_single'}),
             (LAYERS + 'grounding_dino_layers_HED.py', 'GroundingDinoTransformerEncoder', set()),
@@ -99,7 +104,7 @@ class SerialDecoderTests(unittest.TestCase):
                       if isinstance(n, ast.FunctionDef)}
             after = {n.name: n for n in cls_node(path, cls).body
                      if isinstance(n, ast.FunctionDef)}
-            expected_added = ({'loss_by_feat', '_loss_by_feat_single_with_targets'}
+            expected_added = ({'_common_quality_loss'}
                               if path == HEAD else set())
             self.assertEqual(after.keys() - before.keys(), expected_added)
             self.assertFalse(before.keys() - after.keys())

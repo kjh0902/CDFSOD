@@ -3,47 +3,94 @@
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
 설정은 원본 그대로 유지한다. RTX 5090 단일 GPU 환경과 dataset/shot별 실행 인터페이스를
-제공하며, 이 브랜치는 아래의 Centered ETF와 Decoder Common Focal auxiliary loss를 추가한다.
+제공하며, 이 브랜치는 Centered ETF와 Encoder/Decoder Common Quality auxiliary loss를 추가한다.
 
-## Centered ETF + Decoder Common Focal auxiliary losses
+## Centered ETF + Encoder/Decoder Common IoU Quality
 
-이 브랜치는 7fbec8da7f6cab0546449021c0437b2284db4257의 serial ACL detector를
-기준으로 한다. 기존 detection loss, encoder query selection, decoder, token scoring,
-Hungarian cost, DN supervision 및 inference는 유지한다.
+기준 브랜치는 `codex/acl-centered-etf-decoder-mu-focal`(530e2e8)이다.
+기존 serial ACL decoder, Hungarian one-to-one detection loss, encoder query
+selection, token classification/confidence, DN supervision 및 inference를 유지하고,
+Decoder Common Binary Focal을 두 개의 class-agnostic Quality Focal Loss로 대체한다.
 
-최종 Feature Enhancer의 memory_text에서 모든 dataset class의 class-name token을
-raw mean하여 p_c를 만든다. 클래스별 가중치는 동일하며 token normalization은 없다.
-mu = mean_c(p_c), d_c = p_c - mu를 사용한다. 기존 centered ETF는 sample별
+최종 Feature Enhancer의 `memory_text`에서 각 dataset class의 class-name token을
+raw mean하여 `p_c`를 만든다. 클래스별 가중치는 동일하며 token normalization은 없다.
+`mu = mean_c(p_c)`, `d_c = p_c - mu`를 사용한다. 기존 centered ETF는 sample별
 전체 residual matrix를 Frobenius normalize하고, detached SVD로 구한 per-image
-nearest Simplex ETF와의 squared distance를 batch mean한다. 기존 helper 및 legacy
-second_order_etf_loss 이름은 호환성을 위해 유지한다.
+nearest Simplex ETF와의 squared distance를 batch mean한다. 이 helper와 legacy
+`second_order_etf_loss` 이름은 변경하지 않았다.
 
-Common Focal은 마지막 decoder layer의 일반 matching query에만 적용한다.
-z_mu = q @ mu / sqrt(D) + b_mu이며 독립적인 learnable b_mu의 초기값은
--log(99)이다. 기존 최종-layer Hungarian assignment의 bbox weights에서
-matched=1 / unmatched=0 target을 함께 반환하므로 추가 matching은 하지 않는다.
-Sigmoid Focal의 alpha=0.25, gamma=2.0이며 기존 classification과 같은
-positive-count/background-weight 및 distributed average factor를 사용한다.
-Common logits는 AMP에서도 FP32로 계산하고 query, raw means 및 bias에 gradient를
-전달한다. DN query, 중간 decoder layer, encoder 및 inference에는 Common Focal을
-적용하지 않는다. GT가 없는 이미지의 일반 query는 모두 negative이다.
+두 quality branch는 같은 최종 `mu`를 사용한다.
 
-18개 few-shot config는 model.second_order_etf_loss_weight=1.0과
-model.bbox_head.mu_focal_loss_weight=1.0을 사용한다. 로그의
-loss_second_order_etf, loss_mu_focal에는 각각 weight가 이미 반영된다.
-모델 생성자의 두 기본값은 기존 config 호환성을 위해 0.0이며 독립적으로
-비활성화할 수 있다. Common Focal이 활성화되면 ETF weight가 0이어도 all-class
-mapping을 생성한다. 공통 pretraining config는 변경하지 않는다.
+- Encoder: `gen_encoder_output_proposals`의 `output_memory`와 해당 encoder
+  regression branch가 예측한 box를 사용한다. 기존 top-k selection 이전의 모든
+  유효 후보가 대상이다. Padding, nonfinite base proposal/prediction 및 퇴화 box는
+  제외한다. 기존 detection encoder loss는 원래 top-k 후보만 그대로 사용한다.
+- Decoder: 마지막 layer의 일반 matching query와 그 layer가 예측한 box를
+  사용한다. DN query와 중간 decoder layer는 quality loss에 포함하지 않는다.
+- Score는 각각 `feature @ mu / sqrt(D) + bias`다. Encoder/Decoder bias는 별도의
+  parameter이며 초기값은 둘 다 `-log(99)`다. Detection classifier bias와도 별개다.
+  Auxiliary score는 selection, Hungarian matching cost 또는 최종 confidence에 쓰지 않는다.
 
-CPU regression tests는 다음 명령으로 실행한다.
+Assignment는 각 branch의 box로 독립적으로 계산하며 class logits나 Hungarian
+매칭을 참조하지 않는다. GT별 IoU top-5 후보 중 IoU > 0인 후보의 합집합을 positive로
+삼는다. 여러 GT와 겹치는 positive는 전체 GT 중 최대 IoU를 target으로 사용한다.
+같은 후보를 중복 계산하지 않는다. 미선택 후보의 최대 IoU가 0.5 이상이면 ignore,
+그보다 낮으면 target 0인 negative다. GT가 없으면 모든 유효 후보가 negative다.
+후보가 5개보다 적으면 있는 후보만 사용하며, overlap이 전혀 없으면 positive를
+강제로 만들지 않는다. 높은 IoU의 중복 후보를 무조건 background로 밀지 않도록
+ignore를 두되, 최종 one-to-one detection 감독은 그대로 유지한다.
 
-    python -m unittest discover -s tests -p 'test_*.py' -v
+기존 `QualityFocalLoss`의 soft tensor target 경로를 사용한다:
+`QFL = BCEWithLogits(score, IoU) * abs(IoU - sigmoid(score))**2`.
+Encoder/Decoder 각각의 unique positive 수를 distributed mean하고 최소 1로 clamp하여
+해당 branch의 loss sum을 나눈다. Detection classification의 avg_factor를 재사용하지
+않으며, 양성이 없어도 유효 negative를 학습한다. Ignore/invalid 후보는 제외한다.
+IoU/assignment는 `no_grad`로 계산하여 quality loss의 box-regression target 경로를
+차단한다. Score는 AMP에서도 FP32로 계산하며 feature, raw class means 및 해당 bias에
+역전파된다. 공유 encoder/decoder parameter는 feature 경로를 통해 업데이트될 수 있다.
 
-실제 production method와 CPU PyTorch를 사용하고, MMCV base 초기화,
-Hungarian solver 및 box loss 일부는 test double로 대체한다. 추가 assignment 부재,
-기존 detection/DN loss 및 출력 보존, final-layer target 재사용, raw class mean,
-DN 제외, gradient, empty GT, AMP와 weight/config를 검증한다.
-전체 CUDA 학습이나 mAP 평가를 대체하지 않는다.
+18개 few-shot config의 기본값:
+
+```python
+model = dict(
+    second_order_etf_loss_weight=1.0,
+    bbox_head=dict(
+        enc_mu_quality_loss_weight=0.1,
+        dec_mu_quality_loss_weight=0.1,
+        common_quality_topk=5,
+        common_quality_ignore_iou_thr=0.5,
+        common_quality_beta=2.0))
+```
+
+Weight를 0으로 설정하면 해당 branch만 비활성화된다. 생성자의 quality weight 기본값은
+둘 다 0.0이므로 공통 pretraining config는 그대로 사용할 수 있다. 예를 들어 encoder만
+비활성화하려면 train 명령에
+`--cfg-options model.bbox_head.enc_mu_quality_loss_weight=0.0`을 추가한다.
+옛 `mu_focal_loss_weight` 옵션은 제거되었으므로 별도 custom config에도 위 옵션을 사용한다.
+ETF가 꺼져도 quality가 하나라도 켜져 있으면 all-class mapping과 `mu`를 계산한다.
+
+로그에는 이미 weight가 적용된 `loss_second_order_etf`, `enc_loss_mu_quality`,
+`dec_loss_mu_quality`가 출력된다. Stage 1/2 hook, optimizer 및 scheduler 설정은
+변경하지 않았다. 기존과 동일한 입력/가중치에서 detection loss와 inference 경로를
+보존한다는 의미이며, 추가 loss로 학습한 가중치의 최종 detection 결과까지 같다는
+의미는 아니다.
+
+CPU regression tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Production assignment, QFL, head 및 detector methods와 CPU PyTorch를 사용한다.
+MMCV base 초기화, Hungarian solver 및 box loss 일부는 test double로 대체한다.
+IoU top-k/ignore, GT 충돌, independent normalization/bias, target detach, feature/mu
+역전파, DN 제외, empty GT/invalid 후보, AMP, 18개 config 및 기존 detection/DN loss와
+출력 보존을 검증한다. 전체 CUDA 학습이나 mAP 평가는 별도 실험이 필요하다.
+
+설계 참고: [Generalized Focal Loss](https://arxiv.org/abs/2006.04388)의 continuous quality
+감독과 [DETRs with Hybrid Matching](https://arxiv.org/abs/2207.13080)의 학습용
+one-to-many 보조 감독을 참고했다. Top-5/ignore 0.5와 위 normalization은 본 실험의
+명시적인 기본값이며, 해당 논문의 전체 알고리즘을 재현하거나 최적값을 주장하지 않는다.
 
 ## 지원 환경
 

@@ -16,6 +16,8 @@ from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
+from ..losses.common_quality_loss import (
+    common_quality_targets, validate_common_quality_cfg)
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
 
@@ -100,21 +102,36 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
     """
 
     def __init__(self, contrastive_cfg=dict(max_text_len=256),
-                 mu_focal_loss_weight=0.0, **kwargs):
-        if (not math.isfinite(mu_focal_loss_weight)
-                or mu_focal_loss_weight < 0):
-            raise ValueError('mu_focal_loss_weight must be finite and nonnegative.')
-        self.mu_focal_loss_weight = float(mu_focal_loss_weight)
+                 enc_mu_quality_loss_weight=0.0,
+                 dec_mu_quality_loss_weight=0.0, common_quality_topk=5,
+                 common_quality_ignore_iou_thr=0.5,
+                 common_quality_beta=2.0, **kwargs):
+        for name, weight in (
+                ('enc_mu_quality_loss_weight', enc_mu_quality_loss_weight),
+                ('dec_mu_quality_loss_weight', dec_mu_quality_loss_weight)):
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(f'{name} must be finite and nonnegative.')
+            setattr(self, name, float(weight))
+        validate_common_quality_cfg(common_quality_topk,
+                                    common_quality_ignore_iou_thr)
+        if not math.isfinite(common_quality_beta) or common_quality_beta < 0:
+            raise ValueError('common_quality_beta must be finite and nonnegative.')
+        self.common_quality_topk = common_quality_topk
+        self.common_quality_ignore_iou_thr = common_quality_ignore_iou_thr
         self.contrastive_cfg = contrastive_cfg
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
         super().__init__(**kwargs)
-        if self.mu_focal_loss_weight > 0:
-            # Independent foreground bias; never used by detection or inference.
-            self.mu_cls = ContrastiveEmbed(
+        if self.enc_mu_quality_loss_weight > 0:
+            self.enc_mu_cls = ContrastiveEmbed(
                 max_text_len=1, log_scale='auto', bias=True)
-            self.loss_mu_focal = MODELS.build(dict(
-                type='FocalLoss', use_sigmoid=True, alpha=0.25, gamma=2.0,
-                loss_weight=1.0))
+        if self.dec_mu_quality_loss_weight > 0:
+            self.dec_mu_cls = ContrastiveEmbed(
+                max_text_len=1, log_scale='auto', bias=True)
+        if (self.enc_mu_quality_loss_weight > 0
+                or self.dec_mu_quality_loss_weight > 0):
+            self.loss_mu_quality = MODELS.build(dict(
+                type='QualityFocalLoss', use_sigmoid=True,
+                beta=common_quality_beta, loss_weight=1.0))
 
     def _init_layers(self) -> None:
         """Initialize classification branch and regression branch of head."""
@@ -471,7 +488,10 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
              memory_text: Tensor, text_token_mask: Tensor,
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
              batch_data_samples: SampleList, dn_meta: Dict[str, int],
-             class_common: Optional[Tensor] = None) -> dict:
+             class_common: Optional[Tensor] = None,
+             enc_quality_features: Optional[Tensor] = None,
+             enc_quality_boxes: Optional[Tensor] = None,
+             enc_quality_valid_mask: Optional[Tensor] = None) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -516,87 +536,68 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
         self.text_masks = text_token_mask
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)
-        if self.mu_focal_loss_weight > 0:
+        losses = self.loss_by_feat(*loss_inputs)
+        if (self.enc_mu_quality_loss_weight > 0
+                or self.dec_mu_quality_loss_weight > 0):
             if (class_common is None
                     or class_common.shape != hidden_states.shape[1:2]
                     + hidden_states.shape[-1:]):
                 raise ValueError('Expected class_common with shape [B, D].')
+        if self.enc_mu_quality_loss_weight > 0:
+            if (enc_quality_features is None or enc_quality_boxes is None
+                    or enc_quality_valid_mask is None):
+                raise ValueError('Encoder quality requires all pre-top-k proposals.')
+            losses['enc_loss_mu_quality'] = self.enc_mu_quality_loss_weight * (
+                self._common_quality_loss(
+                    enc_quality_features, enc_quality_boxes, class_common,
+                    batch_gt_instances, batch_img_metas, self.enc_mu_cls,
+                    enc_quality_valid_mask))
+        if self.dec_mu_quality_loss_weight > 0:
             num_dn = dn_meta['num_denoising_queries'] if dn_meta else 0
-            queries = hidden_states[-1, :, num_dn:]
-            # Raw class means are FP32 under AMP, so compute auxiliary logits in
-            # the same precision. Both casts preserve FE/decoder gradients.
-            with torch.autocast(device_type=queries.device.type, enabled=False):
-                queries = queries if queries.dtype == torch.float64 else queries.float()
-                common = class_common.to(dtype=queries.dtype).unsqueeze(1)
-                common_mask = torch.ones(common.shape[:2], dtype=torch.bool,
-                                         device=common.device)
-                mu_logits = self.mu_cls(queries, common, common_mask)
-            losses = self.loss_by_feat(*loss_inputs, mu_logits=mu_logits)
-        else:
-            losses = self.loss_by_feat(*loss_inputs)
+            losses['dec_loss_mu_quality'] = self.dec_mu_quality_loss_weight * (
+                self._common_quality_loss(
+                    hidden_states[-1, :, num_dn:], outs[1][-1, :, num_dn:],
+                    class_common, batch_gt_instances, batch_img_metas,
+                    self.dec_mu_cls))
         return losses
 
-    def loss_by_feat(self, all_layers_cls_scores, all_layers_bbox_preds,
-                     enc_cls_scores, enc_bbox_preds, batch_gt_instances,
-                     batch_img_metas, dn_meta,
-                     batch_gt_instances_ignore=None, mu_logits=None):
-        """Preserve DINO losses while reusing final-layer assignment targets.
+    def _common_quality_loss(self, features, boxes, class_common,
+                             batch_gt_instances, batch_img_metas,
+                             score_branch, valid_mask=None):
+        """QFL with independent detached assignment/positive normalization.
 
-        Only the auxiliary-enabled path collects targets along with the existing
-        decoder loss calculation. Each layer still runs Hungarian exactly once;
-        encoder and DN losses retain their original methods and targets.
+        Only the auxiliary logits use FP32 under AMP. Casting keeps gradients
+        to the common text mean and visual features; boxes/IoUs are targets.
         """
-        if mu_logits is None:
-            return super().loss_by_feat(
-                all_layers_cls_scores, all_layers_bbox_preds, enc_cls_scores,
-                enc_bbox_preds, batch_gt_instances, batch_img_metas, dn_meta,
-                batch_gt_instances_ignore)
-        assert batch_gt_instances_ignore is None
-        matching_cls, matching_boxes, dn_cls, dn_boxes = self.split_outputs(
-            all_layers_cls_scores, all_layers_bbox_preds, dn_meta)
-        decoder_losses = [
-            self._loss_by_feat_single_with_targets(
-                scores, boxes, batch_gt_instances, batch_img_metas)
-            for scores, boxes in zip(matching_cls, matching_boxes)]
-        loss_dict = dict(zip(('loss_cls', 'loss_bbox', 'loss_iou'),
-                             decoder_losses[-1][:3]))
-        for layer, values in enumerate(decoder_losses[:-1]):
-            for name, value in zip(('loss_cls', 'loss_bbox', 'loss_iou'), values[:3]):
-                loss_dict[f'd{layer}.{name}'] = value
-
-        # Targets come from bbox_weights of that very same Hungarian assignment,
-        # before text-mask flattening. No matching, token-label inference or
-        # persistent target cache is needed for the common branch.
-        targets, avg_factor = decoder_losses[-1][3:]
-        loss_dict['loss_mu_focal'] = self.mu_focal_loss_weight * self.loss_mu_focal(
-            mu_logits.reshape(-1, 1), targets.reshape(-1, 1),
-            avg_factor=avg_factor)
-
-        if enc_cls_scores is not None:
-            enc_losses = self.loss_by_feat_single(
-                enc_cls_scores, enc_bbox_preds, batch_gt_instances,
-                batch_img_metas)
-            loss_dict.update(zip(('enc_loss_cls', 'enc_loss_bbox', 'enc_loss_iou'),
-                                 enc_losses))
-        if dn_cls is not None:
-            dn_losses = self.loss_dn(dn_cls, dn_boxes, batch_gt_instances,
-                                     batch_img_metas, dn_meta)
-            for name, values in zip(('loss_cls', 'loss_bbox', 'loss_iou'), dn_losses):
-                loss_dict[f'dn_{name}'] = values[-1]
-            for layer, values in enumerate(zip(*(loss[:-1] for loss in dn_losses))):
-                for name, value in zip(('loss_cls', 'loss_bbox', 'loss_iou'), values):
-                    loss_dict[f'd{layer}.dn_{name}'] = value
-        return loss_dict
+        if (features.ndim != 3 or boxes.shape != features.shape[:2] + (4,)
+                or class_common.shape != (features.shape[0], features.shape[-1])):
+            raise ValueError('Quality features, boxes and common shapes disagree.')
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            features = features if features.dtype == torch.float64 else features.float()
+            targets, supervised = common_quality_targets(
+                boxes, batch_gt_instances, batch_img_metas, valid_mask,
+                topk=self.common_quality_topk,
+                ignore_iou_thr=self.common_quality_ignore_iou_thr)
+            # Mask before the dot product as well as QFL so invalid features
+            # cannot contaminate the common-vector gradient via 0 * NaN.
+            features = features.masked_fill(~supervised.unsqueeze(-1), 0)
+            common = class_common.to(dtype=features.dtype).unsqueeze(1)
+            common_mask = torch.ones(common.shape[:2], dtype=torch.bool,
+                                     device=common.device)
+            logits = score_branch(features, common, common_mask).squeeze(-1)
+            avg_factor = reduce_mean(targets.gt(0).sum().to(logits)).clamp(min=1).item()
+            # Select before QFL: ignored/invalid entries never contribute, even
+            # when their logits are nonfinite. Empty selection is graph-connected.
+            if not supervised.any():
+                return logits[supervised].sum()
+            return self.loss_mu_quality(
+                logits[supervised].unsqueeze(-1),
+                targets[supervised].to(logits).unsqueeze(-1),
+                avg_factor=avg_factor)
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
                            batch_gt_instances: InstanceList,
                            batch_img_metas: List[dict]) -> Tuple[Tensor]:
-        return self._loss_by_feat_single_with_targets(
-            cls_scores, bbox_preds, batch_gt_instances, batch_img_metas)[:3]
-
-    def _loss_by_feat_single_with_targets(
-            self, cls_scores: Tensor, bbox_preds: Tensor,
-            batch_gt_instances: InstanceList, batch_img_metas: List[dict]):
         """Loss function for outputs from a single decoder layer of a single
         feature level.
 
@@ -630,8 +631,6 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
         label_weights = torch.stack(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
         bbox_weights = torch.cat(bbox_weights_list, 0)
-        mu_targets = bbox_weights.reshape(num_imgs, -1, 4).any(dim=-1).to(
-            dtype=cls_scores.dtype)
 
         # ===== this change =====
         # Loss is not computed for the padded regions of the text.
@@ -693,7 +692,7 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
         # regression L1 loss
         loss_bbox = self.loss_bbox(
             bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
-        return loss_cls, loss_bbox, loss_iou, mu_targets, cls_avg_factor
+        return loss_cls, loss_bbox, loss_iou
 
     def _loss_dn_single(self, dn_cls_scores: Tensor, dn_bbox_preds: Tensor,
                         batch_gt_instances: InstanceList,

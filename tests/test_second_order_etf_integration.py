@@ -398,9 +398,14 @@ class SecondOrderIntegrationTests(unittest.TestCase):
             rel = path.relative_to(ROOT).as_posix()
             new = source(rel)
             self.assertEqual(new.count('second_order_etf_loss_weight=1.0,'), 1)
-            self.assertEqual(new.count('mu_focal_loss_weight=1.0,'), 1)
             stripped = new.replace('    second_order_etf_loss_weight=1.0,\n', '')
-            stripped = stripped.replace('        mu_focal_loss_weight=1.0,\n', '')
+            for option in ('enc_mu_quality_loss_weight=0.1',
+                           'dec_mu_quality_loss_weight=0.1',
+                           'common_quality_topk=5',
+                           'common_quality_ignore_iou_thr=0.5',
+                           'common_quality_beta=2.0'):
+                self.assertEqual(new.count(option + ','), 1)
+                stripped = stripped.replace('        ' + option + ',\n', '')
             self.assertEqual(stripped, source(rel, True))
 
 

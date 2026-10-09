@@ -32,7 +32,11 @@ model = dict(
     second_order_etf_loss_weight=1.0,
     bbox_head=dict(
         type='GroundingDINOHead_ParallelDecoder_DN',
-        mu_focal_loss_weight=1.0,
+        enc_mu_quality_loss_weight=0.1,
+        dec_mu_quality_loss_weight=0.1,
+        common_quality_topk=5,
+        common_quality_ignore_iou_thr=0.5,
+        common_quality_beta=2.0,
         num_classes=num_classes))
 
 train_pipeline = [

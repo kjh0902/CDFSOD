@@ -412,6 +412,17 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                 enc_outputs_class=topk_score,
                 enc_outputs_coord=topk_coords,
                 dn_meta=dn_meta)
+            if getattr(self.bbox_head, 'enc_mu_quality_loss_weight', 0.) > 0:
+                # Preserve every valid encoder candidate for auxiliary quality
+                # supervision. Detection still consumes only the original top-k.
+                valid = (torch.isfinite(output_proposals).all(-1)
+                         & torch.isfinite(enc_outputs_coord_unact).all(-1))
+                if memory_mask is not None:
+                    valid = valid & ~memory_mask
+                head_inputs_dict.update(
+                    enc_quality_features=output_memory,
+                    enc_quality_boxes=enc_outputs_coord_unact.detach().sigmoid(),
+                    enc_quality_valid_mask=valid)
 
         else:
             reference_points = topk_coords_unact
@@ -668,9 +679,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        use_mu_focal = getattr(self.bbox_head, 'mu_focal_loss_weight', 0.) > 0
+        use_mu_quality = (
+            getattr(self.bbox_head, 'enc_mu_quality_loss_weight', 0.) > 0
+            or getattr(self.bbox_head, 'dec_mu_quality_loss_weight', 0.) > 0)
         class_token_maps = [] if (
-            self.second_order_etf_loss_weight > 0 or use_mu_focal) else None
+            self.second_order_etf_loss_weight > 0 or use_mu_quality) else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -754,7 +767,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
-        if use_mu_focal:
+        if use_mu_quality:
             prototypes = _second_order_representations(
                 head_inputs_dict['memory_text'], class_token_maps,
                 head_inputs_dict['text_token_mask'])
