@@ -1,9 +1,14 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
+이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다.
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
 설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후 또는 최종 Feature Enhancer의
-`memory_text`에 **Raw Mean Simplex ETF + μ-Orthogonality 보조 loss**를 적용할 수 있다. HED parallel decoder와 기존 detection 경로는 그대로 사용한다.
+`memory_text`에 **Raw Mean Simplex ETF + μ-Orthogonality 보조 loss**를 적용할 수 있다.
+Decoder와 Detection Head는 `codex/acl-raw-mean-etf-no-hed`의 순수 ACL 구조를 사용한다.
+6개 Decoder 레이어가 순차적으로 query/reference를 갱신하고, 학습에서는 DN Query를
+한 번만 생성한다. Head는 마지막 Decoder 레이어로 예측하며, 클래스 매핑·박스 후처리와
+평가 경로는 유지한다. 기존 config와 실행 스크립트 호환성을 위해 등록된 모델·Head 이름과
+`rand_dnquery_rate` 인자는 유지하지만, HED Parallel Decoder와 레이어별 DN Query는 사용하지 않는다.
 
 ## 지원 환경
 
@@ -194,10 +199,10 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/train.py \
 `--gpu 1`이면 `CUDA_VISIBLE_DEVICES=1`로 물리 GPU 1만 노출하고, 내부 worker는
 local rank 0 / `cuda:0`을 사용한다. Train과 test 모두 한 노드·한 process로 실행한다.
 Batch size, epoch, optimizer, scheduler, Progressive Fine-Tuning hook, Stage 1/2
-freeze 정책, Parallel Decoder / DN Query, matching, query selection과 inference는 유지한다.
+freeze 정책, matching, query selection, 클래스 매핑과 inference 후처리는 유지한다.
 FE는 Stage 1에서 기존 hook에 따라 lr=0이며, upstream BERT/backbone으로의 gradient는 유지한다.
 
-CPU PyTorch만으로 수치, gradient 및 HED 회귀 검사를 실행할 수 있다. CLI 검사는 Bash를
+CPU PyTorch만으로 수치, gradient 및 ACL Decoder 회귀 검사를 실행할 수 있다. CLI 검사는 Bash를
 사용하며 학습·평가 launcher의 인자와 환경을 확인한다. 실제 GPU 학습 검사는 별도로 수행한다.
 
 ```bash

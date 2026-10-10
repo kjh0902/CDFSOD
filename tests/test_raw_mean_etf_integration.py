@@ -1,7 +1,7 @@
 """ACL regression tests with production methods and lightweight dependencies.
 
 No downloaded weights or MMCV extensions: AST loading replaces only the heavy
-base class/imports; encoder/HED decoder loops, prompt mapping, detector and detection head
+base class/imports; encoder/serial ACL decoder loops, prompt mapping, detector and detection head
 forward run the repository's actual code. This is not a full training test.
 """
 import ast
@@ -20,7 +20,8 @@ from torch import nn
 
 from test_raw_mean_etf_loss import ROOT, raw_mean
 
-BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
+BASE = '8bd52df24303a470287d552c85e242ad46efaf2a'
+PREVIOUS = '0a2dcb061bb8aed1c6d3b579b539d30c95cf2957'
 DETECTOR = 'mmdet/models/detectors/grounding_dino_HED.py'
 HEAD = 'mmdet/models/dense_heads/grounding_dino_head_HED.py'
 LAYERS = 'mmdet/models/layers/transformer/grounding_dino_layers_HED.py'
@@ -187,13 +188,10 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     num_layers = 6
-    forward_impl = method(LAYERS,
-                          'GroundingDinoTransformerDecoder_parallel_15_DNQueryRand', 'forward',
+    forward_impl = method('mmdet/models/layers/transformer/dino_layers.py',
+                          'DinoTransformerDecoder', 'forward',
                           coordinate_to_encoding=lambda x: x,
                           inverse_sigmoid=lambda x, eps: torch.logit(x.clamp(eps, 1 - eps)))
-    _split_dn_and_matching_queries = method(
-        LAYERS, 'GroundingDinoTransformerDecoder_parallel_15_DNQueryRand',
-        '_split_dn_and_matching_queries')
 
     def __init__(self):
         super().__init__()
@@ -309,7 +307,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
         else:
             self.assertEqual(a, b)
 
-    def test_hed_detection_matches_acl_base_with_loss_enabled_or_disabled(self):
+    def test_serial_detection_matches_acl_reference_with_loss_enabled_or_disabled(self):
         base = fixture(weight=0., detector_class=load_detector(base=True))
         _, expected = run(base, samples())
         for weight in [0., 0.1, 1., 2.5]:
@@ -454,7 +452,10 @@ class RawMeanIntegrationTests(unittest.TestCase):
     def test_constructor_weight_validation(self):
         model = Detector(language_model={})
         self.assertEqual(model.bert_etf_loss_weight, 1.)
-        self.assertEqual(model.rand_dnquery_rate, 0.5)
+        self.assertFalse(hasattr(model, "rand_dnquery_rate"))
+        for legacy_rate in [0., .5, 1.]:
+            compatible = Detector(language_model={}, rand_dnquery_rate=legacy_rate)
+            self.assertFalse(hasattr(compatible, "rand_dnquery_rate"))
         for name, default in [('bert_etf_loss_weight', 1.),
                               ('bert_orth_loss_weight', 0.),
                               ('fe_etf_loss_weight', 0.), ('fe_orth_loss_weight', 0.)]:
@@ -589,62 +590,56 @@ class RawMeanIntegrationTests(unittest.TestCase):
             snapshots.append(snapshot)
         self.assert_nested_equal(snapshots[0], snapshots[1])
 
-    def test_architecture_and_all_configs_preserve_base(self):
+    def test_architecture_matches_acl_reference_and_preserves_existing_configs(self):
         def methods(text):
             cls = next(n for n in ast.parse(text).body if isinstance(n, ast.ClassDef))
             return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
-        self.assertEqual(after.keys() - before.keys(), {'_get_raw_mean_class_token_map'})
-        self.assertTrue(before.keys() <= after.keys())
-        for name in before.keys() - {'__init__', 'loss'}:
+        self.assertEqual(after.keys(), before.keys())
+        for name in before.keys() - {'__init__', 'loss', '_get_raw_mean_class_token_map'}:
             self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
-        for path in [HEAD, LAYERS, 'mmdet/models/layers/transformer/dino_layers.py',
-                     'mmdet/models/layers/transformer/grounding_dino_layers.py',
-                     'mmdet/models/detectors/grounding_dino.py',
-                     'mmdet/datasets/coco.py', 'mmdet/engine/hooks/stage_lr_hook.py',
-                     'configs_cdfsod/grounding_dino_swin-b_pretrain_all.py',
-                     'tools/train.py']:
+        # The reference head and retired HED decoder are used verbatim.
+        for path in [HEAD, LAYERS]:
             self.assertEqual(source(path), source(path, True), path)
+        paths = ['mmdet/models/layers/transformer/dino_layers.py',
+                 'mmdet/models/layers/transformer/grounding_dino_layers.py',
+                 'mmdet/models/detectors/grounding_dino.py',
+                 'mmdet/datasets/coco.py', 'mmdet/engine/hooks/stage_lr_hook.py',
+                 'tools/train.py', 'tools/test.py', 'run_cdfsod.sh',
+                 'tools/dist_train.sh', 'tools/dist_test.sh', 'src_path.py',
+                 'environment.yml', 'requirements.txt', 'scripts/install_rtx3090.sh',
+                 'tools/verify_environment.py',
+                 'mmdet/models/losses/nearest_etf_loss.py',
+                 'mmdet/models/losses/raw_mean_etf_loss.py',
+                 'mmdet/models/losses/mu_orthogonality_loss.py']
         configs = list((ROOT / 'configs_cdfsod/final_configs_bs4').glob('*.py'))
         self.assertEqual(len(configs), 18)
-        for path in configs:
-            rel = path.relative_to(ROOT).as_posix()
-            new = source(rel)
-            weights = ('    bert_etf_loss_weight=1.0,\n'
-                       '    bert_orth_loss_weight=0.0,\n'
-                       '    fe_etf_loss_weight=0.0,\n'
-                       '    fe_orth_loss_weight=0.0,\n')
-            self.assertEqual(new.count(weights), 1)
-            self.assertEqual(new.replace(weights, ''),
-                             source(rel, True))
+        paths += [p.relative_to(ROOT).as_posix()
+                  for p in (ROOT / 'configs_cdfsod').rglob('*.py')]
+        for path in paths:
+            previous = subprocess.check_output(['git', 'show', f'{PREVIOUS}:{path}'],
+                                               cwd=ROOT).decode('utf-8')
+            self.assertEqual(source(path), previous, path)
 
-    def test_hed_layers_keep_parallel_inputs_and_per_layer_dn_queries(self):
+    def test_decoder_refines_all_queries_and_references_sequentially_with_one_dn_batch(self):
         model = fixture()
-        run(model, samples())
-        # Back five layers all consume the same first-layer query and references.
-        layers = model.decoder.layers
-        for layer in layers[2:]:
-            torch.testing.assert_close(layer.input_query, layers[1].input_query)
-            torch.testing.assert_close(layer.input_references, layers[1].input_references)
-        self.assertFalse(torch.allclose(layers[0].input_query, layers[1].input_query))
-        self.assertIn('additional_dn_items', model.decoder.seen)
-
-        # Exercise HED's own-DN and shared-DN paths with explicit DN metadata.
-        seen = dict(model.decoder.seen)
-        seen['dn_meta'] = dict(num_denoising_queries=1)
-        for rate in [0., 1.]:
-            model.rand_dnquery_rate = rate
+        with patch.object(model, 'dn_query_generator', wraps=model.dn_query_generator) as dn:
             _, snapshot = run(model, samples())
-            supplied = snapshot['decoder']['additional_dn_items']
-            self.assertEqual(len(supplied), 4)
-            self.assertEqual(len(supplied[0]), model.decoder.num_layers)
-            self.assertTrue(all((q is not None) == bool(rate) for q in supplied[0]))
-            seen.update(snapshot['decoder'])
-            model.decoder(**seen)
-            for index, layer in enumerate(layers[1:]):
-                torch.testing.assert_close(layer.input_query[:, 1:], layers[1].input_query[:, 1:])
-                if rate:
-                    torch.testing.assert_close(layer.input_query[:, :1], supplied[0][index])
+            dn.assert_called_once()
+        self.assertNotIn('additional_dn_items', snapshot['decoder'])
+        self.assertEqual(snapshot['head']['dn_meta']['num_denoising_queries'], 1)
+        layers = model.decoder.layers
+        for i, layer in enumerate(layers):
+            if i:
+                torch.testing.assert_close(layer.input_query,
+                                           snapshot['head']['hidden_states'][i - 1])
+                self.assertFalse(torch.allclose(layer.input_query, layers[i - 1].input_query))
+            torch.testing.assert_close(layer.input_references[:, :, 0],
+                                       snapshot['head']['references'][i].detach())
+        model.eval()
+        with patch.object(model, 'dn_query_generator', side_effect=AssertionError('DN called in inference')):
+            model.predict(torch.zeros(2, 3, 4, 4), samples())
+        self.assertNotIn('additional_dn_items', model.decoder.seen)
 
     def test_progressive_fine_tuning_group_lrs_and_stage_transition_match_base(self):
         node = next(n for n in ast.parse(source('mmdet/engine/hooks/stage_lr_hook.py')).body
