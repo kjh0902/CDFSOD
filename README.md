@@ -2,41 +2,45 @@
 
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다. 논문의 HED,
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후에 **Raw Mean Simplex ETF
-보조 loss**를 추가했다. HED parallel decoder와 기존 detection 경로는 그대로 사용한다.
+설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후 또는 최종 Feature Enhancer의
+`memory_text`에 **Raw Mean Simplex ETF + μ-Orthogonality 보조 loss**를 적용할 수 있다. HED parallel decoder와 기존 detection 경로는 그대로 사용한다.
 
 ## 지원 환경
 
 | 항목 | 고정값 |
 |---|---|
-| GPU | NVIDIA GeForce RTX 5090, 물리 GPU 0 한 장 |
+| GPU | NVIDIA RTX 3090 24GB × 2 중 물리 GPU 0 또는 1 한 장 |
+| OS / Driver | Ubuntu/Linux / 560.35.03 |
 | Python | 3.10 |
-| PyTorch | 2.7.1 + CUDA 12.8 wheel |
-| torchvision | 0.22.1 + CUDA 12.8 wheel |
-| CUDA build toolkit | 12.8 (conda 환경 내부) |
+| PyTorch | 2.7.1 + CUDA 12.6 wheel |
+| torchvision | 0.22.1 + CUDA 12.6 wheel |
+| CUDA build toolkit | 12.6 (conda 환경 내부) |
 | MMEngine | 0.10.7 |
-| MMCV | 2.2.0 소스 빌드, `sm_120` |
+| MMCV | 2.2.0 소스 빌드, `sm_86` |
 | FairScale | 0.4.13 |
 
-`nvidia-smi`의 `CUDA Version: 13.2`는 드라이버가 지원하는 최대 버전이다. 이 저장소는
-RTX 5090 코드가 포함된 공식 PyTorch `cu128` wheel과 CUDA 12.8로 빌드한 MMCV를 사용한다.
+`nvidia-smi`의 `CUDA Version: 12.6`은 드라이버가 지원하는 최대 버전이며, 로컬 nvcc 설치를
+의미하지 않는다. [공식 PyTorch 2.7.1 설치표](https://pytorch.org/get-started/previous-versions/)의
+`cu126` wheel과 같은 CUDA 12.6 toolkit으로 MMCV를 빌드한다. 제공된 드라이버는
+[CUDA 12.6 GA의 Linux 최소 버전 560.28.03](https://docs.nvidia.com/cuda/archive/12.6.0/cuda-toolkit-release-notes/index.html)을 충족한다.
 
 ## 1. 설치
 
 ```bash
-git clone https://github.com/kjh0902/CDFSOD.git
+git clone --branch acl-hed-etf-mu-orthogonality https://github.com/kjh0902/CDFSOD.git
 cd CDFSOD
 
 conda env create -f environment.yml
 conda activate ft-fsod
-bash scripts/install_rtx5090.sh
+bash scripts/install_rtx3090.sh
 ```
 
-설치 스크립트는 PyTorch의 `sm_120` 지원, GPU 0 CUDA matmul/backward, MMCV CUDA NMS,
-FairScale activation checkpointing import를 검사한다. 다시 검사하려면:
+설치 스크립트는 PyTorch의 `sm_86` 지원, 선택한 GPU의 CUDA matmul/backward, MMCV CUDA NMS,
+FairScale activation checkpointing import를 검사한다. 설치 검사는 기본 GPU 0을 사용하며,
+`GPU_ID=1 bash scripts/install_rtx3090.sh`로 GPU 1을 선택할 수 있다. 다시 검사하려면:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python tools/verify_environment.py
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/verify_environment.py
 ```
 
 ## 2. 데이터와 사전학습 checkpoint
@@ -44,13 +48,13 @@ CUDA_VISIBLE_DEVICES=0 python tools/verify_environment.py
 기본 dataset root는 서버의 다음 경로로 설정되어 있다.
 
 ```text
-/home/aislab5090/CDFSOD/junhyung/datasets
+/home/aislab/Desktop/fewshot/data/CD-FSODdata
 ```
 
 필요한 구조는 다음과 같다.
 
 ```text
-/home/aislab5090/CDFSOD/junhyung/datasets/
+/home/aislab/Desktop/fewshot/data/CD-FSODdata/
 ├── ArTaxOr/
 ├── clipart1k/
 ├── DIOR/
@@ -65,7 +69,7 @@ CUDA_VISIBLE_DEVICES=0 python tools/verify_environment.py
 다른 위치를 사용해야 할 때만 환경 변수로 덮어쓴다.
 
 ```bash
-export CDFSOD_PATH=/absolute/path/to/datasets
+export CDFSOD_PATH=/home/aislab/Desktop/fewshot/data/CD-FSODdata
 ```
 
 Swin-B 사전학습 checkpoint를 준비한다.
@@ -124,7 +128,8 @@ bash run_cdfsod.sh --dataset UODD --shot 5 --gpu 0
 중단된 동일 실험을 이어서 실행할 때는 `--resume`을 추가한다.
 
 ```bash
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 --resume
+bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 \
+  --work-dir work_dirs/experiment_A_NEU-DET_1shot --resume
 ```
 
 동일 서버에서 다른 distributed 작업이 이미 `29500` 포트를 사용한다면 빈 포트를 지정한다.
@@ -135,46 +140,75 @@ bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
 
 실행할 config와 결과 경로만 확인하려면 `--dry-run`을 추가한다.
 
-### BERT Raw Mean Simplex ETF loss
+### BERT / FE ETF + μ-Orthogonality 실험
 
-전체 dataset class의 class-name token을 `text_feat_map` 직후 클래스별로 평균한다.
-Token과 개별 class prototype에 L2 정규화를 적용하지 않는다. 각 이미지의 전체 class
-prototype 행렬을 class 축으로 centering하고, 행렬 전체의 Frobenius norm으로 정규화한 뒤
-SVD로 구한 nearest Simplex ETF와의 제곱 Frobenius 거리를 계산한다. SVD target은
-detach하며, loss는 이미지별로 계산해 batch 평균을 낸다.
+두 위치 모두 이미지별로 **전체 dataset class**의 class-name WordPiece token을
+Raw Mean pooling한다. Token이나 개별 prototype을 정규화하지 않는다. BERT 위치는
+`text_feat_map` 직후, FE 위치는 최종 enhancer의 `memory_text`이다. 같은 위치의 두
+loss는 prototype을 한 번 계산해 같은 tensor를 공유하며, GT에 없는 클래스와 empty-GT
+이미지도 포함한다. Prompt에는 모든 클래스가 있어야 하며 잘리거나 누락된 span은 오류로 처리한다.
 
-GT에 없는 클래스와 empty-GT 이미지도 전체 class loss에 포함된다. BERT와
-`text_feat_map`에는 gradient가 흐르며, 기존 Progressive Fine-Tuning hook의 freeze/unfreeze
-설정을 따른다. Feature enhancer, HED decoder 및 detection head 입력은 변경하지 않는다.
-학습 loss dict에 `loss_raw_mean_etf`가 추가되며, inference에서는 계산하지 않는다.
+ETF는 기존 `nearest_etf_loss.py`를 그대로 사용한다. Class centering → 전체 행렬
+Frobenius normalization → 매번 SVD로 계산한 Nearest Simplex ETF와 제곱 거리를 구한다.
+Target만 detach한다. μ-Orthogonality는 `μ = mean_c p_c`, `r_c = p_c - μ`에 대해
+`mean_{i,c} ((μ_i · r_{i,c}) / (||μ_i|| ||r_{i,c}|| + 1e-6))²`를 FP32로 계산한다.
+μ와 residual 모두 detach하지 않는다. FISH의 단일 클래스는 residual이 0이므로 두 loss가 0이다.
 
-기본 weight는 **1.0**이다. 각 finetune config의 `model.raw_mean_etf_loss_weight`를 수정하거나
-CLI에서 덮어쓸 수 있다. `0`은 ETF mapping과 loss 계산을 모두 비활성화한다.
+| Config option | 기본 weight | 학습 로그 |
+|---|---:|---|
+| `model.bert_etf_loss_weight` | 1.0 | `loss_bert_etf` |
+| `model.bert_orth_loss_weight` | 0.0 | `loss_bert_orth` |
+| `model.fe_etf_loss_weight` | 0.0 | `loss_fe_etf` |
+| `model.fe_orth_loss_weight` | 0.0 | `loss_fe_orth` |
+
+각 weight는 독립적으로 조절하며, 0이면 해당 loss를 계산하거나 로그에 추가하지 않는다.
+네 weight가 모두 0이면 보조 loss용 클래스 매핑과 pooling도 생략한다. 기본값은 시작
+브랜치의 BERT ETF 단독 실험을 유지한다. Inference에서는 보조 loss를 계산하지 않는다.
+
+아래 weight 1.0은 실행 예시이며 각 loss의 weight는 실험에 맞게 설정한다. 두 명령은
+순서대로 실행하고, 각 실행은 한 GPU만 사용한다.
 
 ```bash
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 --etf-loss-weight 0.1
+# Experiment A: BERT ETF + BERT μ-Orthogonality
+bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 \
+  --work-dir work_dirs/experiment_A_NEU-DET_1shot \
+  --bert-etf-loss-weight 1.0 --bert-orth-loss-weight 1.0 \
+  --fe-etf-loss-weight 0 --fe-orth-loss-weight 0
 
-python tools/train.py \
+# Experiment B: FE ETF + FE μ-Orthogonality
+bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 1 \
+  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
+  --bert-etf-loss-weight 0 --bert-orth-loss-weight 0 \
+  --fe-etf-loss-weight 1.0 --fe-orth-loss-weight 1.0
+
+# Native MMEngine CLI에서도 동일하게 설정 가능
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/train.py \
   configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
-  --cfg-options model.raw_mean_etf_loss_weight=0.1
+  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
+  --cfg-options model.bert_etf_loss_weight=0 model.bert_orth_loss_weight=0 \
+                model.fe_etf_loss_weight=1.0 model.fe_orth_loss_weight=1.0
 ```
 
-ETF를 켠 학습 prompt는 `bbox_head.num_classes`개의 모든 dataset class를 포함해야 한다.
-일부 클래스만 제공하거나 class token이 잘리는 prompt는 오류로 처리한다. 명시적인
-`tokens_positive`도 모든 클래스의 span을 제공해야 한다. 필요한 feature 차원은 `D >= C - 1`이다.
-FISH처럼 클래스가 하나뿐인 dataset은 클래스 간 ETF 구조를 정의할 수 없으므로,
-ETF 항을 gradient가 0인 zero loss로 처리한다. Weight 기본값은 동일하게 1.0이다.
+`--etf-loss-weight`와 `--raw-mean-etf-loss-weight`는 `--bert-etf-loss-weight`의 alias로 유지한다.
+기존 config의 `model.raw_mean_etf_loss_weight`는 `model.bert_etf_loss_weight`로 변경한다.
+`--gpu 1`이면 `CUDA_VISIBLE_DEVICES=1`로 물리 GPU 1만 노출하고, 내부 worker는
+local rank 0 / `cuda:0`을 사용한다. Train과 test 모두 한 노드·한 process로 실행한다.
+Batch size, epoch, optimizer, scheduler, Progressive Fine-Tuning hook, Stage 1/2
+freeze 정책, Parallel Decoder / DN Query, matching, query selection과 inference는 유지한다.
+FE는 Stage 1에서 기존 hook에 따라 lr=0이며, upstream BERT/backbone으로의 gradient는 유지한다.
 
-CPU PyTorch만으로 수치, gradient 및 HED 회귀 검사를 실행할 수 있다. 전체 GPU 학습 검사는
-별도로 학습 환경에서 실행해야 한다.
+CPU PyTorch만으로 수치, gradient 및 HED 회귀 검사를 실행할 수 있다. CLI 검사는 Bash를
+사용하며 학습·평가 launcher의 인자와 환경을 확인한다. 실제 GPU 학습 검사는 별도로 수행한다.
 
 ```bash
-python -m unittest discover -s tests -p 'test_*etf*.py' -v
+python -m unittest discover -s tests -v
 ```
 
 ## 4. 결과 구조와 집계
 
-학습 checkpoint, 로그, 평가 결과는 dataset과 shot별로 분리된다.
+학습 checkpoint, 로그, 평가 결과는 `--work-dir`에 저장한다. 옵션을 생략하면 dataset/shot
+아래에 timestamp와 process ID를 포함한 새 run directory를 생성해 실험 간 덮어쓰기를 피한다.
+`--resume`은 기존 실험을 가리키는 `--work-dir`과 함께 사용한다.
 
 ```text
 exp_cdfsod_results/
@@ -186,7 +220,8 @@ exp_cdfsod_results/
 └── UODD/{1shot,5shot,10shot}/
 ```
 
-각 실험 폴더에는 기존 naming convention의 best checkpoint와 `results.pkl`이 저장된다.
+위 dataset/shot 폴더 아래의 개별 run directory 또는 지정한 `--work-dir`에는
+기존 naming convention의 best checkpoint와 `results.pkl`이 저장된다.
 완료된 실험의 mAP를 모아 보려면:
 
 ```bash
@@ -199,12 +234,12 @@ python analyze_results_cdfsod.py
 - `Weights only load failed` 또는 `HistoryBuffer was not an allowed global`: 최신
   `tools/train.py`와 `tools/test.py`를 사용한다. 이 호환 처리는 출처를 신뢰하는 checkpoint에만
   사용해야 한다.
-- `No module named mmcv._ext`: `scripts/install_rtx5090.sh`로 MMCV CUDA ops를 다시 빌드한다.
-- `no kernel image is available`: CUDA 12.4 이하 wheel이 섞인 환경일 수 있다. conda 환경을
-  새로 만들고 설치 스크립트를 다시 실행한다.
-- MMCV 빌드 OOM: `MAX_JOBS=1 bash scripts/install_rtx5090.sh`로 재실행한다.
+- `No module named mmcv._ext`: `scripts/install_rtx3090.sh`로 MMCV CUDA ops를 다시 빌드한다.
+- `no kernel image is available`: `sm_86`을 포함한 cu126 PyTorch와 현재 toolkit으로
+  빌드한 MMCV인지 확인한 뒤 설치 스크립트를 다시 실행한다.
+- MMCV 빌드 OOM: `MAX_JOBS=1 bash scripts/install_rtx3090.sh`로 재실행한다.
 - `Address already in use`: `--port`에 사용 중이지 않은 값을 지정한다.
-- CUDA OOM: config를 변경하기 전에 `nvidia-smi`로 GPU 0의 다른 process를 확인한다.
+- CUDA OOM: config를 변경하기 전에 `nvidia-smi`로 선택한 물리 GPU의 다른 process를 확인한다.
 
 ## 원본 및 인용
 

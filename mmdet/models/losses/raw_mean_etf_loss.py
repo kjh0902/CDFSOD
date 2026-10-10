@@ -1,4 +1,4 @@
-"""Raw mean class prototypes from projected BERT tokens before the feature enhancer."""
+"""Raw class-name token means and auxiliary geometry at BERT or FE output."""
 import math
 from numbers import Integral
 
@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from .nearest_etf_loss import nearest_etf_loss
+from .mu_orthogonality_loss import mu_orthogonality_loss
 
 
 def _raw_mean_prototypes(memory_text: Tensor, class_token_maps,
@@ -78,3 +79,26 @@ def raw_mean_etf_loss(memory_text: Tensor, class_token_maps,
     if prototypes.size(1) == 1:
         return prototypes.sum() * 0
     return nearest_etf_loss(prototypes, eps=eps)
+
+
+def raw_mean_geometry_losses(memory_text: Tensor, class_token_maps,
+                             text_token_mask: Tensor, *,
+                             etf_weight: float, orth_weight: float,
+                             eps: float = 1e-6) -> dict:
+    """Pool once per representation; evaluate only enabled loss terms.
+
+    Both objectives receive the exact same unnormalized [B,C,D] prototypes.
+    Return weighted scalar losses for the detector's individual log entries.
+    """
+    if etf_weight == 0 and orth_weight == 0:
+        return {}
+    prototypes = _raw_mean_prototypes(
+        memory_text, class_token_maps, text_token_mask, eps)
+    losses = {}
+    if etf_weight > 0:
+        etf = (prototypes.sum() * 0 if prototypes.size(1) == 1
+               else nearest_etf_loss(prototypes, eps=eps))
+        losses['etf'] = etf_weight * etf
+    if orth_weight > 0:
+        losses['orth'] = orth_weight * mu_orthogonality_loss(prototypes, eps=eps)
+    return losses

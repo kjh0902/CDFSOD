@@ -5,8 +5,8 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - cuda-nvcc=12.8
-  - cuda-toolkit=12.8
+  - cuda-nvcc=12.6
+  - cuda-toolkit=12.6
   - ninja
   - git
   - cxx-compiler

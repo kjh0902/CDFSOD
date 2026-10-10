@@ -1,8 +1,8 @@
 # Runtime dependencies for the vendored MMDetection 3.3.0 code.
 #
-# PyTorch and MMCV are intentionally installed by scripts/install_rtx5090.sh:
-# - torch/torchvision must come from the official CUDA 12.8 wheel index.
-# - MMCV must be compiled for the active torch ABI and RTX 5090 (sm_120).
+# PyTorch and MMCV are intentionally installed by scripts/install_rtx3090.sh:
+# - torch/torchvision come from the official CUDA 12.6 wheel index.
+# - MMCV is compiled for the active torch ABI and RTX 3090 (sm_86).
 
 addict==2.4.0
 fairscale==0.4.13
@@ -24,6 +24,6 @@ terminaltables==3.1.10
 transformers==4.57.1
 yapf==0.43.0
 
-# MMEngine 0.10.7 is installed with --no-deps by install_rtx5090.sh after
+# MMEngine 0.10.7 is installed with --no-deps by install_rtx3090.sh after
 # this file so that its opencv-python dependency does not replace the
 # headless server build above.

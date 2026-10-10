@@ -15,12 +15,12 @@ export CUDACXX="${CONDA_PREFIX}/bin/nvcc"
 export CPATH="${CONDA_PREFIX}/targets/x86_64-linux/include${CPATH:+:${CPATH}}"
 export LIBRARY_PATH="${CONDA_PREFIX}/targets/x86_64-linux/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-export TORCH_CUDA_ARCH_LIST="12.0"
+export TORCH_CUDA_ARCH_LIST="8.6"
 export MMCV_WITH_OPS=1
 export MAX_JOBS="${MAX_JOBS:-2}"
 
 if [[ ! -x "${CUDACXX}" ]]; then
-  echo "[ERROR] CUDA 12.8 nvcc was not found at ${CUDACXX}." >&2
+  echo "[ERROR] CUDA 12.6 nvcc was not found at ${CUDACXX}." >&2
   exit 1
 fi
 
@@ -29,7 +29,7 @@ python -m pip install --upgrade \
 
 python -m pip install \
   "torch==2.7.1" "torchvision==0.22.1" \
-  --index-url https://download.pytorch.org/whl/cu128
+  --index-url https://download.pytorch.org/whl/cu126
 
 python -m pip install -r "${REPO_ROOT}/requirements.txt"
 python -m pip install --no-deps "mmengine==0.10.7"
@@ -49,6 +49,6 @@ python -m pip install \
   --no-build-isolation --no-deps --force-reinstall -v "${MMCV_SOURCE_DIR}"
 
 python "${REPO_ROOT}/tools/patch_mmengine_determinism.py"
-CUDA_VISIBLE_DEVICES=0 python "${REPO_ROOT}/tools/verify_environment.py"
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${GPU_ID:-0}" python "${REPO_ROOT}/tools/verify_environment.py"
 
-echo "[OK] FT-FSOD RTX 5090 environment is ready."
+echo "[OK] FT-FSOD RTX 3090 environment is ready."

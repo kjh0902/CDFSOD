@@ -15,6 +15,12 @@ package = types.ModuleType('_acl_loss_tests')
 package.__path__ = []
 sys.modules[package.__name__] = package
 sys.modules[package.__name__ + '.nearest_etf_loss'] = etf
+orth_spec = importlib.util.spec_from_file_location(
+    package.__name__ + '.mu_orthogonality_loss',
+    ROOT / 'mmdet/models/losses/mu_orthogonality_loss.py')
+orth = importlib.util.module_from_spec(orth_spec)
+orth_spec.loader.exec_module(orth)
+sys.modules[orth_spec.name] = orth
 spec = importlib.util.spec_from_file_location(
     package.__name__ + '.raw_mean_etf_loss',
     ROOT / 'mmdet/models/losses/raw_mean_etf_loss.py')

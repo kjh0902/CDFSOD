@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-fast smoke test for the supported single RTX 5090 environment."""
+"""Fail-fast smoke test with one selected RTX 3090 exposed to the process."""
 
 import os
 import sys
@@ -20,8 +20,8 @@ def require(condition: bool, message: str) -> None:
 
 
 require(sys.version_info[:2] == (3, 10), f"Expected Python 3.10, got {sys.version}")
-require(torch.__version__.startswith("2.7.1+cu128"), f"Unexpected torch: {torch.__version__}")
-require(torchvision.__version__.startswith("0.22.1+cu128"),
+require(torch.__version__.startswith("2.7.1+cu126"), f"Unexpected torch: {torch.__version__}")
+require(torchvision.__version__.startswith("0.22.1+cu126"),
         f"Unexpected torchvision: {torchvision.__version__}")
 require(mmengine.__version__ == "0.10.7", f"Unexpected MMEngine: {mmengine.__version__}")
 require(mmcv.__version__.startswith("2.2.0"), f"Unexpected MMCV: {mmcv.__version__}")
@@ -30,14 +30,14 @@ require(version("fairscale") == "0.4.13", f"Unexpected FairScale: {version('fair
 require(callable(checkpoint_wrapper), "FairScale checkpoint_wrapper is unavailable")
 require(torch.cuda.is_available(), "torch.cuda.is_available() is false")
 require(torch.cuda.device_count() == 1,
-        "Expose exactly one GPU with CUDA_VISIBLE_DEVICES=0 when running this check")
+        "Expose one physical GPU with CUDA_VISIBLE_DEVICES=0 or CUDA_VISIBLE_DEVICES=1")
 
 device = torch.device("cuda:0")
 name = torch.cuda.get_device_name(0)
 capability = torch.cuda.get_device_capability(0)
-require(capability >= (12, 0), f"Expected Blackwell sm_120+, got {capability}")
-require("sm_120" in torch.cuda.get_arch_list(),
-        f"PyTorch wheel lacks sm_120: {torch.cuda.get_arch_list()}")
+require(capability == (8, 6), f"Expected RTX 3090 sm_86, got {capability}")
+require("sm_86" in torch.cuda.get_arch_list(),
+        f"PyTorch wheel lacks sm_86: {torch.cuda.get_arch_list()}")
 
 x = torch.randn(1024, 1024, device=device, requires_grad=True)
 loss = (x @ x.T).square().mean()
@@ -58,4 +58,4 @@ print(f"Vendored MMDetection: {mmdet.__version__}")
 print(f"FairScale: {version('fairscale')}")
 print(f"MMCV compiler: {get_compiler_version()}; CUDA: {get_compiling_cuda_version()}")
 print(f"GPU: {name}; capability: {capability}; visible: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-print("[OK] PyTorch and MMCV CUDA operations passed on GPU 0")
+print("[OK] PyTorch and MMCV CUDA operations passed on the selected GPU (logical cuda:0)")

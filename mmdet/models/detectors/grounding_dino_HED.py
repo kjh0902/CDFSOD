@@ -14,7 +14,7 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.raw_mean_etf_loss import raw_mean_etf_loss
+from ..losses.raw_mean_etf_loss import raw_mean_geometry_losses
 from ..layers.transformer.grounding_dino_layers_HED import (
     GroundingDinoTransformerDecoder_parallel_15_DNQueryRand, GroundingDinoTransformerEncoder)
 from .dino import DINO
@@ -60,14 +60,20 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 raw_mean_etf_loss_weight=1.0,
+                 bert_etf_loss_weight=1.0,
+                 bert_orth_loss_weight=0.0,
+                 fe_etf_loss_weight=0.0,
+                 fe_orth_loss_weight=0.0,
                  **kwargs) -> None:
 
-        if (not math.isfinite(raw_mean_etf_loss_weight)
-                or raw_mean_etf_loss_weight < 0):
-            raise ValueError(
-                'raw_mean_etf_loss_weight must be finite and nonnegative.')
-        self.raw_mean_etf_loss_weight = float(raw_mean_etf_loss_weight)
+        for name, weight in [
+                ('bert_etf_loss_weight', bert_etf_loss_weight),
+                ('bert_orth_loss_weight', bert_orth_loss_weight),
+                ('fe_etf_loss_weight', fe_etf_loss_weight),
+                ('fe_orth_loss_weight', fe_orth_loss_weight)]:
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(f'{name} must be finite and nonnegative.')
+            setattr(self, name, float(weight))
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -701,7 +707,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.raw_mean_etf_loss_weight > 0 else None
+        class_token_maps = [] if any(weight > 0 for weight in (
+            self.bert_etf_loss_weight, self.bert_orth_loss_weight,
+            self.fe_etf_loss_weight, self.fe_orth_loss_weight)) else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -769,11 +777,14 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
-        if class_token_maps is not None:
-            # ETF sees projected BERT tokens before any visual-text enhancement.
-            auxiliary_loss = raw_mean_etf_loss(
+        bert_losses = {}
+        if self.bert_etf_loss_weight > 0 or self.bert_orth_loss_weight > 0:
+            # Both losses share raw means after projection, before enhancement.
+            bert_losses = raw_mean_geometry_losses(
                 text_dict['embedded'], class_token_maps,
-                text_dict['text_token_mask'])
+                text_dict['text_token_mask'],
+                etf_weight=self.bert_etf_loss_weight,
+                orth_weight=self.bert_orth_loss_weight)
 
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
@@ -793,8 +804,17 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        if class_token_maps is not None:
-            losses['loss_raw_mean_etf'] = (
-                self.raw_mean_etf_loss_weight * auxiliary_loss)
+        losses.update({f'loss_bert_{name}': value
+                       for name, value in bert_losses.items()})
+        if self.fe_etf_loss_weight > 0 or self.fe_orth_loss_weight > 0:
+            # Final FE memory uses the same complete class-name token mapping.
+            # Retain the graph even in Stage 1 (FE lr=0) for upstream gradients.
+            fe_losses = raw_mean_geometry_losses(
+                head_inputs_dict['memory_text'], class_token_maps,
+                head_inputs_dict['text_token_mask'],
+                etf_weight=self.fe_etf_loss_weight,
+                orth_weight=self.fe_orth_loss_weight)
+            losses.update({f'loss_fe_{name}': value
+                           for name, value in fe_losses.items()})
         return losses
 
