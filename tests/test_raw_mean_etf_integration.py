@@ -619,7 +619,32 @@ class RawMeanIntegrationTests(unittest.TestCase):
         for path in paths:
             previous = subprocess.check_output(['git', 'show', f'{PREVIOUS}:{path}'],
                                                cwd=ROOT).decode('utf-8')
-            self.assertEqual(source(path), previous, path)
+            if path in ('tools/train.py', 'tools/test.py'):
+                # Permit only the explicit shutdown wrapper and diagnostics;
+                # the original CLI, configuration and runner logic must match.
+                tree = ast.parse(source(path))
+                tree.body = [n for n in tree.body if not (
+                    (isinstance(n, ast.Import) and
+                     ast.unparse(n) == 'import faulthandler') or
+                    (isinstance(n, ast.ImportFrom) and ast.unparse(n) ==
+                     'from mmdet.utils.distributed_runtime import distributed_runtime'))]
+                main = next(n for n in tree.body
+                            if isinstance(n, ast.FunctionDef) and n.name == 'main')
+                runtime = main.body[-1]
+                self.assertIsInstance(runtime, ast.With)
+                self.assertEqual(len(runtime.items), 1)
+                self.assertEqual(ast.unparse(runtime.items[0]), 'distributed_runtime()')
+                mode = 'train' if path == 'tools/train.py' else 'test'
+                self.assertEqual(ast.unparse(runtime.body[-1]),
+                                 f"runner.logger.info('Runner.{mode}() completed; starting shutdown.')")
+                main.body[-1:] = runtime.body[:-1]
+                guard = tree.body[-1]
+                self.assertEqual(ast.unparse(guard.body[0]),
+                                 'faulthandler.enable(all_threads=True)')
+                guard.body.pop(0)
+                self.assertEqual(ast.dump(tree), ast.dump(ast.parse(previous)), path)
+            else:
+                self.assertEqual(source(path), previous, path)
 
     def test_decoder_refines_all_queries_and_references_sequentially_with_one_dn_batch(self):
         model = fixture()
