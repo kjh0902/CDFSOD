@@ -53,13 +53,13 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/verify_environm
 기본 dataset root는 서버의 다음 경로로 설정되어 있다.
 
 ```text
-/home/aislab/Desktop/fewshot/data/CD-FSODdata
+/home/aislab/Desktop/junhyung/cdfsod/datasets
 ```
 
 필요한 구조는 다음과 같다.
 
 ```text
-/home/aislab/Desktop/fewshot/data/CD-FSODdata/
+/home/aislab/Desktop/junhyung/cdfsod/datasets/
 ├── ArTaxOr/
 ├── clipart1k/
 ├── DIOR/
@@ -74,7 +74,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/verify_environm
 다른 위치를 사용해야 할 때만 환경 변수로 덮어쓴다.
 
 ```bash
-export CDFSOD_PATH=/home/aislab/Desktop/fewshot/data/CD-FSODdata
+export CDFSOD_PATH=/home/aislab/Desktop/junhyung/cdfsod/datasets
 ```
 
 Swin-B 사전학습 checkpoint를 준비한다.
