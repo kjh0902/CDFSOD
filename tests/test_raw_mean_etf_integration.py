@@ -605,7 +605,7 @@ class RawMeanIntegrationTests(unittest.TestCase):
                  'mmdet/models/layers/transformer/grounding_dino_layers.py',
                  'mmdet/models/detectors/grounding_dino.py',
                  'mmdet/datasets/coco.py', 'mmdet/engine/hooks/stage_lr_hook.py',
-                 'tools/train.py', 'tools/test.py', 'run_cdfsod.sh',
+                 'tools/train.py', 'tools/test.py',
                  'tools/dist_train.sh', 'tools/dist_test.sh', 'src_path.py',
                  'environment.yml', 'requirements.txt', 'scripts/install_rtx3090.sh',
                  'tools/verify_environment.py',
@@ -614,10 +614,23 @@ class RawMeanIntegrationTests(unittest.TestCase):
                  'mmdet/models/losses/mu_orthogonality_loss.py']
         configs = list((ROOT / 'configs_cdfsod/final_configs_bs4').glob('*.py'))
         self.assertEqual(len(configs), 18)
-        paths += [p.relative_to(ROOT).as_posix()
-                  for p in (ROOT / 'configs_cdfsod').rglob('*.py')]
+        # Full LoRA has its own config regression test comparing resolved
+        # datasets/pipelines/losses to the exact starting branch. Existing
+        # pretrained configs still have to match this ACL reference verbatim.
+        paths += ['configs_cdfsod/grounding_dino_swin-b_pretrain_all.py',
+                  'configs_cdfsod/grounding_dino_swin-t_pretrain_obj365.py']
+        launcher = source('run_cdfsod.sh')
+        previous_launcher = subprocess.check_output(
+            ['git', 'show', f'{PREVIOUS}:run_cdfsod.sh'], cwd=ROOT).decode('utf-8')
+        previous_launcher = previous_launcher.replace(
+            'model.bert_etf_loss_weight (default: 1.0)',
+            'model.bert_etf_loss_weight (default: 0.0)').replace(
+            'model.fe_etf_loss_weight (default: 0.0)',
+            'model.fe_etf_loss_weight (default: 5.0)')
+        self.assertEqual(launcher, previous_launcher)
         for path in paths:
-            previous = subprocess.check_output(['git', 'show', f'{PREVIOUS}:{path}'],
+            reference = 'd560d78' if path == 'src_path.py' else PREVIOUS
+            previous = subprocess.check_output(['git', 'show', f'{reference}:{path}'],
                                                cwd=ROOT).decode('utf-8')
             if path in ('tools/train.py', 'tools/test.py'):
                 # Permit only the explicit shutdown wrapper and diagnostics;

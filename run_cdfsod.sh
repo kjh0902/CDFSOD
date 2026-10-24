@@ -16,9 +16,9 @@ Options:
   --gpu ID         Physical GPU 0 or 1; one GPU per run (default: 0)
   --work-dir DIR   Checkpoint/log directory (default: a unique run directory)
   --port PORT      torch.distributed rendezvous port (default: 29500)
-  --bert-etf-loss-weight W   Override model.bert_etf_loss_weight (default: 1.0)
+  --bert-etf-loss-weight W   Override model.bert_etf_loss_weight (default: 0.0)
   --bert-orth-loss-weight W  Override model.bert_orth_loss_weight (default: 0.0)
-  --fe-etf-loss-weight W     Override model.fe_etf_loss_weight (default: 0.0)
+  --fe-etf-loss-weight W     Override model.fe_etf_loss_weight (default: 5.0)
   --fe-orth-loss-weight W    Override model.fe_orth_loss_weight (default: 0.0)
                            Each weight is independent; 0 skips that loss.
   --etf-loss-weight W       Legacy alias for --bert-etf-loss-weight
