@@ -2,8 +2,8 @@
 
 이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다.
 Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후 또는 최종 Feature Enhancer의
-`memory_text`에 **Raw Mean Simplex ETF + μ-Orthogonality 보조 loss**를 적용할 수 있다.
+설정은 시작 브랜치 그대로 유지하며, 최종 Feature Enhancer의 `memory_text`에
+**Batch-shared μ-Orthogonal Token ETF Loss**를 적용한다. BERT 보조 loss는 사용하지 않는다.
 Decoder와 Detection Head는 `codex/acl-raw-mean-etf-no-hed`의 순수 ACL 구조를 사용한다.
 6개 Decoder 레이어가 순차적으로 query/reference를 갱신하고, 학습에서는 DN Query를
 한 번만 생성한다. Head는 마지막 Decoder 레이어로 예측하며, 클래스 매핑·박스 후처리와
@@ -32,7 +32,7 @@ Decoder와 Detection Head는 `codex/acl-raw-mean-etf-no-hed`의 순수 ACL 구�
 ## 1. 설치
 
 ```bash
-git clone --branch acl-hed-etf-mu-orthogonality https://github.com/kjh0902/CDFSOD.git
+git clone --branch acl-batch-shared-mu-orth-token-etf https://github.com/kjh0902/CDFSOD.git
 cd CDFSOD
 
 conda env create -f environment.yml
@@ -145,65 +145,86 @@ bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
 
 실행할 config와 결과 경로만 확인하려면 `--dry-run`을 추가한다.
 
-### BERT / FE ETF + μ-Orthogonality 실험
+### Batch-shared μ-Orthogonal Token ETF
 
-두 위치 모두 이미지별로 **전체 dataset class**의 class-name WordPiece token을
-Raw Mean pooling한다. Token이나 개별 prototype을 정규화하지 않는다. BERT 위치는
-`text_feat_map` 직후, FE 위치는 최종 enhancer의 `memory_text`이다. 같은 위치의 두
-loss는 prototype을 한 번 계산해 같은 tensor를 공유하며, GT에 없는 클래스와 empty-GT
-이미지도 포함한다. Prompt에는 모든 클래스가 있어야 하며 잘리거나 누락된 span은 오류로 처리한다.
+최종 FE의 `memory_text`에서 **전체 dataset class**의 class-name WordPiece token을
+사용한다. GT에 없는 클래스와 empty-GT 이미지도 포함한다. 기존 전체 클래스 매핑을
+재사용하며, 누락·잘림·빈 span·padding을 가리키는 Token은 오류로 처리한다.
+이미지별 클래스 평균을 구한 다음 Batch 전체에서 같은 클래스의 평균을 구한다.
 
-ETF는 기존 `nearest_etf_loss.py`를 그대로 사용한다. Class centering → 전체 행렬
-Frobenius normalization → 매번 SVD로 계산한 Nearest Simplex ETF와 제곱 거리를 구한다.
-Target만 detach한다. μ-Orthogonality는 `μ = mean_c p_c`, `r_c = p_c - μ`에 대해
-`mean_{i,c} ((μ_i · r_{i,c}) / (||μ_i|| ||r_{i,c}|| + 1e-6))²`를 FP32로 계산한다.
-μ와 residual 모두 detach하지 않는다. FISH의 단일 클래스는 residual이 0이므로 두 loss가 0이다.
+$$
+p_{i,c}=\frac{1}{K_{i,c}}\sum_k t_{i,c,k},\quad
+\bar p_c=\frac1B\sum_i p_{i,c},\quad
+\mu=\frac1C\sum_c\bar p_c
+$$
+$$
+s=\sqrt{\sum_c\|\bar p_c-\mu\|^2},\qquad
+Z_c=\frac{\bar p_c-\mu}{\max(s,10^{-6})}
+$$
+
+`nearest_etf_loss.py`와 같은 Unit-Frobenius Simplex ETF를 사용한다.
+Helmert Basis `Q`와 μ의 직교 여공간 Basis `W`에 대해 Constrained Procrustes를 푼다.
+
+$$
+W^\top Z^\top Q=U\Sigma V^\top,\qquad
+M^*=\frac{Q(WUV^\top)^\top}{\sqrt{C-1}}
+$$
+
+이 Target은 `M* μ = 0`, `M* M*ᵀ = (I - 11ᵀ/C)/(C-1)`을 만족하며
+`||Z-M||_F²`를 최소화한다. SVD를 직교 여공간 안에서 수행하므로 Prototype의
+Rank가 부족한 경우에도 직교 조건을 유지한다. μ가 정확히 0이면 `W=I`이며,
+미소한 비영 μ는 크기를 재조정하여 방향을 안정적으로 계산한다.
+비영 μ에서는 `D≥C`, 영 μ에서는 `D≥C−1`이 필요하다.
+
+최종 목적함수는 개별 Token을 Batch 공통 ETF Vertex로 직접 정렬한다.
+
+$$
+L_{\mathrm{UnifiedETF}}=\frac1{BC}\sum_{i,c}\frac1{K_{i,c}}\sum_k
+\left\|\frac{t_{i,c,k}-\mu}{\max(s,10^{-6})}-\operatorname{sg}(m_c^*)\right\|_2^2
+$$
+
+차원별 제곱합 뒤 클래스 내 Token 평균, 이미지·클래스 평균을 순서대로 계산한다.
+따라서 클래스 이름의 Token 수와 Batch Size에 따라 가중치가 바뀌지 않으며,
+Token/클래스 벡터의 개별 정규화나 차원 `D`로의 평균은 하지 않는다.
+Target만 detach하고 Token, μ, s는 미분한다. Autocast를 끄고 FP32로 계산하며,
+매 Batch Target을 다시 구한다. EMA나 저장된 Target은 사용하지 않는다.
+FISH처럼 `C=1`이면 SVD 없이 미분 가능한 0을 반환한다.
 
 | Config option | 기본 weight | 학습 로그 |
 |---|---:|---|
-| `model.bert_etf_loss_weight` | 1.0 | `loss_bert_etf` |
-| `model.bert_orth_loss_weight` | 0.0 | `loss_bert_orth` |
-| `model.fe_etf_loss_weight` | 0.0 | `loss_fe_etf` |
-| `model.fe_orth_loss_weight` | 0.0 | `loss_fe_orth` |
+| `model.unified_etf_loss_weight` | 10.0 | `loss_unified_etf` |
 
-각 weight는 독립적으로 조절하며, 0이면 해당 loss를 계산하거나 로그에 추가하지 않는다.
-네 weight가 모두 0이면 보조 loss용 클래스 매핑과 pooling도 생략한다. 기본값은 시작
-브랜치의 BERT ETF 단독 실험을 유지한다. Inference에서는 보조 loss를 계산하지 않는다.
-
-아래 weight 1.0은 실행 예시이며 각 loss의 weight는 실험에 맞게 설정한다. 두 명령은
-순서대로 실행하고, 각 실행은 한 GPU만 사용한다.
+Weight는 유한한 비음수이며, 0이면 보조 Loss·전체 클래스 매핑·SVD를 모두 생략한다.
+Inference에서는 보조 Loss를 계산하지 않는다. 기존 BERT/FE ETF·Orth weight와
+`--etf-loss-weight`, `--raw-mean-etf-loss-weight` alias는 폐기했으며, 이전 옵션을
+사용하면 새 옵션으로 변경하라는 오류를 표시한다.
 
 ```bash
-# Experiment A: BERT ETF + BERT μ-Orthogonality
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 \
-  --work-dir work_dirs/experiment_A_NEU-DET_1shot \
-  --bert-etf-loss-weight 1.0 --bert-orth-loss-weight 1.0 \
-  --fe-etf-loss-weight 0 --fe-orth-loss-weight 0
+# 기본 weight=10.0
+bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0
 
-# Experiment B: FE ETF + FE μ-Orthogonality
+# CLI에서 weight 변경
 bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 1 \
-  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
-  --bert-etf-loss-weight 0 --bert-orth-loss-weight 0 \
-  --fe-etf-loss-weight 1.0 --fe-orth-loss-weight 1.0
+  --work-dir work_dirs/unified_etf_NEU-DET_1shot \
+  --unified-etf-loss-weight 5.0
 
-# Native MMEngine CLI에서도 동일하게 설정 가능
+# Native MMEngine CLI
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/train.py \
   configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
-  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
-  --cfg-options model.bert_etf_loss_weight=0 model.bert_orth_loss_weight=0 \
-                model.fe_etf_loss_weight=1.0 model.fe_orth_loss_weight=1.0
+  --work-dir work_dirs/unified_etf_NEU-DET_1shot \
+  --cfg-options model.unified_etf_loss_weight=5.0
 ```
 
-`--etf-loss-weight`와 `--raw-mean-etf-loss-weight`는 `--bert-etf-loss-weight`의 alias로 유지한다.
-기존 config의 `model.raw_mean_etf_loss_weight`는 `model.bert_etf_loss_weight`로 변경한다.
-`--gpu 1`이면 `CUDA_VISIBLE_DEVICES=1`로 물리 GPU 1만 노출하고, 내부 worker는
-local rank 0 / `cuda:0`을 사용한다. Train과 test 모두 한 노드·한 process로 실행한다.
-Batch size, epoch, optimizer, scheduler, Progressive Fine-Tuning hook, Stage 1/2
-freeze 정책, matching, query selection, 클래스 매핑과 inference 후처리는 유지한다.
-FE는 Stage 1에서 기존 hook에 따라 lr=0이며, upstream BERT/backbone으로의 gradient는 유지한다.
+Train과 test는 기존대로 한 노드·한 GPU·한 process로 실행한다. Batch는 해당
+forward의 로컬 Minibatch이며, GPU 사이 통계를 모으는 통신은 추가하지 않는다.
+기본 Batch Size 4와 Max Epochs(FISH 16, Clipart1k 50, 나머지 100), optimizer, scheduler,
+Progressive FT, Detection Loss, augmentation, dataset, evaluation을 유지한다.
+FE는 Stage 1에서 기존 hook에 따라 lr=0이며 upstream Gradient는 유지한다.
 
-CPU PyTorch만으로 수치, gradient 및 ACL Decoder 회귀 검사를 실행할 수 있다. CLI 검사는 Bash를
-사용하며 학습·평가 launcher의 인자와 환경을 확인한다. 실제 GPU 학습 검사는 별도로 수행한다.
+CPU PyTorch로 수학·Token 가중치·Gradient·ACL 회귀 검사를 실행할 수 있다.
+CLI 검사는 Bash로 학습·평가 launcher의 인자와 환경을 확인한다.
+현재 로컬 검증 환경은 CPU PyTorch이며 MMCV 확장이 없어 실제 GPU 학습은 검증 범위에
+포함되지 않는다. 기존 수학 Helper는 참고와 회귀 검증용으로 보존한다.
 
 ```bash
 python -m unittest discover -s tests -v

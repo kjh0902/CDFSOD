@@ -14,7 +14,8 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
-from ..losses.raw_mean_etf_loss import raw_mean_geometry_losses
+from ..losses.batch_shared_mu_orth_token_etf_loss import (
+    batch_shared_mu_orth_token_etf_loss)
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder)
 from ..layers.transformer.grounding_dino_layers_HED import (
@@ -61,20 +62,18 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
                  *args,
                  use_autocast=False,
                  rand_dnquery_rate=0.5,
-                 bert_etf_loss_weight=1.0,
-                 bert_orth_loss_weight=0.0,
-                 fe_etf_loss_weight=0.0,
-                 fe_orth_loss_weight=0.0,
+                 unified_etf_loss_weight=10.0,
                  **kwargs) -> None:
 
-        for name, weight in [
-                ('bert_etf_loss_weight', bert_etf_loss_weight),
-                ('bert_orth_loss_weight', bert_orth_loss_weight),
-                ('fe_etf_loss_weight', fe_etf_loss_weight),
-                ('fe_orth_loss_weight', fe_orth_loss_weight)]:
-            if not math.isfinite(weight) or weight < 0:
-                raise ValueError(f'{name} must be finite and nonnegative.')
-            setattr(self, name, float(weight))
+        retired_weights = {'bert_etf_loss_weight', 'bert_orth_loss_weight',
+                           'fe_etf_loss_weight', 'fe_orth_loss_weight',
+                           'raw_mean_etf_loss_weight'}
+        if retired_weights.intersection(kwargs):
+            raise ValueError('Replace retired ETF/orth weights with '
+                             'unified_etf_loss_weight (FE token loss only).')
+        if not math.isfinite(unified_etf_loss_weight) or unified_etf_loss_weight < 0:
+            raise ValueError('unified_etf_loss_weight must be finite and nonnegative.')
+        self.unified_etf_loss_weight = float(unified_etf_loss_weight)
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -642,12 +641,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if isinstance(tokens_positive, dict):
             if set(tokens_positive) != set(range(classes)):
                 raise ValueError(
-                    'Raw mean ETF requires all dataset class IDs 0..C-1.')
+                    'Unified ETF requires all dataset class IDs 0..C-1.')
             tokens_positive = [tokens_positive[c] for c in range(classes)]
         if (not isinstance(tokens_positive, (list, tuple))
                 or len(tokens_positive) != classes or classes < 1):
             raise ValueError(
-                'Raw mean ETF requires spans for every dataset class (C >= 1).')
+                'Unified ETF requires spans for every dataset class (C >= 1).')
         # Mapping tokenization is untruncated; BERT tokenization is truncated.
         # Reject long prompts before create_positive_map can clip class spans.
         max_length = min(
@@ -655,11 +654,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len)
         if tokenized['attention_mask'].sum(-1).max().item() > max_length:
             raise ValueError(
-                'Raw mean ETF requires a complete, untruncated all-class prompt.')
+                'Unified ETF requires a complete, untruncated all-class prompt.')
         mapping, _ = self.get_positive_map(tokenized, tokens_positive)
         if any(not indices for indices in mapping.values()):
             raise ValueError(
-                'Raw mean ETF found a dataset class without class-name tokens.')
+                'Unified ETF found a dataset class without class-name tokens.')
         return mapping
 
     def loss(self, batch_inputs: Tensor,
@@ -673,9 +672,7 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if any(weight > 0 for weight in (
-            self.bert_etf_loss_weight, self.bert_orth_loss_weight,
-            self.fe_etf_loss_weight, self.fe_orth_loss_weight)) else None
+        class_token_maps = [] if self.unified_etf_loss_weight > 0 else None
 
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
@@ -743,15 +740,6 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
-        bert_losses = {}
-        if self.bert_etf_loss_weight > 0 or self.bert_orth_loss_weight > 0:
-            # Both losses share raw means after projection, before enhancement.
-            bert_losses = raw_mean_geometry_losses(
-                text_dict['embedded'], class_token_maps,
-                text_dict['text_token_mask'],
-                etf_weight=self.bert_etf_loss_weight,
-                orth_weight=self.bert_orth_loss_weight)
-
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
@@ -770,17 +758,12 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        losses.update({f'loss_bert_{name}': value
-                       for name, value in bert_losses.items()})
-        if self.fe_etf_loss_weight > 0 or self.fe_orth_loss_weight > 0:
-            # Final FE memory uses the same complete class-name token mapping.
-            # Retain the graph even in Stage 1 (FE lr=0) for upstream gradients.
-            fe_losses = raw_mean_geometry_losses(
-                head_inputs_dict['memory_text'], class_token_maps,
-                head_inputs_dict['text_token_mask'],
-                etf_weight=self.fe_etf_loss_weight,
-                orth_weight=self.fe_orth_loss_weight)
-            losses.update({f'loss_fe_{name}': value
-                           for name, value in fe_losses.items()})
+        if self.unified_etf_loss_weight > 0:
+            # Final FE tokens retain their graph in Stage 1 (FE lr=0) so that
+            # auxiliary gradients can still reach the upstream text/backbone.
+            losses['loss_unified_etf'] = self.unified_etf_loss_weight * (
+                batch_shared_mu_orth_token_etf_loss(
+                    head_inputs_dict['memory_text'], class_token_maps,
+                    head_inputs_dict['text_token_mask']))
         return losses
 

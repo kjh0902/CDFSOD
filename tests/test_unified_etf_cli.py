@@ -11,12 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 BASH = shutil.which('bash')
 if os.name == 'nt' and Path('C:/Program Files/Git/bin/bash.exe').is_file():
     BASH = 'C:/Program Files/Git/bin/bash.exe'
-OPTIONS = ['bert-etf-loss-weight', 'bert-orth-loss-weight',
-           'fe-etf-loss-weight', 'fe-orth-loss-weight']
+OPTIONS = ['unified-etf-loss-weight']
 
 
 @unittest.skipUnless(BASH, 'Requires Bash')
-class RawMeanCLIIntegrationTests(unittest.TestCase):
+class UnifiedETFCLIIntegrationTests(unittest.TestCase):
     def run_cli(self, *args, root=ROOT, env=None):
         return subprocess.run([BASH, (root / 'run_cdfsod.sh').as_posix(), *args],
                               cwd=root, env=env, capture_output=True,
@@ -38,7 +37,7 @@ class RawMeanCLIIntegrationTests(unittest.TestCase):
                             next(l for l in second.stdout.splitlines() if l.startswith('Output')))
 
     def test_invalid_arguments_and_weights(self):
-        for option in OPTIONS + ['etf-loss-weight']:
+        for option in OPTIONS:
             for value in ['', '-0.1', 'nan', 'inf', '1e999', 'bad', '1; exit 0']:
                 result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1',
                                       f'--{option}', value, '--dry-run')
@@ -55,7 +54,7 @@ class RawMeanCLIIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
 
     def test_weights_resume_and_single_physical_gpu_reach_train_and_test(self):
-        with tempfile.TemporaryDirectory(prefix='acl-hed-mu-cli-') as directory:
+        with tempfile.TemporaryDirectory(prefix='acl-unified-etf-cli-') as directory:
             root = Path(directory)
             (root / 'run_cdfsod.sh').write_text((ROOT / 'run_cdfsod.sh').read_text(encoding='utf-8'),
                                                encoding='utf-8', newline='\n')
@@ -98,8 +97,7 @@ fi
                 output = (root / f'experiment {gpu}').as_posix()
                 result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1', '--gpu', gpu,
                                       '--work-dir', output, '--resume',
-                                      '--bert-etf-loss-weight', '0', '--bert-orth-loss-weight', '.3',
-                                      '--fe-etf-loss-weight', '1e-2', '--fe-orth-loss-weight', '2',
+                                      '--unified-etf-loss-weight', '2.5',
                                       root=root, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for kind in ['train', 'test']:
@@ -108,15 +106,26 @@ fi
                     self.assertEqual(settings, [gpu, 'PCI_BUS_ID', '1', '0'])
                     self.assertIn('--nproc_per_node=1', args)
                     self.assertEqual(args[args.index('--work-dir') + 1], output)
-                    for name, weight in zip(OPTIONS, ['0', '.3', '1e-2', '2']):
+                    for name, weight in zip(OPTIONS, ['2.5']):
                         self.assertIn(f'model.{name.replace("-", "_")}={weight}', args)
                     self.assertEqual('--resume' in args, kind == 'train')
-                for alias in ['--etf-loss-weight', '--raw-mean-etf-loss-weight']:
+                for weight in ['0', '1e-2']:
                     result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1',
-                                          '--work-dir', output, alias, '.25', root=root, env=env)
+                                          '--work-dir', output, '--unified-etf-loss-weight', weight,
+                                          root=root, env=env)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn('model.bert_etf_loss_weight=.25',
-                                  (root / 'train_args.txt').read_text(encoding='utf-8').splitlines())
+                    for kind in ['train', 'test']:
+                        self.assertIn(f'model.unified_etf_loss_weight={weight}',
+                            (root / f'{kind}_args.txt').read_text(encoding='utf-8').splitlines())
+
+    def test_retired_options_give_migration_guidance(self):
+        for old in ['bert-etf-loss-weight', 'bert-orth-loss-weight', 'fe-etf-loss-weight',
+                    'fe-orth-loss-weight', 'etf-loss-weight', 'raw-mean-etf-loss-weight']:
+            result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1',
+                                  f'--{old}', '1', '--dry-run')
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('use --unified-etf-loss-weight', result.stderr)
+
 
 
 if __name__ == '__main__':

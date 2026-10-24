@@ -16,12 +16,8 @@ Options:
   --gpu ID         Physical GPU 0 or 1; one GPU per run (default: 0)
   --work-dir DIR   Checkpoint/log directory (default: a unique run directory)
   --port PORT      torch.distributed rendezvous port (default: 29500)
-  --bert-etf-loss-weight W   Override model.bert_etf_loss_weight (default: 1.0)
-  --bert-orth-loss-weight W  Override model.bert_orth_loss_weight (default: 0.0)
-  --fe-etf-loss-weight W     Override model.fe_etf_loss_weight (default: 0.0)
-  --fe-orth-loss-weight W    Override model.fe_orth_loss_weight (default: 0.0)
-                           Each weight is independent; 0 skips that loss.
-  --etf-loss-weight W       Legacy alias for --bert-etf-loss-weight
+  --unified-etf-loss-weight W  Override model.unified_etf_loss_weight (default: 10.0)
+                               0 skips the FE token loss and auxiliary mapping.
   --resume         Resume the latest checkpoint; requires --work-dir
   --dry-run        Validate arguments and print resolved paths without running
   -h, --help       Show this help
@@ -33,10 +29,7 @@ SHOT=""
 GPU_ID="0"
 PORT="29500"
 WORK_DIR=""
-BERT_ETF_LOSS_WEIGHT=""
-BERT_ORTH_LOSS_WEIGHT=""
-FE_ETF_LOSS_WEIGHT=""
-FE_ORTH_LOSS_WEIGHT=""
+UNIFIED_ETF_LOSS_WEIGHT=""
 RESUME=false
 DRY_RUN=false
 
@@ -67,25 +60,14 @@ while [[ $# -gt 0 ]]; do
       WORK_DIR="$2"
       shift 2
       ;;
-    --bert-etf-loss-weight|--etf-loss-weight|--raw-mean-etf-loss-weight)
+    --unified-etf-loss-weight)
       [[ $# -ge 2 && -n "$2" ]] || { echo "[ERROR] $1 requires a value." >&2; exit 2; }
-      BERT_ETF_LOSS_WEIGHT="$2"
+      UNIFIED_ETF_LOSS_WEIGHT="$2"
       shift 2
       ;;
-    --bert-orth-loss-weight)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "[ERROR] $1 requires a value." >&2; exit 2; }
-      BERT_ORTH_LOSS_WEIGHT="$2"
-      shift 2
-      ;;
-    --fe-etf-loss-weight)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "[ERROR] $1 requires a value." >&2; exit 2; }
-      FE_ETF_LOSS_WEIGHT="$2"
-      shift 2
-      ;;
-    --fe-orth-loss-weight)
-      [[ $# -ge 2 && -n "$2" ]] || { echo "[ERROR] $1 requires a value." >&2; exit 2; }
-      FE_ORTH_LOSS_WEIGHT="$2"
-      shift 2
+    --bert-etf-loss-weight|--bert-orth-loss-weight|--fe-etf-loss-weight|--fe-orth-loss-weight|--etf-loss-weight|--raw-mean-etf-loss-weight)
+      echo "[ERROR] $1 was retired; use --unified-etf-loss-weight (FE token loss only)." >&2
+      exit 2
       ;;
     --resume)
       RESUME=true
@@ -180,10 +162,7 @@ add_loss_weight() {
   CFG_OPTIONS+=("model.${name}=${weight}")
   echo "${name}: ${weight} (CLI override)"
 }
-add_loss_weight bert_etf_loss_weight "${BERT_ETF_LOSS_WEIGHT}"
-add_loss_weight bert_orth_loss_weight "${BERT_ORTH_LOSS_WEIGHT}"
-add_loss_weight fe_etf_loss_weight "${FE_ETF_LOSS_WEIGHT}"
-add_loss_weight fe_orth_loss_weight "${FE_ORTH_LOSS_WEIGHT}"
+add_loss_weight unified_etf_loss_weight "${UNIFIED_ETF_LOSS_WEIGHT}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${REPO_ROOT}/configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_${CONFIG_DATASET}_${SHOT}shot.py"

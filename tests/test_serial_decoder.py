@@ -38,26 +38,13 @@ def method(path, name, cls=None, **env):
 
 
 class SerialDecoderTests(unittest.TestCase):
-    def test_auxiliary_wiring_and_constructor_preserved(self):
-        # Both representation locations and four weights remain unchanged.
+    def test_feature_and_transformer_forward_preserved(self):
         before = cls_node(DETECTOR, base=True)
         after = cls_node(DETECTOR)
-        for name in ('loss', '_get_raw_mean_class_token_map',
-                     'forward_encoder', 'forward_transformer'):
-            old = next(n for n in before.body if isinstance(n, ast.FunctionDef)
-                       and n.name == name)
-            new = next(n for n in after.body if isinstance(n, ast.FunctionDef)
-                       and n.name == name)
-            self.assertEqual(ast.get_source_segment(source(DETECTOR, True), old),
-                             ast.get_source_segment(source(DETECTOR), new), name)
-        old = next(n for n in before.body if isinstance(n, ast.FunctionDef)
-                   and n.name == '__init__')
-        new = next(n for n in after.body if isinstance(n, ast.FunctionDef)
-                   and n.name == '__init__')
-        old.body = [n for n in old.body if not (
-            isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute)
-            and n.targets[0].attr == 'rand_dnquery_rate')]
-        self.assertEqual(ast.dump(old), ast.dump(new))
+        for name in ('forward_encoder', 'forward_transformer'):
+            old = next(n for n in before.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            new = next(n for n in after.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            self.assertEqual(ast.dump(old), ast.dump(new), name)
 
     def test_standard_decoder_inherits_serial_forward_with_six_layers(self):
         decoder = cls_node(LAYERS + 'grounding_dino_layers.py',
@@ -76,7 +63,8 @@ class SerialDecoderTests(unittest.TestCase):
 
     def test_non_decoder_methods_and_training_head_unchanged(self):
         for path, cls, allowed in [
-            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder'}),
+            (DETECTOR, None, {'__init__', '_init_layers', 'pre_decoder', 'forward_decoder',
+                              'loss', '_get_raw_mean_class_token_map'}),
             (HEAD, 'GroundingDINOHead_ParallelDecoder_DN', {'predict_by_feat'}),
             (LAYERS + 'grounding_dino_layers_HED.py', 'GroundingDinoTransformerEncoder', set()),
         ]:
