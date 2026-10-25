@@ -15,6 +15,7 @@ from terminaltables import AsciiTable
 
 from mmdet.datasets.api_wrappers import COCO, COCOeval, COCOevalMP
 from mmdet.registry import METRICS
+from mmdet.utils.acl_diagnostic_io import classwise_ap
 from mmdet.structures.mask import encode_mask_results
 from ..functional import eval_recalls
 
@@ -524,6 +525,16 @@ class CocoMetric(BaseMetric):
                     # precision: (iou, recall, cls, area range, max dets)
                     assert len(self.cat_ids) == precisions.shape[2]
 
+                    # These values used to be printed but AP50/AP75 were not
+                    # returned to hooks/JSON loggers. Preserve standard mAP
+                    # and expose additional, unrounded per-category metrics.
+                    for detail in classwise_ap(
+                            precisions, coco_eval.params.iouThrs, self.cat_ids):
+                        for name in ('AP', 'AP50', 'AP75'):
+                            value = detail[name]
+                            eval_results[f'{metric}_class_{detail["category_id"]}_{name}'] = (
+                                float('nan') if value is None else value)
+
                     results_per_category = []
                     for idx, cat_id in enumerate(self.cat_ids):
                         t = []
@@ -541,8 +552,10 @@ class CocoMetric(BaseMetric):
                         eval_results[f'{nm["name"]}_precision'] = round(ap, 3)
 
                         # indexes of IoU  @50 and @75
-                        for iou in [0, 5]:
-                            precision = precisions[iou, :, idx, 0, -1]
+                        for threshold in [.50, .75]:
+                            matching = np.flatnonzero(np.isclose(
+                                coco_eval.params.iouThrs, threshold))
+                            precision = precisions[matching, :, idx, 0, -1]
                             precision = precision[precision > -1]
                             if precision.size:
                                 ap = np.mean(precision)

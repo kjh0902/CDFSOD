@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from test_raw_mean_etf_loss import ROOT, raw_mean
+from acl_diagnostic_test_support import events, without_diagnostic_events
 
 BASE = '8bd52df24303a470287d552c85e242ad46efaf2a'
 PREVIOUS = '0a2dcb061bb8aed1c6d3b579b539d30c95cf2957'
@@ -40,7 +41,8 @@ def execute(nodes, **extra):
     env = dict(torch=torch, nn=nn, math=math, copy=copy, re=re,
                random=random, warnings=warnings,
                raw_mean_etf_loss=raw_mean.raw_mean_etf_loss,
-               raw_mean_geometry_losses=raw_mean.raw_mean_geometry_losses)
+               raw_mean_geometry_losses=raw_mean.raw_mean_geometry_losses,
+               diagnostic_event=events.diagnostic_event)
     env.update(extra)
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0)] + nodes, type_ignores=[])
@@ -79,6 +81,10 @@ class Sample(SimpleNamespace):
 
 
 class Tokens(dict):
+    @property
+    def input_ids(self):
+        return self['input_ids']
+
     def __init__(self, ids, mask, spans):
         super().__init__(input_ids=ids, attention_mask=mask)
         self.spans = spans
@@ -597,15 +603,17 @@ class RawMeanIntegrationTests(unittest.TestCase):
         before, after = methods(source(DETECTOR, True)), methods(source(DETECTOR))
         self.assertEqual(after.keys(), before.keys())
         for name in before.keys() - {'__init__', 'loss', '_get_raw_mean_class_token_map'}:
-            self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
+            self.assertEqual(ast.dump(before[name]),
+                             ast.dump(without_diagnostic_events(after[name])), name)
         # The reference head and retired HED decoder are used verbatim.
         for path in [HEAD, LAYERS]:
-            self.assertEqual(source(path), source(path, True), path)
+            self.assertEqual(ast.dump(without_diagnostic_events(ast.parse(source(path)))),
+                             ast.dump(ast.parse(source(path, True))), path)
         paths = ['mmdet/models/layers/transformer/dino_layers.py',
                  'mmdet/models/layers/transformer/grounding_dino_layers.py',
                  'mmdet/models/detectors/grounding_dino.py',
                  'mmdet/datasets/coco.py', 'mmdet/engine/hooks/stage_lr_hook.py',
-                 'tools/train.py', 'tools/test.py', 'run_cdfsod.sh',
+                 'tools/train.py', 'tools/test.py',
                  'tools/dist_train.sh', 'tools/dist_test.sh', 'src_path.py',
                  'environment.yml', 'requirements.txt', 'scripts/install_rtx3090.sh',
                  'tools/verify_environment.py',
@@ -614,10 +622,13 @@ class RawMeanIntegrationTests(unittest.TestCase):
                  'mmdet/models/losses/mu_orthogonality_loss.py']
         configs = list((ROOT / 'configs_cdfsod/final_configs_bs4').glob('*.py'))
         self.assertEqual(len(configs), 18)
-        paths += [p.relative_to(ROOT).as_posix()
-                  for p in (ROOT / 'configs_cdfsod').rglob('*.py')]
+        # Diagnostic config/launcher differences are checked against d560d78
+        # with an explicit allowlist in test_acl_diagnostics instead.
+        paths += ['configs_cdfsod/grounding_dino_swin-b_pretrain_all.py',
+                  'configs_cdfsod/grounding_dino_swin-t_pretrain_obj365.py']
         for path in paths:
-            previous = subprocess.check_output(['git', 'show', f'{PREVIOUS}:{path}'],
+            reference = 'd560d78' if path == 'src_path.py' else PREVIOUS
+            previous = subprocess.check_output(['git', 'show', f'{reference}:{path}'],
                                                cwd=ROOT).decode('utf-8')
             if path in ('tools/train.py', 'tools/test.py'):
                 # Permit only the explicit shutdown wrapper and diagnostics;

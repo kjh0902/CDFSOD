@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Run one CD-FSOD dataset/shot experiment (train, then evaluate the best checkpoint).
+Run one ACL diagnostic baseline (train with validation each epoch; no checkpoints).
 
 Usage:
   bash run_cdfsod.sh --dataset DATASET --shot {1|5|10} [options]
@@ -14,15 +14,15 @@ Required:
 
 Options:
   --gpu ID         Physical GPU 0 or 1; one GPU per run (default: 0)
-  --work-dir DIR   Checkpoint/log directory (default: a unique run directory)
+  --work-dir DIR   Log/diagnostic directory (default: a unique run directory)
   --port PORT      torch.distributed rendezvous port (default: 29500)
-  --bert-etf-loss-weight W   Override model.bert_etf_loss_weight (default: 1.0)
+  --bert-etf-loss-weight W   Override model.bert_etf_loss_weight (default: 0.0)
   --bert-orth-loss-weight W  Override model.bert_orth_loss_weight (default: 0.0)
   --fe-etf-loss-weight W     Override model.fe_etf_loss_weight (default: 0.0)
   --fe-orth-loss-weight W    Override model.fe_orth_loss_weight (default: 0.0)
-                           Each weight is independent; 0 skips that loss.
+                           Diagnostic baseline accepts only zero for every weight.
   --etf-loss-weight W       Legacy alias for --bert-etf-loss-weight
-  --resume         Resume the latest checkpoint; requires --work-dir
+  --resume         Unsupported: this baseline never saves checkpoints
   --dry-run        Validate arguments and print resolved paths without running
   -h, --help       Show this help
 EOF
@@ -160,8 +160,8 @@ if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   exit 2
 fi
 
-if [[ "${RESUME}" == true && -z "${WORK_DIR}" ]]; then
-  echo "[ERROR] --resume requires --work-dir pointing to the existing experiment." >&2
+if [[ "${RESUME}" == true ]]; then
+  echo "[ERROR] --resume is unavailable: diagnostic baseline never saves checkpoints." >&2
   exit 2
 fi
 
@@ -173,8 +173,8 @@ add_loss_weight() {
     return
   fi
   if [[ ! "${weight}" =~ ^\+?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] ||
-     ! awk -v w="${weight}" 'BEGIN { n=w+0; exit !(n>=0 && n<=1.7976931348623157e308) }'; then
-    echo "[ERROR] --${name//_/-} must be a nonnegative finite number." >&2
+     ! awk -v w="${weight}" 'BEGIN { n=w+0; exit !(n==0) }'; then
+    echo "[ERROR] --${name//_/-} must be zero for the diagnostic baseline." >&2
     exit 2
   fi
   CFG_OPTIONS+=("model.${name}=${weight}")
@@ -195,13 +195,8 @@ if [[ ! -f "${CONFIG}" ]]; then
 fi
 
 TRAIN_ARGS=()
-TEST_ARGS=()
 if (( ${#CFG_OPTIONS[@]} > 0 )); then
   TRAIN_ARGS+=(--cfg-options "${CFG_OPTIONS[@]}")
-  TEST_ARGS+=(--cfg-options "${CFG_OPTIONS[@]}")
-fi
-if [[ "${RESUME}" == true ]]; then
-  TRAIN_ARGS+=(--resume)
 fi
 
 echo "Dataset : ${OUTPUT_DATASET}"
@@ -225,25 +220,5 @@ NNODES=1 NODE_RANK=0 bash "${REPO_ROOT}/tools/dist_train.sh" \
   "${CONFIG}" 1 "${PORT}" "${GPU_ID}" \
   --work-dir "${WORK_DIR}" "${TRAIN_ARGS[@]}"
 
-shopt -s nullglob
-BEST_CHECKPOINTS=("${WORK_DIR}"/best_coco_bbox_mAP_iter_*.pth)
-shopt -u nullglob
-
-if (( ${#BEST_CHECKPOINTS[@]} == 0 )); then
-  echo "[ERROR] Training finished without best_coco_bbox_mAP_iter_*.pth in ${WORK_DIR}." >&2
-  exit 1
-fi
-
-BEST_CHECKPOINT="${BEST_CHECKPOINTS[0]}"
-if (( ${#BEST_CHECKPOINTS[@]} > 1 )); then
-  echo "[ERROR] Multiple best checkpoints in ${WORK_DIR}; use an isolated --work-dir." >&2
-  exit 1
-fi
-echo "Best checkpoint: ${BEST_CHECKPOINT}"
-
-NNODES=1 NODE_RANK=0 bash "${REPO_ROOT}/tools/dist_test.sh" \
-  "${CONFIG}" "${BEST_CHECKPOINT}" 1 "${PORT}" "${GPU_ID}" \
-  --work-dir "${WORK_DIR}" \
-  --out "${WORK_DIR}/results.pkl" "${TEST_ARGS[@]}"
-
-echo "[OK] ${OUTPUT_DATASET} ${SHOT}-shot training and evaluation completed."
+echo "[OK] ${OUTPUT_DATASET} ${SHOT}-shot training and epoch validation completed."
+echo "Diagnostics: ${WORK_DIR}/diagnostics"

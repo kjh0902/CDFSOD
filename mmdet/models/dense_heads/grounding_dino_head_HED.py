@@ -16,6 +16,7 @@ from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
+from mmdet.utils.acl_diagnostic_events import diagnostic_event
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
 
@@ -451,6 +452,10 @@ class GroundingDINOHead_ParallelDecoder_DN(DINOHead):
         results.bboxes = det_bboxes
         results.scores = scores
         results.labels = det_labels
+        diagnostic_event(
+            'detections', results=results,
+            query_index=bbox_index if token_positive_maps is not None else indexes,
+            class_index=det_labels, flat_index=indexes)
         return results
     
 

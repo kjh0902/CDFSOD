@@ -1,14 +1,13 @@
-# FT-FSOD: CD-FSOD 실험 저장소
+# ACL Baseline Diagnostic Logging
 
-이 저장소는 FT-FSOD의 **CD-FSOD 6개 target dataset 재현만** 지원한다.
-Progressive Fine-Tuning, augmentation, optimizer, scheduler, validation metric 및 checkpoint
-설정은 원본 그대로 유지하며, BERT → `text_feat_map` 직후 또는 최종 Feature Enhancer의
-`memory_text`에 **Raw Mean Simplex ETF + μ-Orthogonality 보조 loss**를 적용할 수 있다.
-Decoder와 Detection Head는 `codex/acl-raw-mean-etf-no-hed`의 순수 ACL 구조를 사용한다.
-6개 Decoder 레이어가 순차적으로 query/reference를 갱신하고, 학습에서는 DN Query를
-한 번만 생성한다. Head는 마지막 Decoder 레이어로 예측하며, 클래스 매핑·박스 후처리와
-평가 경로는 유지한다. 기존 config와 실행 스크립트 호환성을 위해 등록된 모델·Head 이름과
-`rand_dnquery_rate` 인자는 유지하지만, HED Parallel Decoder와 레이어별 DN Query는 사용하지 않는다.
+This branch runs the ACL **sequential decoder without HED**. The four BERT/FE
+ETF and orthogonality weights are all **0.0**. The original progressive
+fine-tuning hook, augmentation, optimizer, scheduler and batch sizes are retained.
+FISH runs for 16 epochs, Clipart1k for 50, and all other targets for 100.
+Validation runs every epoch. **No model/optimizer checkpoints are saved**, and
+there is no post-training best-checkpoint reload or test invocation. Initial
+pretrained weights and activation checkpointing are retained.
+
 
 ## 지원 환경
 
@@ -32,7 +31,7 @@ Decoder와 Detection Head는 `codex/acl-raw-mean-etf-no-hed`의 순수 ACL 구�
 ## 1. 설치
 
 ```bash
-git clone --branch acl-hed-etf-mu-orthogonality https://github.com/kjh0902/CDFSOD.git
+git clone --branch acl-diagnostic-logging https://github.com/kjh0902/CDFSOD.git
 cd CDFSOD
 
 conda env create -f environment.yml
@@ -98,153 +97,142 @@ python -c "from transformers import AutoTokenizer, BertModel; AutoTokenizer.from
 python -m nltk.downloader punkt punkt_tab averaged_perceptron_tagger averaged_perceptron_tagger_eng
 ```
 
-## 3. dataset/shot별 학습 및 평가
+## 3. Run the diagnostic baseline
 
-`run_cdfsod.sh`는 지정한 config 하나를 학습한 뒤, 기존 validation metric으로 생성된
-`best_coco_bbox_mAP_iter_*.pth`를 찾아 즉시 평가한다.
+Run from the repository root in the supported Linux GPU environment:
 
 ```bash
 bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0
-bash run_cdfsod.sh --dataset NEU-DET --shot 5 --gpu 0
-bash run_cdfsod.sh --dataset NEU-DET --shot 10 --gpu 0
+bash run_cdfsod.sh --dataset FISH --shot 5 --gpu 1 --port 29501
+bash run_cdfsod.sh --dataset DIOR --shot 10 --gpu 0 --dry-run
 ```
 
-지원 dataset과 이름은 다음과 같다.
+Datasets: ArTaxOr, Clipart1k, DIOR, FISH (DeepFish alias), NEU-DET, UODD.
+Shots: 1, 5, 10. Each invocation uses one physical GPU and a unique work directory.
+`--work-dir PATH` selects the output directory. `--resume` is rejected because
+there are no checkpoints. Existing weight flags/aliases accept only zero.
+The diagnostic hook also checks these invariants for direct `tools/train.py` use.
+
+The logger follows the existing LoggerHook interval and short-epoch rules.
+Stage numbers come from BBoxHeadFirstHook6, not an assumed epoch threshold.
+Training records include current losses, window means, every optimizer-group LR,
+and the original optimizer's pre-clipping gradient norm. LR=0 is the existing
+progressive freeze mechanism; logging does not change it.
+
+## 4. Diagnostic files and offline reading
+
+All data is in `<work-dir>/diagnostics/`. In distributed direct-runner use,
+pass the relevant `diagnostics/rank_XXXX/` directory to the reader instead.
 
 ```text
-ArTaxOr
-Clipart1k
-DIOR
-FISH        # DeepFish도 alias로 사용 가능
-NEU-DET
-UODD
+diagnostics/
+  manifest.json             # schema, exact config, commit, tensor conventions, status
+  dataset.json              # original GT, crowd/ignore, image sizes, category-label map
+  train.jsonl               # epoch/step/stage, every loss, LR groups, gradient norm
+  metrics.jsonl             # standard COCO metrics plus structured per-class AP/AP50/AP75
+  prompts/<hash>.json        # static prompts, token strings and class mappings shared across epochs
+  epoch_001/
+    index.jsonl             # run/epoch/image/rank/batch/chunk -> tensors
+    batch_000000.npz         # bounded batch shards, compressed and pickle-free
+    text/<content-hash>.npz  # actual equal BERT features deduplicated within an epoch
+    text/<content-hash>.npz.json
+    complete.json           # written only after all images and metrics are committed
 ```
 
-예시:
+Read/verify/analyze without torch, MMEngine, model weights, tokenizer or images:
 
 ```bash
-bash run_cdfsod.sh --dataset ArTaxOr --shot 1 --gpu 0
-bash run_cdfsod.sh --dataset Clipart1k --shot 5 --gpu 0
-bash run_cdfsod.sh --dataset DIOR --shot 10 --gpu 0
-bash run_cdfsod.sh --dataset DeepFish --shot 1 --gpu 0
-bash run_cdfsod.sh --dataset UODD --shot 5 --gpu 0
+python tools/analysis_tools/inspect_acl_diagnostics.py /path/to/work-dir/diagnostics --verify --analyze
 ```
 
-중단된 동일 실험을 이어서 실행할 때는 `--resume`을 추가한다.
+The reader can also be loaded directly with `importlib.util.spec_from_file_location`
+from `mmdet/utils/acl_diagnostic_io.py`; use `DiagnosticReader(directory)`,
+`observations()`, `load(record)` and `proposals(arrays)`.
+
+### Tensor conventions
+
+- Each observation has image metadata, prompt chunk, class offset, one-based
+  model token mapping, and a reference to the original GT snapshot. Dataset
+  `class_index` and all query/candidate/detection indices are zero-based;
+  `category_id` preserves the original COCO category ID.
+- `bert_before_map`, `bert_after_map`, actual input token IDs, token strings,
+  position IDs, valid-token and text attention masks are shared only when their
+  stored contents and prompt metadata are identical in the same epoch.
+- `fe_text[layer,token,channel]` is stored for all six enhancer layers and every
+  image. Its final layer is `fe_text[-1]`.
+- `decoder_token_logits[layer,query,token]`, `decoder_class_scores[layer,query,class]`
+  and `decoder_boxes[layer,query,4]` cover all six serial layers. Only actual
+  token columns are stored; omitted padded logit columns are -inf. Class score
+  is the model's mean of sigmoid(token logits), not a mean-logit or softmax.
+- `decoder_boxes[-1]` is the complete pre-postprocessing query prediction;
+  it is not duplicated. Decoder/encoder boxes use normalized cxcywh with the
+  same resized-image convention as the original prediction head.
+- Final `det_boxes` are xyxy in original pixels and `det_scores` are float32.
+  `det_query_index`, `det_class_index_local`, `det_class_index` and
+  `det_flat_topk_index` are copied from actual postprocessing. Global class
+  index = local index + prompt-chunk class offset. For mapped class prompts,
+  flat index = query index * local class count + local class index.
+  Ties and repeated query IDs with different classes are preserved exactly.
+- Encoder arrays are `encoder_boxes[N,4]`, `encoder_class_scores[N,C]`,
+  `selection_max_token_logit[N]` (float32), `selection_argmax_token[N]`,
+  and `selected_indices[Q]`. Candidate order is unchanged, including invalid
+  candidates. Masks are bit-packed with little bit order. The reader restores
+  base anchors from `spatial_shapes`, `valid_hw` and `padding_mask` using
+  recipe version 1 (0.05 * 2**level sizes, 0.01/0.99 validity bounds).
+  Selected candidate rows are referenced by index rather than duplicated.
+- Large float arrays use float16 + NPZ compression. No full encoder NxT token
+  logit array, visual/query hidden state or attention weight matrix is saved.
+  Masks are structural masks, not attention weights. There is no native
+  objectness head; max class score is explicitly only an objectness proxy.
+- Class AP/AP50/AP75 come from the same COCO precision array used by the existing
+  evaluator, at area=all and its final maxDets setting. AP50/AP75 threshold
+  positions are looked up by value. Additional scalar keys are
+  `coco/bbox_class_<category_id>_AP`, `_AP50`, `_AP75`. Standard mAP/scheduler
+  inputs are unchanged. Undefined metrics are JSON null with a reason.
+
+`--analyze` demonstrates saved-data-only candidate/selected/final-query GT IoU
+coverage, per-query class confusion, objectness proxies and BERT-to-FE token
+cosines by epoch. Query confusion is best-IoU matching, not a replacement for
+COCO's one-to-one detection evaluation. The reader exposes each epoch's BERT
+features for temporal drift comparisons. The NPZ quantization means offline
+recomputed scores/IoUs can differ slightly from full precision; saved final
+scores, selected indices and detection origins retain their original values.
+
+## 5. Disk capacity and failure behavior
+
+The logger performs a conservative uncompressed capacity estimate before
+training using model dimensions, validation resize bounds, dataset size and
+all epochs. It recalibrates with actual compressed bytes during validation.
+Capacity is rechecked at batch/epoch boundaries and before each file write.
+The defaults reserve **10 GiB** plus **1.2 times** projected remaining data.
+Preflight may intentionally reject a disk that could fit unusually compressible
+data; it does not assume an optimistic compression ratio.
+
+Configure `ACLDiagnosticHook` in the dataset/shot config when needed:
+
+```python
+dict(type='ACLDiagnosticHook', out_dir='/large-disk/acl-run/diagnostics',
+     reserve_gib=10.0, capacity_margin=1.2)
+```
+
+The destination must not already exist. Storage errors or insufficient capacity
+stop the run immediately; data is never silently sampled, dropped or pruned.
+NPZ/JSON files are atomically renamed before index rows refer to them. A failed
+run keeps a running manifest and any `.partial` file for diagnosis; it cannot
+be mistaken for a completed epoch/run. Compression and I/O add runtime but do
+not modify model inputs, outputs, gradients, parameter updates or RNG state.
+
+## 6. Local regression tests
 
 ```bash
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 \
-  --work-dir work_dirs/experiment_A_NEU-DET_1shot --resume
+python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-동일 서버에서 다른 distributed 작업이 이미 `29500` 포트를 사용한다면 빈 포트를 지정한다.
-
-```bash
-bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
-```
-
-실행할 config와 결과 경로만 확인하려면 `--dry-run`을 추가한다.
-
-### BERT / FE ETF + μ-Orthogonality 실험
-
-두 위치 모두 이미지별로 **전체 dataset class**의 class-name WordPiece token을
-Raw Mean pooling한다. Token이나 개별 prototype을 정규화하지 않는다. BERT 위치는
-`text_feat_map` 직후, FE 위치는 최종 enhancer의 `memory_text`이다. 같은 위치의 두
-loss는 prototype을 한 번 계산해 같은 tensor를 공유하며, GT에 없는 클래스와 empty-GT
-이미지도 포함한다. Prompt에는 모든 클래스가 있어야 하며 잘리거나 누락된 span은 오류로 처리한다.
-
-ETF는 기존 `nearest_etf_loss.py`를 그대로 사용한다. Class centering → 전체 행렬
-Frobenius normalization → 매번 SVD로 계산한 Nearest Simplex ETF와 제곱 거리를 구한다.
-Target만 detach한다. μ-Orthogonality는 `μ = mean_c p_c`, `r_c = p_c - μ`에 대해
-`mean_{i,c} ((μ_i · r_{i,c}) / (||μ_i|| ||r_{i,c}|| + 1e-6))²`를 FP32로 계산한다.
-μ와 residual 모두 detach하지 않는다. FISH의 단일 클래스는 residual이 0이므로 두 loss가 0이다.
-
-| Config option | 기본 weight | 학습 로그 |
-|---|---:|---|
-| `model.bert_etf_loss_weight` | 1.0 | `loss_bert_etf` |
-| `model.bert_orth_loss_weight` | 0.0 | `loss_bert_orth` |
-| `model.fe_etf_loss_weight` | 0.0 | `loss_fe_etf` |
-| `model.fe_orth_loss_weight` | 0.0 | `loss_fe_orth` |
-
-각 weight는 독립적으로 조절하며, 0이면 해당 loss를 계산하거나 로그에 추가하지 않는다.
-네 weight가 모두 0이면 보조 loss용 클래스 매핑과 pooling도 생략한다. 기본값은 시작
-브랜치의 BERT ETF 단독 실험을 유지한다. Inference에서는 보조 loss를 계산하지 않는다.
-
-아래 weight 1.0은 실행 예시이며 각 loss의 weight는 실험에 맞게 설정한다. 두 명령은
-순서대로 실행하고, 각 실행은 한 GPU만 사용한다.
-
-```bash
-# Experiment A: BERT ETF + BERT μ-Orthogonality
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 0 \
-  --work-dir work_dirs/experiment_A_NEU-DET_1shot \
-  --bert-etf-loss-weight 1.0 --bert-orth-loss-weight 1.0 \
-  --fe-etf-loss-weight 0 --fe-orth-loss-weight 0
-
-# Experiment B: FE ETF + FE μ-Orthogonality
-bash run_cdfsod.sh --dataset NEU-DET --shot 1 --gpu 1 \
-  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
-  --bert-etf-loss-weight 0 --bert-orth-loss-weight 0 \
-  --fe-etf-loss-weight 1.0 --fe-orth-loss-weight 1.0
-
-# Native MMEngine CLI에서도 동일하게 설정 가능
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/train.py \
-  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
-  --work-dir work_dirs/experiment_B_NEU-DET_1shot \
-  --cfg-options model.bert_etf_loss_weight=0 model.bert_orth_loss_weight=0 \
-                model.fe_etf_loss_weight=1.0 model.fe_orth_loss_weight=1.0
-```
-
-`--etf-loss-weight`와 `--raw-mean-etf-loss-weight`는 `--bert-etf-loss-weight`의 alias로 유지한다.
-기존 config의 `model.raw_mean_etf_loss_weight`는 `model.bert_etf_loss_weight`로 변경한다.
-`--gpu 1`이면 `CUDA_VISIBLE_DEVICES=1`로 물리 GPU 1만 노출하고, 내부 worker는
-local rank 0 / `cuda:0`을 사용한다. Train과 test 모두 한 노드·한 process로 실행한다.
-Batch size, epoch, optimizer, scheduler, Progressive Fine-Tuning hook, Stage 1/2
-freeze 정책, matching, query selection, 클래스 매핑과 inference 후처리는 유지한다.
-FE는 Stage 1에서 기존 hook에 따라 lr=0이며, upstream BERT/backbone으로의 gradient는 유지한다.
-
-CPU PyTorch만으로 수치, gradient 및 ACL Decoder 회귀 검사를 실행할 수 있다. CLI 검사는 Bash를
-사용하며 학습·평가 launcher의 인자와 환경을 확인한다. 실제 GPU 학습 검사는 별도로 수행한다.
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## 4. 결과 구조와 집계
-
-학습 checkpoint, 로그, 평가 결과는 `--work-dir`에 저장한다. 옵션을 생략하면 dataset/shot
-아래에 timestamp와 process ID를 포함한 새 run directory를 생성해 실험 간 덮어쓰기를 피한다.
-`--resume`은 기존 실험을 가리키는 `--work-dir`과 함께 사용한다.
-
-```text
-exp_cdfsod_results/
-├── ArTaxOr/{1shot,5shot,10shot}/
-├── Clipart1k/{1shot,5shot,10shot}/
-├── DIOR/{1shot,5shot,10shot}/
-├── FISH/{1shot,5shot,10shot}/
-├── NEU-DET/{1shot,5shot,10shot}/
-└── UODD/{1shot,5shot,10shot}/
-```
-
-위 dataset/shot 폴더 아래의 개별 run directory 또는 지정한 `--work-dir`에는
-기존 naming convention의 best checkpoint와 `results.pkl`이 저장된다.
-완료된 실험의 mAP를 모아 보려면:
-
-```bash
-python analyze_results_cdfsod.py
-```
-
-## 문제 해결
-
-- `please install fairscale`: `python -m pip install -r requirements.txt`를 실행한다.
-- `Weights only load failed` 또는 `HistoryBuffer was not an allowed global`: 최신
-  `tools/train.py`와 `tools/test.py`를 사용한다. 이 호환 처리는 출처를 신뢰하는 checkpoint에만
-  사용해야 한다.
-- `No module named mmcv._ext`: `scripts/install_rtx3090.sh`로 MMCV CUDA ops를 다시 빌드한다.
-- `no kernel image is available`: `sm_86`을 포함한 cu126 PyTorch와 현재 toolkit으로
-  빌드한 MMCV인지 확인한 뒤 설치 스크립트를 다시 실행한다.
-- MMCV 빌드 OOM: `MAX_JOBS=1 bash scripts/install_rtx3090.sh`로 재실행한다.
-- `Address already in use`: `--port`에 사용 중이지 않은 값을 지정한다.
-- CUDA OOM: config를 변경하기 전에 `nvidia-smi`로 선택한 물리 GPU의 다른 process를 확인한다.
+Tests use real production detector/head/encoder methods and small CPU fixtures;
+CUDA/MMCV extensions and pretrained weights are not needed. They check config
+preservation, numerical/RNG invariance, AP50/AP75 export, tied-score provenance,
+proposal reconstruction, serialization, offline analysis and injected storage
+failures. These tests do not claim full GPU/dataset training verification.
 
 ## 원본 및 인용
 

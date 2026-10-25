@@ -39,7 +39,7 @@ class RawMeanCLIIntegrationTests(unittest.TestCase):
 
     def test_invalid_arguments_and_weights(self):
         for option in OPTIONS + ['etf-loss-weight']:
-            for value in ['', '-0.1', 'nan', 'inf', '1e999', 'bad', '1; exit 0']:
+            for value in ['', '-0.1', '0.1', 'nan', 'inf', '1e999', 'bad', '1; exit 0']:
                 result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1',
                                       f'--{option}', value, '--dry-run')
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -54,7 +54,7 @@ class RawMeanCLIIntegrationTests(unittest.TestCase):
             result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1', *extra)
             self.assertEqual(result.returncode, 2)
 
-    def test_weights_resume_and_single_physical_gpu_reach_train_and_test(self):
+    def test_zero_weights_and_single_physical_gpu_reach_train_without_test_or_checkpoints(self):
         with tempfile.TemporaryDirectory(prefix='acl-hed-mu-cli-') as directory:
             root = Path(directory)
             (root / 'run_cdfsod.sh').write_text((ROOT / 'run_cdfsod.sh').read_text(encoding='utf-8'),
@@ -79,15 +79,6 @@ case "$*" in
 esac
 printf '%s\\n' "$@" > "${CAPTURE_ROOT}/${kind}_args.txt"
 printf '%s\\n' "${CUDA_VISIBLE_DEVICES}" "${CUDA_DEVICE_ORDER}" "${NNODES}" "${NODE_RANK}" > "${CAPTURE_ROOT}/${kind}_env.txt"
-if [[ "$kind" == train ]]; then
-  while [[ $# -gt 0 ]]; do
-    if [[ "$1" == --work-dir ]]; then
-      touch "$2/best_coco_bbox_mAP_iter_1.pth"
-      break
-    fi
-    shift
-  done
-fi
 ''', encoding='utf-8', newline='\n')
             python.chmod(0o755)
             bash_path = subprocess.check_output([BASH, '-c', 'printf "%s" "$PATH"'],
@@ -97,25 +88,27 @@ fi
             for gpu in ['0', '1']:
                 output = (root / f'experiment {gpu}').as_posix()
                 result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1', '--gpu', gpu,
-                                      '--work-dir', output, '--resume',
-                                      '--bert-etf-loss-weight', '0', '--bert-orth-loss-weight', '.3',
-                                      '--fe-etf-loss-weight', '1e-2', '--fe-orth-loss-weight', '2',
+                                      '--work-dir', output,
+                                      '--bert-etf-loss-weight', '0', '--bert-orth-loss-weight', '.0',
+                                      '--fe-etf-loss-weight', '0e-2', '--fe-orth-loss-weight', '0',
                                       root=root, env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                for kind in ['train', 'test']:
+                self.assertFalse((root / 'test_args.txt').exists())
+                self.assertFalse(list(Path(output).glob('*.pth')))
+                for kind in ['train']:
                     args = (root / f'{kind}_args.txt').read_text(encoding='utf-8').splitlines()
                     settings = (root / f'{kind}_env.txt').read_text(encoding='utf-8').splitlines()
                     self.assertEqual(settings, [gpu, 'PCI_BUS_ID', '1', '0'])
                     self.assertIn('--nproc_per_node=1', args)
                     self.assertEqual(args[args.index('--work-dir') + 1], output)
-                    for name, weight in zip(OPTIONS, ['0', '.3', '1e-2', '2']):
+                    for name, weight in zip(OPTIONS, ['0', '.0', '0e-2', '0']):
                         self.assertIn(f'model.{name.replace("-", "_")}={weight}', args)
-                    self.assertEqual('--resume' in args, kind == 'train')
+                    self.assertNotIn('--resume', args)
                 for alias in ['--etf-loss-weight', '--raw-mean-etf-loss-weight']:
                     result = self.run_cli('--dataset', 'NEU-DET', '--shot', '1',
-                                          '--work-dir', output, alias, '.25', root=root, env=env)
+                                          '--work-dir', output, alias, '0', root=root, env=env)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn('model.bert_etf_loss_weight=.25',
+                    self.assertIn('model.bert_etf_loss_weight=0',
                                   (root / 'train_args.txt').read_text(encoding='utf-8').splitlines())
 
 

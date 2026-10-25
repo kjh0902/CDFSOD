@@ -43,7 +43,7 @@ metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 model = dict(
     type='GroundingDINO_ParallelDecoder_15_DNQuery_rand',
     rand_dnquery_rate=0.5,
-    bert_etf_loss_weight=1.0,
+    bert_etf_loss_weight=0.0,
     bert_orth_loss_weight=0.0,
     fe_etf_loss_weight=0.0,
     fe_orth_loss_weight=0.0,
@@ -149,6 +149,7 @@ test_dataloader = dict(
         return_classes=True))
 
 val_evaluator = dict(
+    classwise=True,
     ann_file=f'{data_root}/annotations/test.json')
 
 test_evaluator = dict(
@@ -192,9 +193,10 @@ param_scheduler = [
         verbose=True)
 ]
 
-default_hooks = dict(checkpoint=dict(max_keep_ckpts=1, save_best='auto')) 
+default_hooks = dict(checkpoint=None)
 
 custom_hooks = [
+    dict(type='ACLDiagnosticHook'),
     dict(
         type='BBoxHeadFirstHook6',
         adjust_scheduler_patience=True,

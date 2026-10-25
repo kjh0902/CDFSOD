@@ -13,6 +13,7 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
+from mmdet.utils.acl_diagnostic_events import diagnostic_event
 from ..layers import SinePositionalEncoding
 from ..losses.raw_mean_etf_loss import raw_mean_geometry_losses
 from ..layers.transformer.grounding_dino_layers import (
@@ -392,6 +393,11 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
         # binary classification.
         topk_indices = torch.topk(
             enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+        diagnostic_event(
+            'candidates', logits=enc_outputs_class,
+            boxes_unact=enc_outputs_coord_unact, selected=topk_indices,
+            base_proposals=output_proposals, memory_mask=memory_mask,
+            spatial_shapes=spatial_shapes)
 
         topk_score = torch.gather(
             enc_outputs_class, 1,
@@ -569,6 +575,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             for b in range(len(text_prompts[0])):
                 text_prompts_once = [text_prompts[0][b]]
                 token_positive_maps_once = token_positive_maps[0][b]
+                diagnostic_event(
+                    'prompt', samples=batch_data_samples, captions=text_prompts_once,
+                    mappings=[token_positive_maps_once], chunk=b, class_offset=count)
                 text_dict = self.language_model(text_prompts_once)
                 # text feature map layer
                 if self.text_feat_map is not None:
@@ -593,6 +602,9 @@ class GroundingDINO_ParallelDecoder_15_DNQuery_rand(DINO):
             is_rec_tasks = [False] * len(results_list)
         else:
             # extract text feats
+            diagnostic_event(
+                'prompt', samples=batch_data_samples, captions=text_prompts,
+                mappings=token_positive_maps, chunk=0, class_offset=0)
             text_dict = self.language_model(list(text_prompts))
             # text feature map layer
             if self.text_feat_map is not None:

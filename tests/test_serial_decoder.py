@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import torch
 from torch import nn
+from acl_diagnostic_test_support import events, without_diagnostic_events
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = '0a2dcb061bb8aed1c6d3b579b539d30c95cf2957'
@@ -32,7 +33,7 @@ def method(path, name, cls=None, **env):
                 if isinstance(n, ast.FunctionDef) and n.name == name)
     module = ast.Module(body=[ast.ImportFrom(module='__future__',
         names=[ast.alias(name='annotations')], level=0), node], type_ignores=[])
-    env.update(torch=torch, nn=nn)
+    env.update(torch=torch, nn=nn, diagnostic_event=events.diagnostic_event)
     exec(compile(ast.fix_missing_locations(module), path, 'exec'), env)
     return env[name]
 
@@ -86,7 +87,8 @@ class SerialDecoderTests(unittest.TestCase):
                      if isinstance(n, ast.FunctionDef)}
             self.assertEqual(before.keys(), after.keys())
             for name in before.keys() - allowed:
-                self.assertEqual(ast.dump(before[name]), ast.dump(after[name]), name)
+                self.assertEqual(ast.dump(before[name]),
+                                 ast.dump(without_diagnostic_events(after[name])), name)
         self.assertNotIn('additional_dn_items', source(DETECTOR))
         self.assertIn('self.decoder = GroundingDinoTransformerDecoder(', source(DETECTOR))
 
