@@ -12,7 +12,57 @@ import shutil
 import numpy as np
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+def snapshot_reasons(epoch, max_epochs, interval=5, stage_changed=False):
+    reasons = []
+    if epoch == 1:
+        reasons.append('initial')
+    if epoch % interval == 0:
+        reasons.append('interval')
+    if stage_changed:
+        reasons.append('stage_transition')
+    if epoch == max_epochs:
+        reasons.append('final')
+    return reasons
+
+
+def select_token_probes(dataset, limit=32):
+    """Fixed, RNG-free image sample: cover classes/empty GT, then hash order."""
+    ids = {row['id'] for row in dataset['images']}
+    classes = {row['category_id'] for row in dataset['categories']}
+    labels = {key: set() for key in ids}
+    for row in dataset['annotations']:
+        if (row['image_id'] in labels and row['category_id'] in classes and
+                not row.get('ignore') and not row.get('iscrowd')):
+            labels[row['image_id']].add(row['category_id'])
+    ordered = sorted(ids, key=lambda key: hashlib.sha256(str(key).encode()).digest())
+    selected, covered = [], set()
+    empty = next((key for key in ordered if not labels[key]), None)
+    if empty is not None and limit:
+        selected.append(empty)
+    while len(selected) < min(limit, len(ids)):
+        remaining = [key for key in ordered if key not in selected]
+        best = max(remaining, key=lambda key: len(labels[key] - covered))
+        selected.append(best)
+        covered |= labels[best]
+    return selected
+
+
+def compact_uint(values):
+    values = np.asarray(values)
+    maximum = int(values.max()) if values.size else 0
+    if values.size and int(values.min()) < 0:
+        raise ValueError('Diagnostic indices must be nonnegative')
+    dtype = np.uint8 if maximum <= 255 else np.uint16 if maximum <= 65535 else np.uint32
+    return values.astype(dtype)
+
+
+def rectangular_padding(spatial_shapes, valid_hw):
+    return np.concatenate([~((np.arange(h)[:, None] < vh) &
+                              (np.arange(w)[None, :] < vw)).ravel()
+                           for (h, w), (vh, vw) in zip(spatial_shapes, valid_hw)])
 
 
 def json_safe(value):
@@ -178,16 +228,49 @@ class DiagnosticWriter:
             digest.update(value.tobytes())
         key = (epoch, digest.hexdigest())
         if key not in self._shared:
-            prompt_hash = hashlib.sha256(json_bytes(metadata)).hexdigest()
-            prompt_ref = f'prompts/{prompt_hash}.json'
-            if prompt_hash not in self._prompts:
-                self.atomic_json(prompt_ref, metadata)
-                self._prompts.add(prompt_hash)
+            prompt_ref = self.shared_prompt(metadata)
             relative = f'epoch_{epoch:03d}/text/{key[1]}.npz'
             self.save_arrays(relative, arrays)
             self.atomic_json(relative + '.json', dict(prompt_ref=prompt_ref))
             self._shared[key] = relative
         return self._shared[key]
+
+    def shared_prompt(self, metadata):
+        prompt_hash = hashlib.sha256(json_bytes(metadata)).hexdigest()
+        relative = f'prompts/{prompt_hash}.json'
+        if prompt_hash not in self._prompts:
+            self.atomic_json(relative, metadata)
+            self._prompts.add(prompt_hash)
+        return relative
+
+    def write_batch(self, epoch, batch, records, run_id, step, rank=0):
+        """The production write path, also used by the storage benchmark."""
+        start_bytes = self.written_bytes
+        arrays, index = {}, []
+        shard = f'epoch_{epoch:03d}/batch_{batch:06d}.npz'
+        for position, row in enumerate(records):
+            prompt = dict(caption=row['caption'], class_mapping=row['class_mapping'])
+            prompt_ref = self.shared_prompt(prompt)
+            text_ref = None
+            if row['text']:
+                text_ref = self.shared_text(epoch, row['text'], dict(
+                    prompt, tokens=row['tokens']))
+            prefix = f'obs_{position:04d}__'
+            arrays.update({prefix + key: value for key, value in row['arrays'].items()})
+            index.append(dict(
+                run_id=run_id, epoch=epoch, step=step, rank=rank, batch=batch,
+                batch_position=position, image_batch_position=row['image_batch_position'],
+                img_id=row['metadata']['img_id'], chunk=row['chunk'],
+                class_offset=row['class_offset'], prompt_ref=prompt_ref, text_ref=text_ref,
+                image_meta={key: value for key, value in row['metadata'].items() if key != 'text'},
+                shard=shard, prefix=prefix, capture_level=row['capture_level'],
+                token_probe=row['token_probe'], num_queries=row['num_queries'],
+                original_logit_width=row['original_logit_width']))
+        self.save_arrays(shard, arrays)
+        for record in index:
+            self.append(f'epoch_{epoch:03d}/index.jsonl', record)
+        self.last_batch_bytes = self.written_bytes - start_bytes
+        return index
 
     def finish(self):
         self.manifest.update(status='complete', tensor_bytes=self.written_bytes)
@@ -198,7 +281,7 @@ class DiagnosticReader:
     def __init__(self, root):
         self.root = Path(root)
         self.manifest = self.read_json('manifest.json')
-        if self.manifest['schema_version'] != SCHEMA_VERSION:
+        if self.manifest['schema_version'] not in (1, SCHEMA_VERSION):
             raise ValueError('Unsupported diagnostic schema')
         self.dataset = self.read_json('dataset.json')
         self._text_metadata = {}
@@ -215,23 +298,34 @@ class DiagnosticReader:
         for path in sorted(self.root.glob('epoch_*/index.jsonl')):
             for record in self.records(path.relative_to(self.root)):
                 text_ref = record['text_ref']
-                if text_ref not in self._text_metadata:
-                    prompt_ref = self.read_json(text_ref + '.json')['prompt_ref']
-                    self._text_metadata[text_ref] = self.read_json(prompt_ref)
-                yield dict(record, **self._text_metadata[text_ref])
+                metadata_ref = record.get('prompt_ref')
+                if metadata_ref is None:
+                    metadata_ref = self.read_json(text_ref + '.json')['prompt_ref']
+                if metadata_ref not in self._text_metadata:
+                    self._text_metadata[metadata_ref] = self.read_json(metadata_ref)
+                yield dict(record, **self._text_metadata[metadata_ref])
 
     def load(self, record):
         with np.load(self.root / record['shard'], allow_pickle=False) as archive:
             prefix = record['prefix']
             arrays = {key[len(prefix):]: archive[key] for key in archive.files
                       if key.startswith(prefix)}
-        with np.load(self.root / record['text_ref'], allow_pickle=False) as archive:
-            arrays.update({key: archive[key] for key in archive.files})
+        if record['text_ref'] is not None:
+            with np.load(self.root / record['text_ref'], allow_pickle=False) as archive:
+                arrays.update({key: archive[key] for key in archive.files})
+        if 'det_class_index_local' not in arrays:
+            arrays['det_class_index_local'] = arrays['det_class_index'].astype(np.int64) - record['class_offset']
+            classes = (len(record['class_mapping']) if record['class_mapping'] is not None
+                       else record['original_logit_width'])
+            query = arrays['det_query_index'].astype(np.int64)
+            arrays['det_flat_topk_index'] = (query * classes + arrays['det_class_index_local']
+                                             if record['class_mapping'] is not None else query.copy())
         return arrays
 
     def proposals(self, arrays):
         count = int(np.prod(arrays['spatial_shapes'], axis=-1).sum())
-        padding = unpack_mask(arrays['padding_mask'], (count,))
+        padding = (unpack_mask(arrays['padding_mask'], (count,)) if 'padding_mask' in arrays
+                   else rectangular_padding(arrays['spatial_shapes'], arrays['valid_hw']))
         return reconstruct_proposals(arrays['spatial_shapes'], arrays['valid_hw'], padding)
 
     def verify(self):
@@ -240,28 +334,48 @@ class DiagnosticReader:
         count = 0
         images = {}
         observation_counts = {}
+        capture_levels = {}
         known_ids = {row['id'] for row in self.dataset['images']}
         for record in self.observations():
             if record['img_id'] not in known_ids:
                 raise ValueError('Observation image is absent from the GT snapshot')
             arrays = self.load(record)
-            anchors, valid = self.proposals(arrays)
-            np.testing.assert_array_equal(valid, unpack_mask(
-                arrays['proposal_valid'], valid.shape))
-            n, q = len(anchors), arrays['decoder_boxes'].shape[1]
-            if arrays['encoder_boxes'].shape != (n, 4) or arrays['encoder_class_scores'].shape[0] != n:
-                raise ValueError('Encoder candidate shape mismatch')
-            selected = arrays['selected_indices']
-            if np.any(selected >= n) or np.any(selected < 0) or len(selected) != q:
-                raise ValueError('Invalid encoder-to-query indices')
+            internal = record.get('capture_level', 'full') != 'detections'
+            capture_levels.setdefault(record['epoch'], set()).add(record.get('capture_level', 'full'))
+            if internal:
+                anchors, valid = self.proposals(arrays)
+                if 'proposal_valid' in arrays:
+                    np.testing.assert_array_equal(valid, unpack_mask(arrays['proposal_valid'], valid.shape))
+                n, q = len(anchors), arrays['decoder_boxes'].shape[1]
+                retained = arrays.get('encoder_candidate_indices', np.arange(n))
+                if (len(np.unique(retained)) != len(retained) or np.any(retained >= n) or
+                        arrays['encoder_boxes'].shape != (len(retained), 4) or
+                        arrays['encoder_class_scores'].shape[0] != len(retained)):
+                    raise ValueError('Encoder candidate shape mismatch')
+                selected = arrays['selected_indices']
+                if (np.any(selected >= n) or np.any(selected < 0) or len(selected) != q or
+                        not np.isin(selected, retained).all()):
+                    raise ValueError('Invalid encoder-to-query indices')
+                classes = arrays['decoder_class_scores'].shape[-1]
+                if record.get('capture_level') == 'internal':
+                    required = {'fe_class_prototypes', 'bert_before_map', 'bert_after_map',
+                                'gt_annotation_ids', 'gt_candidate_iou_max', 'gt_selected_iou_max'}
+                    if not required <= arrays.keys():
+                        raise ValueError('Missing internal snapshot arrays')
+                    if record['token_probe'] and not {
+                            'decoder_final_token_logits', 'fe_final_text'} <= arrays.keys():
+                        raise ValueError('Missing token probe arrays')
+            else:
+                q = record['num_queries']
+                classes = (len(record['class_mapping']) if record['class_mapping'] is not None
+                           else record['original_logit_width'])
             query, cls = arrays['det_query_index'], arrays['det_class_index_local']
-            classes = arrays['decoder_class_scores'].shape[-1]
             if np.any(query < 0) or np.any(query >= q):
                 raise ValueError('Invalid detection query indices')
             if record['class_mapping'] is not None:
                 if np.any(cls < 0) or np.any(cls >= classes):
                     raise ValueError('Invalid detection class indices')
-                np.testing.assert_array_equal(arrays['det_flat_topk_index'], query * classes + cls)
+                np.testing.assert_array_equal(arrays['det_flat_topk_index'], query.astype(np.int64) * classes + cls)
             np.testing.assert_array_equal(arrays['det_class_index'], cls + record['class_offset'])
             if len(query) != len(arrays['det_boxes']):
                 raise ValueError('Detection provenance length mismatch')
@@ -274,6 +388,8 @@ class DiagnosticReader:
                 raise ValueError('Completed epoch image count mismatch')
             if observation_counts.get(completed['epoch'], 0) != completed['observations']:
                 raise ValueError('Completed epoch observation count mismatch')
+            if 'capture_level' in completed and capture_levels[completed['epoch']] != {completed['capture_level']}:
+                raise ValueError('Epoch capture policy does not match its observations')
         if self.manifest['status'] != 'complete':
             raise ValueError('Diagnostic run is incomplete (manifest is not complete)')
         if set(images) != set(range(1, self.manifest['max_epochs'] + 1)):
@@ -285,3 +401,15 @@ class DiagnosticReader:
             raise ValueError('Diagnostic run has missing or duplicate epoch metrics')
         return {'observations': count, 'epochs': len(images),
                 'status': self.manifest['status']}
+
+    @staticmethod
+    def selected_candidate_rows(arrays):
+        """Map native (full encoder) query indices to retained candidate rows."""
+        retained = arrays.get('encoder_candidate_indices')
+        selected = arrays['selected_indices']
+        if retained is None:
+            return selected.astype(np.int64)
+        rows = np.searchsorted(retained, selected)
+        if np.any(rows >= len(retained)) or not np.array_equal(retained[rows], selected):
+            raise ValueError('Selected candidate missing from sparse encoder arrays')
+        return rows

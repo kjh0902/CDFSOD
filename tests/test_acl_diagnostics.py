@@ -34,6 +34,7 @@ def load_hook(hook_base=object, checkpoint_type=None):
                CheckpointHook=checkpoint_type or type('CheckpointHook', (), {}),
                Path=Path, math=math, np=np, subprocess=subprocess,
                DiagnosticWriter=dio.DiagnosticWriter, ACLBatchCapture=cap.ACLBatchCapture,
+               select_token_probes=dio.select_token_probes, snapshot_reasons=dio.snapshot_reasons,
                activate_diagnostics=events.activate_diagnostics,
                deactivate_diagnostics=events.deactivate_diagnostics,
                diagnostic_event=events.diagnostic_event,
@@ -107,6 +108,7 @@ def full_fixture():
     language.forward = MethodType(language_forward, language)
     language.tokenizer.convert_ids_to_tokens = lambda ids: [str(i) for i in ids]
     head = model.bbox_head
+    head.max_text_len = 64
     head.test_cfg = dict(max_per_img=5)
     head._predict_by_feat_single = MethodType(PREDICT_SINGLE, head)
     # Use the actual token-to-class conversion.
@@ -306,13 +308,13 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(records[0]['text_ref'], records[1]['text_ref'])
             self.assertNotEqual(records[0]['text_ref'], records[2]['text_ref'])
             arrays = reader.load(records[0])
-            self.assertEqual(arrays['fe_text'].shape[0], 6)
+            self.assertEqual(arrays['fe_class_prototypes'].shape[0], 6)
             self.assertEqual(arrays['decoder_boxes'].shape[0], 6)
             self.assertEqual(arrays['encoder_class_scores'].shape, (5, 6))
             self.assertNotIn('encoder_token_logits', arrays)
             self.assertNotIn('base_proposals', arrays)
             self.assertEqual(arrays['det_boxes'].dtype, np.float32)
-            self.assertEqual(arrays['decoder_token_logits'].dtype, np.float16)
+            self.assertEqual(arrays['decoder_final_token_logits'].dtype, np.float16)
             self.assertEqual(arrays['selection_max_token_logit'].dtype, np.float32)
             saved = list(reader.records('metrics.jsonl'))
             self.assertEqual(saved[0]['per_class'][0]['AP50'], .5)
@@ -330,7 +332,7 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_logging_preserves_loss_gradients_updates_predictions_and_rng(self):
         snapshots = []
-        for enabled in (False, True):
+        for enabled in (False, 'full', 'internal', 'detections'):
             model = full_fixture()
             hook = DiagnosticHook()
             hook.model = model
@@ -347,7 +349,8 @@ class DiagnosticTests(unittest.TestCase):
                          for p in model.parameters()]
             norm = nn.utils.clip_grad_norm_(model.parameters(), .1)
             optimizer.step()
-            capture = cap.ACLBatchCapture()
+            capture = cap.ACLBatchCapture(level=enabled or 'full', num_queries=model.num_queries,
+                logit_width=64, probe_ids=[101])
             token = events.activate_diagnostics(capture) if enabled else None
             try:
                 model.eval()
@@ -370,7 +373,8 @@ class DiagnosticTests(unittest.TestCase):
                 numpy=np.random.get_state()[1].tolist()))
             for handle in hook.handles:
                 handle.remove()
-        reference.RawMeanIntegrationTests().assert_nested_equal(snapshots[0], snapshots[1])
+        for snapshot in snapshots[1:]:
+            reference.RawMeanIntegrationTests().assert_nested_equal(snapshots[0], snapshot)
 
     def test_train_cadence_stage_lrs_loss_window_and_norm(self):
         history = lambda value: SimpleNamespace(current=lambda: value, mean=lambda _: value / 2)
@@ -581,6 +585,188 @@ class DiagnosticTests(unittest.TestCase):
             runner.hooks.append(type('AutoLoadBestCheckpointHook', (), {})())
             with self.assertRaisesRegex(ValueError, 'checkpoint'):
                 DiagnosticHook().before_train(runner)
+
+    def test_snapshot_schedule_and_rng_free_class_covering_probes(self):
+        self.assertEqual([e for e in range(1, 13) if dio.snapshot_reasons(e, 12)], [1, 5, 10, 12])
+        self.assertEqual(dio.snapshot_reasons(3, 12, stage_changed=True), ['stage_transition'])
+        state = random.getstate()
+        dataset = dict(images=[dict(id=i) for i in range(6)],
+            categories=[dict(category_id=i) for i in range(3)],
+            annotations=[dict(image_id=i, category_id=i % 3) for i in range(5)])
+        ids = dio.select_token_probes(dataset, 4)
+        self.assertIn(5, ids)  # empty GT witness
+        self.assertEqual({row['category_id'] for row in dataset['annotations']
+                          if row['image_id'] in ids}, {0, 1, 2})
+        self.assertEqual(ids, dio.select_token_probes(dataset, 4))
+        self.assertEqual(state, random.getstate())
+        self.assertEqual(dio.select_token_probes(dataset, 0), [])
+
+    def test_every_epoch_detections_and_scalar_summaries_with_transition_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = runner_fixture(directory)
+            runner.max_epochs = 7
+            hook = DiagnosticHook(reserve_gib=0, token_probe_images=1)
+            hook.before_train(runner)
+            for epoch in range(1, 8):
+                runner.epoch = epoch - 1
+                if epoch == 3:
+                    hook.stage_hook._stage2_started = True
+                hook.before_train_epoch(runner)
+                for step in range(3):
+                    hook.before_train_iter(runner, step)
+                    hook.after_train_iter(runner, step, outputs={'loss': float(step + 1)})
+                    runner.iter += 1
+                hook.after_train_epoch(runner)
+                runner.epoch = epoch
+                hook.before_val_epoch(runner)
+                hook.before_val_iter(runner, 0)
+                with torch.no_grad():
+                    runner.model.eval()
+                    outputs = runner.model.predict(torch.zeros(2, 3, 4, 4), data_samples())
+                hook.after_val_iter(runner, 0, outputs=outputs)
+                hook.after_val_epoch(runner, {'coco/bbox_mAP': .2})
+            hook.after_run(runner)
+            reader = dio.DiagnosticReader(Path(directory) / 'diagnostics')
+            self.assertEqual(reader.verify()['observations'], 14)
+            observations = list(reader.observations())
+            for row in observations:
+                arrays = reader.load(row)
+                self.assertEqual('decoder_boxes' in arrays, row['epoch'] in (1, 3, 5, 7))
+                if row['epoch'] not in (1, 3, 5, 7):
+                    self.assertIsNone(row['text_ref'])
+                    self.assertNotIn('bert_after_map', arrays)
+                self.assertEqual(len(arrays['det_boxes']), 5)
+            summaries = list(reader.records('train_epochs.jsonl'))
+            self.assertEqual(len(summaries), 7)
+            self.assertTrue(all(row['losses']['loss'] == 2. for row in summaries))
+            transitions = list(reader.records('stage_events.jsonl'))
+            self.assertEqual([row['epoch'] for row in transitions], [3])
+            metrics = list(reader.records('metrics.jsonl'))
+            self.assertEqual(metrics[2]['snapshot_reasons'], ['stage_transition'])
+            self.assertEqual(metrics[-1]['snapshot_reasons'], ['final'])
+            spec = importlib.util.spec_from_file_location('inspect_compact_epochs', ROOT /
+                'tools/analysis_tools/inspect_acl_diagnostics.py')
+            inspector = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(inspector)
+            analysis = inspector.analyze(reader)
+            self.assertEqual(analysis[2]['internal_observations'], 0)
+            self.assertEqual(analysis[2]['images'], 2)
+            self.assertIsNone(analysis[2]['candidate_gt_coverage_at_0_5'])
+            self.assertIn('detection_class_confusion', analysis[2])
+            self.assertEqual(analysis[3]['internal_observations'], 2)
+
+    def test_sparse_oracles_preserve_missed_good_candidates_and_full_gt_coverage(self):
+        n, q = 256, 4
+        shapes = np.array([[16, 16]])
+        anchors, valid = dio.reconstruct_proposals(shapes, shapes)
+        boxes = torch.tensor([.1, .1, .05, .05]).repeat(1, n, 1)
+        boxes[0, 200] = torch.tensor([.5, .5, .2, .2])
+        logits = torch.full((1, n, 4), -5.)
+        logits[0, 200, 1] = 2.
+        selected = torch.tensor([[10, 11, 12, 13]])
+        logits[0, selected[0], 0] = 10.
+        capture = cap.ACLBatchCapture(level='internal', num_queries=q,
+            boundary_candidates=0, ground_truth={101: [dict(id=7, category_id=10,
+                                                        bbox=[40, 40, 20, 20])]},
+            category_map={10: 0})
+        sample = SimpleNamespace(metainfo=dict(img_id=101, img_shape=(100, 100), scale_factor=(1., 1.)))
+        capture('prompt', samples=[sample], captions=['a'], mappings=[{1: [1], 2: [2]}],
+                chunk=0, class_offset=0)
+        capture('candidates', logits=logits, boxes_unact=boxes.logit(), selected=selected,
+                base_proposals=torch.logit(torch.from_numpy(anchors))[None],
+                memory_mask=None, spatial_shapes=torch.from_numpy(shapes))
+        arrays = capture.current[0]['arrays']
+        self.assertIn(200, arrays['encoder_candidate_indices'])
+        self.assertTrue(np.isin(selected.numpy(), arrays['encoder_candidate_indices']).all())
+        self.assertLess(len(arrays['encoder_boxes']), 12)
+        self.assertAlmostEqual(arrays['gt_candidate_iou_max'][0], 1., places=5)
+        self.assertEqual(arrays['gt_selected_iou_max'][0], 0.)
+        self.assertEqual(arrays['gt_candidate_count_iou50_75'].tolist(), [[1], [1]])
+        self.assertAlmostEqual(arrays['gt_candidate_class_score_iou50_75'][0, 0],
+                               torch.tensor(2.).sigmoid().item(), places=3)
+        self.assertNotIn('padding_mask', arrays)
+        self.assertNotIn('proposal_valid', arrays)
+        padding = torch.zeros(1, n, dtype=torch.bool)
+        padding[0, 75] = True  # not representable as a top-left valid rectangle
+        base = torch.logit(torch.from_numpy(anchors))[None]
+        base[:, 75] = torch.inf
+        capture('candidates', logits=logits, boxes_unact=boxes.logit(), selected=selected,
+                base_proposals=base, memory_mask=padding, spatial_shapes=torch.from_numpy(shapes))
+        np.testing.assert_array_equal(dio.unpack_mask(arrays['padding_mask'], (n,)), padding[0].numpy())
+        reader_stub = object.__new__(dio.DiagnosticReader)
+        _, reconstructed_valid = reader_stub.proposals(arrays)
+        np.testing.assert_array_equal(reconstructed_valid, torch.isfinite(base[0]).all(-1).numpy())
+
+    def test_detection_only_capture_skips_all_internal_payloads_and_exact_index_reconstruction(self):
+        capture = cap.ACLBatchCapture(level='detections', num_queries=900, logit_width=256)
+        mapping = {i + 1: [i] for i in range(256)}
+        sample = SimpleNamespace(metainfo=dict(img_id=1))
+        capture('prompt', samples=[sample], captions=['prompt'], mappings=[mapping], chunk=0, class_offset=0)
+        # Intentionally unusable payloads prove light epochs do not inspect/copy them.
+        for event in ('tokenizer', 'language', 'feat_map', 'fe_layer', 'candidates', 'head'):
+            capture(event, outputs=object())
+        result = Instances(bboxes=torch.zeros(1, 4), scores=torch.tensor([.9]), labels=torch.tensor([255]))
+        capture('detections', results=result, query_index=torch.tensor([899]),
+                class_index=result.labels, flat_index=torch.tensor([899 * 256 + 255]))
+        rows = capture.finish()
+        self.assertEqual(set(rows[0]['arrays']), {'det_boxes', 'det_scores', 'det_query_index', 'det_class_index'})
+        self.assertEqual(rows[0]['arrays']['det_class_index'].dtype, np.uint8)
+        self.assertEqual(rows[0]['arrays']['det_query_index'].dtype, np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            writer = dio.DiagnosticWriter(Path(directory) / 'out', {}, {}, reserve_gib=0)
+            records = writer.write_batch(1, 0, rows, 'test', 1)
+            reader = dio.DiagnosticReader(writer.root)
+            row = next(reader.observations())
+            restored = reader.load(row)
+            self.assertEqual(restored['det_flat_topk_index'][0], 899 * 256 + 255)
+            np.testing.assert_array_equal(restored['det_scores'], result.scores.numpy())
+            self.assertIsNone(records[0]['text_ref'])
+
+    def test_sparse_reader_v1_compatibility_and_compressed_benchmark(self):
+        spec = importlib.util.spec_from_file_location('acl_storage_benchmark', ROOT /
+            'tools/analysis_tools/benchmark_acl_diagnostics.py')
+        benchmark = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(benchmark)
+        with tempfile.TemporaryDirectory() as directory:
+            report = benchmark.benchmark(Path(directory) / 'comparison', epochs=3, images=2,
+                max_epochs=3, stage_epoch=2, candidates=256, queries=16, tokens=14,
+                classes=3, dimension=8)
+            self.assertTrue(report['native_detection_arrays_equal'])
+            for version in ('v1', 'v2'):
+                reader = dio.DiagnosticReader(Path(directory) / 'comparison' / version)
+                self.assertEqual(reader.verify()['observations'], 6)
+                first = next(reader.observations())
+                arrays = reader.load(first)
+                rows = reader.selected_candidate_rows(arrays)
+                retained = arrays.get('encoder_candidate_indices', np.arange(256))
+                np.testing.assert_array_equal(retained[rows], arrays['selected_indices'])
+                if version == 'v2':
+                    self.assertLess(len(retained), 256)
+                    self.assertNotIn('decoder_token_logits', arrays)
+                else:
+                    self.assertIn('decoder_token_logits', arrays)
+
+    def test_storage_failure_remains_fatal_on_both_snapshot_and_light_epochs(self):
+        for epoch in (1, 2):
+            with tempfile.TemporaryDirectory() as directory:
+                runner = runner_fixture(directory)
+                runner.max_epochs = 7
+                hook = DiagnosticHook(reserve_gib=0)
+                hook.before_train(runner)
+                runner.epoch = epoch
+                hook.before_val_epoch(runner)
+                hook.before_val_iter(runner, 0)
+                with torch.no_grad():
+                    runner.model.eval()
+                    outputs = runner.model.predict(torch.zeros(2, 3, 4, 4), data_samples())
+                with patch.object(hook.writer, 'save_arrays', side_effect=OSError('disk full')):
+                    with self.assertRaisesRegex(OSError, 'disk full'):
+                        hook.after_val_iter(runner, 0, outputs=outputs)
+                self.assertIsNone(hook.token)
+                self.assertFalse((hook.writer.root / f'epoch_{epoch:03d}/complete.json').exists())
+                self.assertEqual(hook.writer.manifest['status'], 'running')
+                for handle in hook.handles:
+                    handle.remove()
 
 
 if __name__ == '__main__':

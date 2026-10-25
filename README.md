@@ -119,108 +119,159 @@ Training records include current losses, window means, every optimizer-group LR,
 and the original optimizer's pre-clipping gradient norm. LR=0 is the existing
 progressive freeze mechanism; logging does not change it.
 
-## 4. Diagnostic files and offline reading
+## 4. Compact diagnostics (schema v2)
 
-All data is in `<work-dir>/diagnostics/`. In distributed direct-runner use,
-pass the relevant `diagnostics/rank_XXXX/` directory to the reader instead.
+The baseline training/validation and checkpoint-free launcher are unchanged.
+The default storage policy is:
+
+| Data | Frequency / scope |
+|---|---|
+| Loss, all optimizer-group LRs, existing gradient norm | Existing iteration cadence, plus an all-iteration mean every epoch |
+| COCO mAP, AP50/AP75, per-class AP/AP50/AP75 | Every validation epoch |
+| GT snapshot, prompts, category/label mapping | Once per run / unique prompt |
+| Final detections and exact query/global-class provenance | Every image, every epoch; float32 boxes/scores |
+| Encoder candidates, decoder layers, BERT/FE features | Epoch 1, every 5 epochs, first validation after a stage transition, final epoch |
+| Final decoder token logits and final FE token features | Only on the same <=32 fixed probe images, at internal snapshot epochs |
+
+Probe selection covers available classes and an empty-GT image when possible,
+then fills by stable image-ID hashes. It never draws from training/validation RNGs.
+Stage events are recorded before training the first epoch of the new stage.
+Their internal snapshot is the normal validation after that epoch; no extra
+forward/evaluation is added. The immediately preceding epoch may have only final
+detections and scalars, rather than internal tensors.
 
 ```text
 diagnostics/
-  manifest.json             # schema, exact config, commit, tensor conventions, status
-  dataset.json              # original GT, crowd/ignore, image sizes, category-label map
-  train.jsonl               # epoch/step/stage, every loss, LR groups, gradient norm
-  metrics.jsonl             # standard COCO metrics plus structured per-class AP/AP50/AP75
-  prompts/<hash>.json        # static prompts, token strings and class mappings shared across epochs
+  manifest.json             # schema, config, commit, policy, fixed probe IDs, completion status
+  dataset.json              # original GT, crowd/ignore, image sizes, category-label mapping
+  train.jsonl               # unchanged existing iteration logging cadence
+  train_epochs.jsonl        # epoch means over ALL train iterations, LR, gradient norm mean
+  stage_events.jsonl        # only when the progressive stage changes
+  metrics.jsonl             # every epoch's COCO metrics, snapshot reasons and actual tensor bytes
+  prompts/<hash>.json        # shared prompt/mapping metadata
   epoch_001/
-    index.jsonl             # run/epoch/image/rank/batch/chunk -> tensors
-    batch_000000.npz         # bounded batch shards, compressed and pickle-free
-    text/<content-hash>.npz  # actual equal BERT features deduplicated within an epoch
-    text/<content-hash>.npz.json
-    complete.json           # written only after all images and metrics are committed
+    index.jsonl             # every image/chunk, capture_level, exact tensor references
+    batch_000000.npz         # compressed batch shards; light epochs contain final detections only
+    text/<hash>.npz          # snapshot BERT features, deduplicated by actual stored bytes
+    text/<hash>.npz.json
+    complete.json           # finalized only after all images and metrics were stored
 ```
 
-Read/verify/analyze without torch, MMEngine, model weights, tokenizer or images:
+### Retained internal information
+
+- Encoder candidates are the union of the actual selected queries, up to 128
+  highest-selection-score unselected candidates, and up to 5 highest-IoU valid
+  candidates per non-crowd/non-ignored GT. `encoder_candidate_indices` preserves
+  the original flattened encoder IDs; `selected_indices` keeps the actual native
+  query selection order. Candidate arrays now have M rows, not N full grid rows.
+- For ALL valid candidates, the logger also computes GT-wise maximum IoU,
+  selected-candidate maximum IoU, candidate counts at IoU >= .50/.75, and the
+  best correct-class score above those IoUs. These small summaries retain evidence
+  that a good proposal existed but was not selected. Max-token-logit quantiles
+  summarize the full candidate score distribution. Boxes and IoU summaries use
+  the existing unclipped normalized-cxcywh-to-original-pixels convention.
+- All six decoder layers retain every query's class scores and normalized boxes.
+  A class score is the same mean(sigmoid(mapped token logits)) as inference;
+  there is no native objectness head. `decoder_boxes[-1]` and
+  `decoder_class_scores[-1]` are the complete final pre-postprocessing queries.
+- BERT token features before/after text_feat_map remain available on snapshot
+  epochs. All six FE layers retain raw class-name-token means as
+  `fe_class_prototypes[layer,class,channel]`. These support class geometry,
+  inter-layer comparisons, BERT-to-FE and temporal drift analyses without keeping
+  every token vector at every enhancer layer.
+- Probe images additionally retain `decoder_final_token_logits[query,token]`
+  and `fe_final_text[token,channel]`. Full six-layer token logits and full six-layer
+  FE token states are removed. No visual/query hidden states or attention weights
+  are stored.
+- Final `det_boxes` (original-pixel xyxy) and `det_scores` stay float32.
+  Actual query and global class indices are stored using the smallest lossless
+  uint dtype. The reader reconstructs local class and flat top-k indices exactly
+  by integer arithmetic, never by score/box matching or re-running top-k.
+- Base anchors, rectangular padding and proposal-valid masks are reconstructed
+  from spatial shapes, valid heights/widths and the versioned proposal recipe.
+  Nonrectangular padding falls back to the exact bit-packed mask. Retained
+  candidate boxes/scores and other large internal floats stay float16.
+- Compression remains standard pickle-free NPZ DEFLATE. There is no additional
+  int8/lossy score quantization. Missing internal tensors are deliberate and
+  explicitly marked `capture_level=detections`, not fabricated by the reader.
+
+### Offline reading and limitations
+
+The Python/Numpy-only reader supports both existing v1 logs and new v2 logs:
 
 ```bash
-python tools/analysis_tools/inspect_acl_diagnostics.py /path/to/work-dir/diagnostics --verify --analyze
+python tools/analysis_tools/inspect_acl_diagnostics.py /path/to/diagnostics --verify --analyze
 ```
 
-The reader can also be loaded directly with `importlib.util.spec_from_file_location`
-from `mmdet/utils/acl_diagnostic_io.py`; use `DiagnosticReader(directory)`,
-`observations()`, `load(record)` and `proposals(arrays)`.
+`DiagnosticReader.observations()`, `load(record)`, `proposals(arrays)` and
+`selected_candidate_rows(arrays)` expose all stored data. Final detection
+confusion, missed GT, duplicate/localization/background examples can be examined
+EVERY epoch from detections and GT. `--score-threshold .3` controls only this
+example analysis, never the saved predictions or original COCO metrics.
+Internal query-selection coverage, query confusion and FE class-feature drift
+are reported only for snapshot epochs, with explicit internal observation counts.
+Greedy diagnostic matching is not a replacement for COCO evaluation.
 
-### Tensor conventions
+Unretained rejected candidates cannot be individually inspected later. Raw
+within-class token behavior is restricted to the fixed probes' final layers;
+intermediate FE token states and intermediate decoder token logits cannot be
+recovered. Intermediate decoder class scores/boxes and FE class means remain
+available at snapshots. Float16 offline IoUs/scores may differ slightly from
+native precision; native final detection arrays and provenance are unchanged.
+Class AP/AP50/AP75 continue to come from the original evaluator's precision
+array, including threshold lookup by value and null/reason for undefined metrics.
 
-- Each observation has image metadata, prompt chunk, class offset, one-based
-  model token mapping, and a reference to the original GT snapshot. Dataset
-  `class_index` and all query/candidate/detection indices are zero-based;
-  `category_id` preserves the original COCO category ID.
-- `bert_before_map`, `bert_after_map`, actual input token IDs, token strings,
-  position IDs, valid-token and text attention masks are shared only when their
-  stored contents and prompt metadata are identical in the same epoch.
-- `fe_text[layer,token,channel]` is stored for all six enhancer layers and every
-  image. Its final layer is `fe_text[-1]`.
-- `decoder_token_logits[layer,query,token]`, `decoder_class_scores[layer,query,class]`
-  and `decoder_boxes[layer,query,4]` cover all six serial layers. Only actual
-  token columns are stored; omitted padded logit columns are -inf. Class score
-  is the model's mean of sigmoid(token logits), not a mean-logit or softmax.
-- `decoder_boxes[-1]` is the complete pre-postprocessing query prediction;
-  it is not duplicated. Decoder/encoder boxes use normalized cxcywh with the
-  same resized-image convention as the original prediction head.
-- Final `det_boxes` are xyxy in original pixels and `det_scores` are float32.
-  `det_query_index`, `det_class_index_local`, `det_class_index` and
-  `det_flat_topk_index` are copied from actual postprocessing. Global class
-  index = local index + prompt-chunk class offset. For mapped class prompts,
-  flat index = query index * local class count + local class index.
-  Ties and repeated query IDs with different classes are preserved exactly.
-- Encoder arrays are `encoder_boxes[N,4]`, `encoder_class_scores[N,C]`,
-  `selection_max_token_logit[N]` (float32), `selection_argmax_token[N]`,
-  and `selected_indices[Q]`. Candidate order is unchanged, including invalid
-  candidates. Masks are bit-packed with little bit order. The reader restores
-  base anchors from `spatial_shapes`, `valid_hw` and `padding_mask` using
-  recipe version 1 (0.05 * 2**level sizes, 0.01/0.99 validity bounds).
-  Selected candidate rows are referenced by index rather than duplicated.
-- Large float arrays use float16 + NPZ compression. No full encoder NxT token
-  logit array, visual/query hidden state or attention weight matrix is saved.
-  Masks are structural masks, not attention weights. There is no native
-  objectness head; max class score is explicitly only an objectness proxy.
-- Class AP/AP50/AP75 come from the same COCO precision array used by the existing
-  evaluator, at area=all and its final maxDets setting. AP50/AP75 threshold
-  positions are looked up by value. Additional scalar keys are
-  `coco/bbox_class_<category_id>_AP`, `_AP50`, `_AP75`. Standard mAP/scheduler
-  inputs are unchanged. Undefined metrics are JSON null with a reason.
+## 5. Storage measurement and capacity protection
 
-`--analyze` demonstrates saved-data-only candidate/selected/final-query GT IoU
-coverage, per-query class confusion, objectness proxies and BERT-to-FE token
-cosines by epoch. Query confusion is best-IoU matching, not a replacement for
-COCO's one-to-one detection evaluation. The reader exposes each epoch's BERT
-features for temporal drift comparisons. The NPZ quantization means offline
-recomputed scores/IoUs can differ slightly from full precision; saved final
-scores, selected indices and detection origins retain their original values.
+A reproducible CPU benchmark loads the original capture/writer directly from
+commit `09efa0c`, feeds v1 and v2 IDENTICAL synthetic tensors and measures actual
+compressed files, including metadata/scalars:
 
-## 5. Disk capacity and failure behavior
+```bash
+python tools/analysis_tools/benchmark_acl_diagnostics.py /new/output/directory --epochs 9 --images 8 --max-epochs 100
+```
 
-The logger performs a conservative uncompressed capacity estimate before
-training using model dimensions, validation resize bounds, dataset size and
-all epochs. It recalibrates with actual compressed bytes during validation.
-Capacity is rechecked at batch/epoch boundaries and before each file write.
-The defaults reserve **10 GiB** plus **1.2 times** projected remaining data.
-Preflight may intentionally reject a disk that could fit unusually compressible
-data; it does not assume an optimistic compression ratio.
+Parameters: 20,000 encoder candidates, 900 queries, 26 tokens, 6 classes,
+256 feature channels, six layers, 8 images, first 9 epochs of a 100-epoch schedule,
+and an illustrative stage transition at epoch 7. Internal snapshots are 1/5/7.
+All 8 synthetic images are token probes, a conservative probe fraction compared
+with <=32 probes in a full validation dataset.
 
-Configure `ACLDiagnosticHook` in the dataset/shot config when needed:
+| Measured files | Previous v1 | Compact v2 | Reduction |
+|---|---:|---:|---:|
+| First 9 synthetic epochs | 59,154,835 bytes | 4,635,695 bytes | 92.16% |
+| 100 synthetic epochs (projection, 22 snapshots) | 657,241,809 bytes | 35,904,412 bytes | 94.54% |
+
+These are actual compressed-file measurements, not a NEU-DET GPU training run.
+Applying the measured prefix ratio to the reported 1.8 GB / 9 epochs suggests
+about **0.14 GB / 9 epochs**. Actual data, proposal count, image geometry, token
+length and stage timing affect the result. `comparison.json` also projects a full
+run from measured light/snapshot epoch sizes and explicitly labels that estimate.
+Normalizing that projection to the reported NEU-DET rate gives approximately
+**20 GB -> 1.1 GB for 100 epochs**; this is a size estimate, not a measured
+NEU-DET run or a capacity guarantee.
+The benchmark asserts exact equality of native detection boxes, scores and
+query provenance between captures. Existing logs are not modified or deleted.
+
+Preflight budgets light epochs and internal snapshots separately, including one
+possible progressive-stage snapshot. It recalibrates their compression rates
+separately during validation. Defaults still require **10 GiB reserve** plus
+**1.2 times projected remaining data**. Capacity is checked before each file
+write and at batch/epoch boundaries; no optimistic compression ratio is assumed
+before the first measurement.
 
 ```python
-dict(type='ACLDiagnosticHook', out_dir='/large-disk/acl-run/diagnostics',
+dict(type='ACLDiagnosticHook', out_dir='/large-disk/new-run/diagnostics',
+     internal_interval=5, token_probe_images=32,
      reserve_gib=10.0, capacity_margin=1.2)
 ```
 
-The destination must not already exist. Storage errors or insufficient capacity
-stop the run immediately; data is never silently sampled, dropped or pruned.
-NPZ/JSON files are atomically renamed before index rows refer to them. A failed
-run keeps a running manifest and any `.partial` file for diagnosis; it cannot
-be mistaken for a completed epoch/run. Compression and I/O add runtime but do
-not modify model inputs, outputs, gradients, parameter updates or RNG state.
+The destination must be new. A storage error stops training immediately, on
+both light and snapshot epochs. It never triggers extra thinning or deletion.
+Files are atomically finalized before index references are appended; only fully
+stored epochs/runs receive completion markers. Compression and analysis
+reductions add runtime but do not modify model inputs/outputs, gradients,
+optimizer updates, progressive fine-tuning, validation or RNG state.
 
 ## 6. Local regression tests
 

@@ -13,7 +13,8 @@ from mmdet.registry import HOOKS
 from mmdet.utils.acl_diagnostic_capture import ACLBatchCapture
 from mmdet.utils.acl_diagnostic_events import (
     activate_diagnostics, deactivate_diagnostics, diagnostic_event)
-from mmdet.utils.acl_diagnostic_io import DiagnosticWriter
+from mmdet.utils.acl_diagnostic_io import (
+    DiagnosticWriter, select_token_probes, snapshot_reasons)
 
 
 @HOOKS.register_module()
@@ -26,7 +27,14 @@ class ACLDiagnosticHook(Hook):
     """
     priority = 'LOW'
 
-    def __init__(self, out_dir=None, reserve_gib=10., capacity_margin=1.2):
+    def __init__(self, out_dir=None, reserve_gib=10., capacity_margin=1.2,
+                 internal_interval=5, token_probe_images=32):
+        if not isinstance(internal_interval, int) or internal_interval < 1:
+            raise ValueError('internal_interval must be a positive integer')
+        if not isinstance(token_probe_images, int) or token_probe_images < 0:
+            raise ValueError('token_probe_images must be a nonnegative integer')
+        self.internal_interval = internal_interval
+        self.token_probe_images = token_probe_images
         self.out_dir = out_dir
         self.reserve_gib = reserve_gib
         self.capacity_margin = capacity_margin
@@ -35,7 +43,7 @@ class ACLDiagnosticHook(Hook):
         self.capture = None
         self.writer = None
         self.completed_epochs = 0
-        self.peak_bytes_per_image = 0.
+        self.measured_rates = {}
 
     def before_run(self, runner):
         # Runner calls before_run before load_or_resume. Reject resume before
@@ -83,6 +91,13 @@ class ACLDiagnosticHook(Hook):
                          for row in annotation['annotations'] if row['image_id'] in ids],
             gt_box_format='xywh_original_pixels',
             annotation_file=str(dataset.ann_file))
+        self.ground_truth = {}
+        for entry in snapshot['annotations']:
+            self.ground_truth.setdefault(entry['image_id'], []).append(entry)
+        self.category_map = {entry['category_id']: entry['class_index'] for entry in self.classes}
+        self.probe_ids = select_token_probes(snapshot, self.token_probe_images)
+        self.current_stage = 2 if self.stage_hook._stage2_started else 1
+        self.last_validation_stage = self.current_stage
         param_names = {id(parameter): name for name, parameter in self.model.named_parameters()}
         groups = [dict(index=i, names=[param_names.get(id(p), '<unnamed>')
                                       for p in group['params']],
@@ -102,14 +117,20 @@ class ACLDiagnosticHook(Hook):
             parameter_groups=groups, classes=self.classes,
             gradient_norm='pre_clipping_L2_from_optim_wrapper_message_hub',
             stage='BBoxHeadFirstHook6._stage2_started; LR=0 is the original freeze mechanism',
-            raw_logits='token_logits; omitted padded columns are -inf',
+            raw_logits='final decoder token logits only on fixed token probe images at internal snapshots',
             class_scores='mean(sigmoid(token_logits)) over mapped class tokens',
             objectness='no native objectness head; use max class score as a proxy',
             proposal_recipe_version=1, mask_bitorder='little',
             decoder_box_format='normalized_cxcywh_resized_image',
             detection_box_format='xyxy_original_pixels',
-            decoder_final_layer='decoder_*[-1]; not duplicated',
-            fe_final_layer='fe_text[-1]; not duplicated',
+            decoder_final_layer='decoder_class_scores[-1], decoder_boxes[-1]; not duplicated',
+            fe_features='fe_class_prototypes[layer,class,channel]; token probes retain fe_final_text',
+            storage_policy=dict(internal_interval=self.internal_interval,
+                extra_epochs=['initial', 'stage_transition', 'final'], token_probe_ids=self.probe_ids,
+                encoder_boundary_candidates=128, encoder_oracle_per_gt=5,
+                encoder_scope='selected + boundary + GT-IoU oracle; omitted candidates summarized',
+                detections='all images every epoch; original float32 boxes/scores',
+                compression='NPZ DEFLATE; float16 internals; smallest lossless unsigned indices'),
             large_float_dtype='float16', detection_and_gt_dtype='float32',
             indices='zero_based; class_mapping keys retain model one_based labels')
         root = Path(self.out_dir or Path(runner.work_dir) / 'diagnostics')
@@ -149,11 +170,32 @@ class ACLDiagnosticHook(Hook):
         q, c = self.model.num_queries, len(self.classes)
         layers = self.model.decoder.num_layers
         enhancer_layers = len(self.model.encoder.text_layers)
-        per_forward = (self.max_candidates * (2 * c + 14.25) +
-                       layers * q * (2 * tokens + 2 * c + 8) +
-                       enhancer_layers * tokens * dim * 2 +
-                       tokens * (bert_dim + dim) * 2 + tokens ** 2 + 65536)
-        return int(per_forward * chunks * self.epoch_samples * runner.max_epochs)
+        gt_count = max((len(rows) for rows in self.ground_truth.values()), default=0)
+        retained = min(self.max_candidates, q + 128 + 5 * gt_count)
+        detections = self.model.bbox_head.test_cfg.get('max_per_img', q)
+        detection_bytes = detections * 26 + 2048
+        internal_bytes = (detection_bytes + retained * (2 * c + 16) + q * 4 +
+                          layers * q * (2 * c + 8) + enhancer_layers * c * dim * 2 +
+                          tokens * (bert_dim + dim) * 2 + tokens ** 2 +
+                          gt_count * 64 + 8192)
+        # Conservatively budget token probes as all images. Real storage has
+        # at most token_probe_images probes, shared BERT features and compression.
+        if self.token_probe_images:
+            internal_bytes += 2 * (q * tokens + tokens * dim)
+        self.initial_rates = dict(detections=detection_bytes * chunks,
+                                  internal=internal_bytes * chunks)
+        return self._remaining_capacity(runner, 0, 0)
+
+    def _remaining_capacity(self, runner, epoch, remaining_images):
+        future = runner.max_epochs - epoch
+        snapshots = sum(bool(snapshot_reasons(e, runner.max_epochs, self.internal_interval))
+                        for e in range(epoch + 1, runner.max_epochs + 1))
+        if self.current_stage == 1:
+            snapshots = min(future, snapshots + 1)  # one possible progressive transition
+        rates = {key: self.measured_rates.get(key, value) for key, value in self.initial_rates.items()}
+        current = getattr(self, 'capture_level', 'detections')
+        return int(remaining_images * rates[current] + self.epoch_samples *
+                   (snapshots * rates['internal'] + (future - snapshots) * rates['detections']))
 
     def _install_hooks(self):
         def tokenizer(module, args):
@@ -162,18 +204,28 @@ class ACLDiagnosticHook(Hook):
             diagnostic_event('language', outputs=output)
         def feature_map(module, args, output):
             diagnostic_event('feat_map', before=args[0], after=output)
-        def text_layer(module, args, output):
-            diagnostic_event('fe_layer', outputs=output)
         def head(module, args, output):
             diagnostic_event('head', outputs=output)
         self.handles.append(self.model.language_model.language_backbone.register_forward_pre_hook(tokenizer))
         self.handles.append(self.model.language_model.register_forward_hook(language))
         self.handles.append(self.model.text_feat_map.register_forward_hook(feature_map))
-        for layer in self.model.encoder.text_layers:
+        for i, layer in enumerate(self.model.encoder.text_layers):
+            def text_layer(module, args, output, final=i == len(self.model.encoder.text_layers) - 1):
+                diagnostic_event('fe_layer', outputs=output, final_layer=final)
             self.handles.append(layer.register_forward_hook(text_layer))
         self.handles.append(self.model.bbox_head.register_forward_hook(head))
 
     def before_train_epoch(self, runner):
+        stage = 2 if self.stage_hook._stage2_started else 1
+        if stage != self.current_stage:
+            self.writer.append('stage_events.jsonl', dict(
+                epoch=runner.epoch + 1, step=runner.iter, previous_stage=self.current_stage,
+                stage=stage, timing='before_train_epoch'))
+        self.current_stage = stage
+        self.epoch_loss_sums = {}
+        self.epoch_train_steps = 0
+        self.epoch_grad_sum = 0.
+        self.epoch_grad_count = 0
         self.writer.check_space(self.estimated_remaining)
 
     def before_train_iter(self, runner, batch_idx, data_batch=None):
@@ -181,6 +233,18 @@ class ACLDiagnosticHook(Hook):
         self.step_stage = 2 if self.stage_hook._stage2_started else 1
 
     def after_train_iter(self, runner, batch_idx, data_batch=None, outputs=None):
+        # Aggregate every iteration, even when LoggerHook ignores the final
+        # partial logging window. No optimizer/gradient operation is added.
+        if not hasattr(self, 'epoch_loss_sums'):
+            self.epoch_loss_sums, self.epoch_train_steps = {}, 0
+            self.epoch_grad_sum, self.epoch_grad_count = 0., 0
+        self.epoch_train_steps += 1
+        for name, value in (outputs or {}).items():
+            self.epoch_loss_sums[name] = self.epoch_loss_sums.get(name, 0.) + float(value)
+        norm = runner.message_hub.log_scalars.get('train/grad_norm')
+        if norm is not None:
+            self.epoch_grad_sum += float(norm.current())
+            self.epoch_grad_count += 1
         interval = self.logger.interval
         log_now = ((batch_idx + 1) % interval == 0 or
                    (batch_idx + 1 == len(runner.train_dataloader) and
@@ -199,9 +263,24 @@ class ACLDiagnosticHook(Hook):
             grad_norm=None if norm is None else float(norm.current()),
             grad_norm_reason='not_available' if norm is None else None))
 
+    def after_train_epoch(self, runner):
+        self.writer.append('train_epochs.jsonl', dict(
+            epoch=runner.epoch + 1, step=runner.iter, stage=self.step_stage,
+            steps=self.epoch_train_steps,
+            losses={key: value / self.epoch_train_steps for key, value in self.epoch_loss_sums.items()},
+            lr=[float(group['lr']) for group in runner.optim_wrapper.optimizer.param_groups],
+            grad_norm_mean=(self.epoch_grad_sum / self.epoch_grad_count
+                            if self.epoch_grad_count else None)))
+
     def before_val_epoch(self, runner):
         # EpochBasedTrainLoop increments epoch before invoking validation.
         self.epoch = runner.epoch
+        self.current_stage = 2 if self.stage_hook._stage2_started else 1
+        self.snapshot_reasons = snapshot_reasons(
+            self.epoch, runner.max_epochs, self.internal_interval,
+            self.current_stage != self.last_validation_stage)
+        self.last_validation_stage = self.current_stage
+        self.capture_level = 'internal' if self.snapshot_reasons else 'detections'
         self.observed_ids = set()
         self.observed_samples = 0
         self.epoch_observations = 0
@@ -211,7 +290,10 @@ class ACLDiagnosticHook(Hook):
     def before_val_iter(self, runner, batch_idx, data_batch=None):
         if self.token is not None:
             raise RuntimeError('ACL diagnostic capture was not closed')
-        self.capture = ACLBatchCapture()
+        self.capture = ACLBatchCapture(
+            level=self.capture_level, num_queries=self.model.num_queries,
+            logit_width=self.model.bbox_head.max_text_len,
+            ground_truth=self.ground_truth, category_map=self.category_map, probe_ids=self.probe_ids)
         self.token = activate_diagnostics(self.capture)
 
     def after_val_iter(self, runner, batch_idx, data_batch=None, outputs=None):
@@ -231,41 +313,26 @@ class ACLDiagnosticHook(Hook):
                 np.testing.assert_array_equal(
                     np.concatenate([row['arrays'][stored] for row in matching]),
                     actual.detach().cpu().numpy())
-        arrays, index = {}, []
-        relative = f'epoch_{self.epoch:03d}/batch_{batch_idx:06d}.npz'
-        for position, row in enumerate(records):
-            metadata = row['metadata']
-            img_id = metadata['img_id']
-            text = dict(caption=row['caption'], class_mapping=row['class_mapping'],
-                        tokens=self.model.language_model.tokenizer.convert_ids_to_tokens(
-                            row['text']['input_ids'].tolist()))
-            text_ref = self.writer.shared_text(self.epoch, row['text'], text)
-            prefix = f'obs_{position:04d}__'
-            arrays.update({prefix + key: value for key, value in row['arrays'].items()})
-            index.append(dict(
-                run_id=runner.timestamp, epoch=self.epoch, step=runner.iter,
-                rank=self.rank, batch=batch_idx, batch_position=position,
-                image_batch_position=row['image_batch_position'],
-                img_id=img_id, chunk=row['chunk'], class_offset=row['class_offset'],
-                image_meta={key: value for key, value in metadata.items() if key != 'text'},
-                shard=relative, prefix=prefix, text_ref=text_ref,
-                original_logit_width=row['original_logit_width'],
-                final_decoder_layer=row['arrays']['decoder_boxes'].shape[0] - 1))
-            self.observed_ids.add(img_id)
-        self.writer.save_arrays(relative, arrays)
-        for record in index:
-            self.writer.append(f'epoch_{self.epoch:03d}/index.jsonl', record)
+        for row in records:
+            if row['text']:
+                row['tokens'] = self.model.language_model.tokenizer.convert_ids_to_tokens(
+                    row['text']['input_ids'].tolist())
+            self.observed_ids.add(row['metadata']['img_id'])
+        self.writer.write_batch(self.epoch, batch_idx, records,
+                                runner.timestamp, runner.iter, self.rank)
         self.observed_samples += len(outputs)
         self.epoch_observations += len(records)
-        # Calibrate using actual compression; account conservatively for future
-        # batch padding using the largest possible candidate grid.
         byte_count = self.writer.written_bytes - self.epoch_start_bytes
-        actual_candidates = max(len(row['arrays']['encoder_boxes']) for row in records)
-        per_image = byte_count / self.observed_samples * max(1., self.max_candidates / actual_candidates)
-        self.peak_bytes_per_image = max(self.peak_bytes_per_image, per_image)
-        remaining_samples = ((runner.max_epochs - self.epoch) * self.epoch_samples +
-                             self.epoch_samples - self.observed_samples)
-        self.estimated_remaining = int(self.peak_bytes_per_image * remaining_samples)
+        measured = byte_count / self.observed_samples
+        raw = sum(value.nbytes for row in records for value in
+                  list(row['arrays'].values()) + list(row['text'].values())) + 2048 * len(outputs)
+        batch_bytes = self.writer.last_batch_bytes
+        ratio = min(1.1, batch_bytes / max(1, raw))
+        projected = max(measured, self.initial_rates[self.capture_level] * ratio)
+        self.measured_rates[self.capture_level] = max(
+            self.measured_rates.get(self.capture_level, 0.), projected)
+        self.estimated_remaining = self._remaining_capacity(
+            runner, self.epoch, self.epoch_samples - self.observed_samples)
         self.writer.check_space(self.estimated_remaining)
 
     def after_val_epoch(self, runner, metrics=None):
@@ -292,10 +359,14 @@ class ACLDiagnosticHook(Hook):
         self.writer.append('metrics.jsonl', dict(
             epoch=self.epoch, step=runner.iter, metrics=metrics, per_class=per_class,
             observations=self.epoch_observations, unique_images=len(self.observed_ids),
-            tensor_bytes=self.writer.written_bytes - self.epoch_start_bytes))
+            tensor_bytes=self.writer.written_bytes - self.epoch_start_bytes,
+            stage=self.current_stage, capture_level=self.capture_level,
+            snapshot_reasons=self.snapshot_reasons,
+            estimated_remaining_bytes=self.estimated_remaining))
         self.writer.atomic_json(f'epoch_{self.epoch:03d}/complete.json', dict(
             epoch=self.epoch, samples=self.observed_samples,
-            observations=self.epoch_observations, unique_images=len(self.observed_ids)))
+            observations=self.epoch_observations, unique_images=len(self.observed_ids),
+            capture_level=self.capture_level, snapshot_reasons=self.snapshot_reasons))
         self.completed_epochs += 1
         self.writer.check_space(self.estimated_remaining)
 
