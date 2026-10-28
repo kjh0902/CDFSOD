@@ -148,6 +148,7 @@ class SupportVisualMixin:
     def _get_support_loader(self):
         if getattr(self, '_support_loader', None) is None:
             from mmengine.dataset import pseudo_collate
+            from mmengine.fileio import load
             from torch.utils.data import DataLoader
             from mmdet.registry import DATASETS
             cfg = copy.deepcopy(self.support_visual_cfg)
@@ -156,8 +157,13 @@ class SupportVisualMixin:
             expected = tuple(cfg['class_names'])
             if tuple(dataset.metainfo['classes']) != expected:
                 raise ValueError('Support class metadata does not match the query classes.')
-            actual = tuple(dataset.coco.load_cats(dataset.cat_ids)[i]['name']
-                           for i in range(len(dataset.cat_ids)))
+            # CocoDataset.load_data_list() deletes its temporary COCO API.
+            # Read category metadata using the dataset's resolved annotation path
+            # and file backend, and preserve its persistent category/label order.
+            annotation = load(dataset.ann_file, backend_args=dataset.backend_args)
+            categories = {category['id']: category['name']
+                          for category in annotation['categories']}
+            actual = tuple(categories[cat_id] for cat_id in dataset.cat_ids)
             if actual != expected:
                 raise ValueError('Support COCO category order must match class/label order.')
             self._support_loader = DataLoader(

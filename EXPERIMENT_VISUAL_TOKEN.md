@@ -118,10 +118,19 @@ Loss·gradient 및 별도 optimizer update/RNG 동일성을 확인한다. Attent
 소형 fixture이므로 전체 모델 CUDA 검증을 대체하지 않는다. MMEngine 0.10.7로
 18개 config를 파싱하고 Query 학습 설정이 시작 커밋과 동일함을 확인한다.
 
-로컬 검증 결과: **34개 테스트 모두 통과**. CPU Gloo에서는 별도 단일 rank
+로컬 검증 결과: **36개 테스트 모두 통과**. CPU Gloo에서는 별도 단일 rank
 검증으로 기본 group과 보조 group의 실제 통신 및 공통 cleanup을 확인했다.
 Windows 파일 rendezvous는 DistStoreError가 발생해 로컬 TCPStore로 검증했다.
 NCCL 또는 native allocator abort의 재현 검증은 포함하지 않는다.
+
+2026-10-28 Support 초기화 오류 수정: `CocoDataset.load_data_list()`는 초기화 후
+임시 `coco` 속성을 삭제한다. 이 속성을 참조하던 Support category 검증이 첫
+iteration에서 AttributeError를 발생시켰다. Dataset의 resolved annotation 경로와
+backend_args로 category 정보를 읽고, 유지되는 cat_ids 순서로 검증하도록 수정했다.
+파일 읽기는 Support loader 생성 시 한 번이며 Prototype 재계산 정책은 유지한다.
+기존 커밋의 동일 오류를 재현한 뒤, 실제 repository COCO 파싱 메서드·pycocotools·
+MMEngine BaseDataset 초기화/직렬화와 순차 DataLoader를 통과하는 회귀 테스트를
+추가했다. 이미지 변환/Backbone은 소형 fixture이며 실제 CUDA 학습 재실행은 미검증이다.
 
 ## 종료 처리와 남은 제한
 
