@@ -1,13 +1,15 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 브랜치는 `grounding_dino_acl`을 기준으로 HED를 제거하고 기본 **serial Grounding DINO**에
-**GT region–text contrastive loss** 하나를 추가한 실험이다. Progressive Fine-Tuning,
-augmentation, optimizer, scheduler, validation 및 checkpoint 설정은 유지한다.
+이 브랜치는 `acl-serial-visual-text-contrastive`의 `449e69a`를 기반으로 Region-Text
+보조 손실을 제거하고, HED 없는 **serial ACL + Support Visual Token**을 구현한다.
+전체 Shot Support의 GT RoIAlign → GAP → 클래스 평균 Prototype을 매 Training
+Iteration마다 생성하고, BERT/text_feat_map 이후 각 클래스 이름과 period 사이에 삽입한다.
+학습·추론 모두 이름 Token sigmoid 평균과 Visual Score의 Max Fusion을 사용한다.
+기존 Progressive Fine-Tuning, Query 증강 및 Detection Loss 설정은 유지한다.
 
-18개 CDFSOD finetuning config의 초기 가중치는 `lambda_region_text=0.01`이며,
-`model.lambda_region_text=0`으로 보조 손실을 완전히 비활성화할 수 있다.
-객체별 RoIAlign, 전체 class negative, 실행 방법과 검증 범위는
-[실험 설명](EXPERIMENT_REGION_TEXT.md)을 참고한다.
+Epoch 마지막 Training Batch와 전체 Validation의 네 지표만 기록한다.
+Prototype·Fusion·로깅 정의, 실행 방법, 검증 범위와 종료 처리의 한계는
+[실험 설명](EXPERIMENT_VISUAL_TOKEN.md)을 참고한다.
 
 ## 지원 환경
 

@@ -7,7 +7,7 @@ randomness = dict(
     seed=42,  
     deterministic=True,  
     diff_rank_seed=False,
-    warn_only=True # should hack the implementation in mmdet，otherwise the program will encounter error
+    warn_only=True  # Supported by the repository train/test compatibility helper.
 )
 
 class_name = 'ArTaxOr'
@@ -28,9 +28,6 @@ metainfo = dict(classes=class_names, palette=[(220, 20, 60)])
 
 model = dict(
     type='GroundingDINO',
-    lambda_region_text=0.01,
-    region_text_roi_size=3,
-    region_text_featmap_strides=(8, 16, 32, 64),
     bbox_head=dict(
         type='GroundingDINOHead',
         num_classes=num_classes))
@@ -187,3 +184,19 @@ custom_hooks = [
     )
 ]
 load_from = MMGDINOB_PATH
+
+
+# Full support set, independent of query augmentations and sampler.
+from copy import deepcopy
+support_dataset = deepcopy(train_dataloader['dataset'])
+support_dataset.pop('_delete_', None)
+support_dataset.update(
+    test_mode=True, filter_cfg=None,
+    pipeline=[
+        dict(type='LoadImageFromFile', imdecode_backend='pillow'),
+        dict(type='LoadAnnotations', with_bbox=True),
+        dict(type='FixScaleResize', scale=(800, 1333), keep_ratio=True, backend='pillow'),
+        dict(type='PackDetInputs', meta_keys=('img_id', 'img_path', 'ori_shape',
+             'img_shape', 'scale_factor'))])
+model['support_visual_cfg'] = dict(dataset=support_dataset, class_names=class_names)
+custom_hooks.append(dict(type='VisualTokenHook', dataset=class_name, shot=10))

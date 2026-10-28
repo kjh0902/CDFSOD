@@ -1,6 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-import math
 import re
 import warnings
 from typing import Dict, Optional, Tuple, Union
@@ -13,10 +12,11 @@ from torch import Tensor
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType
-from ..losses.region_text_loss import region_text_loss
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from ..utils.support_visual import (SupportVisualMixin, fuse_token_logits,
+                                   insert_visual_tokens)
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -44,7 +44,7 @@ def chunks(lst: list, n: int) -> list:
 
 
 @MODELS.register_module()
-class GroundingDINO(DINO):
+class GroundingDINO(SupportVisualMixin, DINO):
     """Implementation of `Grounding DINO: Marrying DINO with Grounded Pre-
     Training for Open-Set Object Detection.
 
@@ -58,22 +58,12 @@ class GroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
-                 lambda_region_text=0.0,
-                 region_text_roi_size=3,
-                 region_text_featmap_strides=(8, 16, 32, 64),
+                 support_visual_cfg=None,
                  **kwargs) -> None:
 
-        if not math.isfinite(lambda_region_text) or lambda_region_text < 0:
-            raise ValueError('lambda_region_text must be finite and nonnegative.')
-        if not isinstance(region_text_roi_size, int) or region_text_roi_size < 1:
-            raise ValueError('region_text_roi_size must be a positive integer.')
-        if (not region_text_featmap_strides or any(
-                not math.isfinite(s) or s <= 0
-                for s in region_text_featmap_strides)):
-            raise ValueError('region_text_featmap_strides must be positive.')
-        self.lambda_region_text = float(lambda_region_text)
-        self.region_text_roi_size = region_text_roi_size
-        self.region_text_featmap_strides = tuple(region_text_featmap_strides)
+        self.support_visual_cfg = support_visual_cfg
+        self._support_prototypes = None
+        self._visual_stats = None
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -330,11 +320,6 @@ class GroundingDINO(DINO):
 
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
-        if self.training and self.lambda_region_text > 0:
-            head_inputs_dict['region_text_spatial_shapes'] = (
-                encoder_inputs_dict['spatial_shapes'])
-            head_inputs_dict['region_text_level_start_index'] = (
-                encoder_inputs_dict['level_start_index'])
         decoder_inputs_dict.update(tmp_dec_in)
 
         decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
@@ -363,7 +348,8 @@ class GroundingDINO(DINO):
             memory_mask=feat_mask,
             spatial_shapes=spatial_shapes,
             memory_text=memory_text,
-            text_token_mask=text_token_mask)
+            text_token_mask=text_token_mask,
+            visual_layout=text_dict.get('visual_layout'))
         return encoder_outputs_dict
 
     def pre_decoder(
@@ -374,6 +360,7 @@ class GroundingDINO(DINO):
         memory_text: Tensor,
         text_token_mask: Tensor,
         batch_data_samples: OptSampleList = None,
+        visual_layout=None,
     ) -> Tuple[Dict]:
         bs, _, c = memory.shape
 
@@ -392,12 +379,21 @@ class GroundingDINO(DINO):
         # multi-class classification, while DeformDETR, where the input
         # is `enc_outputs_class[..., 0]` selects according to scores of
         # binary classification.
-        topk_indices = torch.topk(
-            enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+        selection_logits = enc_outputs_class
+        if visual_layout is not None:
+            mask = torch.zeros_like(enc_outputs_class[:, 0], dtype=torch.bool)
+            mask[:, :visual_layout['selection'].shape[1]] = visual_layout['selection']
+            selection_logits = enc_outputs_class.masked_fill(~mask[:, None], float('-inf'))
+        maxima, winners = selection_logits.max(-1)
+        topk_indices = torch.topk(maxima, k=self.num_queries, dim=1)[1]
+        if visual_layout is not None and self._visual_stats is not None:
+            self._visual_stats.selection(winners.gather(1, topk_indices), visual_layout)
 
         topk_score = torch.gather(
             enc_outputs_class, 1,
             topk_indices.unsqueeze(-1).repeat(1, 1, cls_out_features))
+        if visual_layout is not None:
+            topk_score = fuse_token_logits(topk_score, visual_layout, cls_out_features)
         topk_coords_unact = torch.gather(
             enc_outputs_coord_unact, 1,
             topk_indices.unsqueeze(-1).repeat(1, 1, 4))
@@ -433,38 +429,44 @@ class GroundingDINO(DINO):
             enc_outputs_coord=topk_coords,
             dn_meta=dn_meta) if self.training else dict()
         # append text_feats to head_inputs_dict
-        if self.training and self.lambda_region_text > 0:
-            # The exact tensor scored above, after proposal masking, fc and norm.
-            head_inputs_dict['region_text_output_memory'] = output_memory
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
+        if visual_layout is not None:
+            head_inputs_dict['visual_layout'] = visual_layout
         return decoder_inputs_dict, head_inputs_dict
 
-    def _get_class_token_map(self, tokenized, tokens_positive):
-        """Reuse ACL's mapping for all classes, before selecting GT labels."""
+    def _visual_class_map(self, tokenized, spans, caption):
         classes = self.bbox_head.num_classes
-        if isinstance(tokens_positive, dict):
-            if set(tokens_positive) != set(range(classes)):
-                raise ValueError(
-                    'Region-text loss requires all dataset class IDs 0..C-1.')
-            tokens_positive = [tokens_positive[c] for c in range(classes)]
-        if (not isinstance(tokens_positive, (list, tuple))
-                or len(tokens_positive) != classes or classes < 1):
-            raise ValueError(
-                'Region-text loss requires spans for every dataset class (C >= 1).')
-        # Mapping tokenization is untruncated; BERT tokenization is truncated.
-        # Reject long prompts before create_positive_map can clip class spans.
-        max_length = min(
-            self.language_model.max_tokens,
-            self.bbox_head.cls_branches[self.decoder.num_layers].max_text_len)
-        if tokenized['attention_mask'].sum(-1).max().item() > max_length:
-            raise ValueError(
-                'Region-text loss requires a complete, untruncated all-class prompt.')
-        mapping, _ = self.get_positive_map(tokenized, tokens_positive)
-        if any(not indices for indices in mapping.values()):
-            raise ValueError(
-                'Region-text loss found a dataset class without class-name tokens.')
+        if isinstance(spans, dict):
+            if set(spans) != set(range(classes)):
+                raise ValueError('Visual tokens require all class spans.')
+            spans = [spans[c] for c in range(classes)]
+        if len(spans) != classes or any(len(span) != 1 for span in spans):
+            raise ValueError('Visual tokens require one name span per dataset class.')
+        names = tuple(clean_label_name(caption[span[0][0]:span[0][1]]) for span in spans)
+        expected = tuple(clean_label_name(name) for name in self.support_visual_cfg['class_names'])
+        if names != expected:
+            raise ValueError('Prompt class order/names do not match the Support set.')
+        limit = min(self.language_model.max_tokens, self.bbox_head.max_text_len)
+        if tokenized['attention_mask'].sum(-1).max().item() + classes > limit:
+            raise ValueError('Complete class prompt plus visual tokens exceeds token limit.')
+        mapping, _ = self.get_positive_map(tokenized, spans)
+        period = self.language_model.tokenizer.convert_tokens_to_ids('.')
+        special = set(self.language_model.tokenizer.all_special_ids + [period])
+        for ids in mapping.values():
+            if (not ids or any(int(tokenized['input_ids'][0, i]) in special for i in ids)
+                    or int(tokenized['input_ids'][0, ids[-1] + 1]) != period):
+                raise ValueError('Each class name must be followed immediately by a period.')
         return mapping
+
+    def _visual_text(self, text_dict, mappings):
+        prototypes = self.support_prototypes()
+        if self._visual_stats is not None:
+            self._visual_stats.features(text_dict, prototypes, mappings)
+        text_dict, layout = insert_visual_tokens(
+            text_dict, prototypes, mappings, self.bbox_head.max_text_len)
+        text_dict['visual_layout'] = layout
+        return text_dict
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
@@ -477,13 +479,7 @@ class GroundingDINO(DINO):
             for data_samples in batch_data_samples
         ]
 
-        class_token_maps = [] if self.lambda_region_text > 0 else None
-        if class_token_maps is not None:
-            for labels in gt_labels:
-                if (labels.ndim != 1 or labels.dtype != torch.long
-                        or ((labels < 0) | (labels >= self.bbox_head.num_classes)).any()):
-                    raise ValueError('Region-text loss requires GT labels in 0..C-1.')
-
+        class_token_maps = [] if self.visual_enabled else None
         if 'tokens_positive' in batch_data_samples[0]:
             tokens_positive = [
                 data_samples.tokens_positive
@@ -498,8 +494,7 @@ class GroundingDINO(DINO):
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt')
                 if class_token_maps is not None:
-                    class_token_maps.append(self._get_class_token_map(
-                        tokenized, token_positive))
+                    class_token_maps.append(self._visual_class_map(tokenized, token_positive, text_prompt))
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
@@ -518,7 +513,7 @@ class GroundingDINO(DINO):
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
                 if class_token_maps is not None:
-                    mapping = self._get_class_token_map(tokenized, tokens_positive)
+                    mapping = self._visual_class_map(tokenized, tokens_positive, caption_string)
                     class_token_maps.extend([mapping] * len(batch_inputs))
                 for gt_label in gt_labels:
                     new_tokens_positive = [
@@ -533,8 +528,8 @@ class GroundingDINO(DINO):
                         self.get_tokens_and_prompts(
                             text_prompt, True)
                     if class_token_maps is not None:
-                        class_token_maps.append(self._get_class_token_map(
-                            tokenized, tokens_positive))
+                        class_token_maps.append(self._visual_class_map(
+                            tokenized, tokens_positive, caption_string))
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
                     ]
@@ -547,10 +542,17 @@ class GroundingDINO(DINO):
         if self.text_feat_map is not None:
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
+        if class_token_maps is not None:
+            text_dict = self._visual_text(text_dict, class_token_maps)
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
             text_token_mask = text_dict['text_token_mask'][i]
+            if class_token_maps is not None:
+                positive_map = torch.nn.functional.one_hot(
+                    gt_labels[i], num_classes=self.bbox_head.max_text_len).float()
+                text_token_mask = torch.ones(self.bbox_head.num_classes,
+                    device=batch_inputs.device, dtype=torch.bool)
             data_samples.gt_instances.positive_maps = positive_map
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
@@ -563,23 +565,8 @@ class GroundingDINO(DINO):
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
 
-        region_inputs = None
-        if class_token_maps is not None:
-            region_inputs = dict(
-                output_memory=head_inputs_dict.pop('region_text_output_memory'),
-                spatial_shapes=head_inputs_dict.pop('region_text_spatial_shapes'),
-                level_start_index=head_inputs_dict.pop('region_text_level_start_index'))
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        if region_inputs is not None:
-            losses['loss_region_text'] = self.lambda_region_text * region_text_loss(
-                **region_inputs,
-                memory_text=head_inputs_dict['memory_text'],
-                text_token_mask=head_inputs_dict['text_token_mask'],
-                class_token_maps=class_token_maps,
-                batch_data_samples=batch_data_samples,
-                featmap_strides=self.region_text_featmap_strides,
-                roi_size=self.region_text_roi_size)
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
@@ -619,6 +606,13 @@ class GroundingDINO(DINO):
             ]
         token_positive_maps, text_prompts, _, entities = zip(
             *_positive_maps_and_prompts)
+
+        if self.visual_enabled:
+            expected = tuple(clean_label_name(name) for name in self.support_visual_cfg['class_names'])
+            for entity, mapping in zip(entities, token_positive_maps):
+                if (isinstance(text_prompts[0], list) or mapping is None or
+                        tuple(clean_label_name(name) for name in entity) != expected):
+                    raise ValueError('Visual inference requires a complete canonical all-class prompt; no chunks.')
 
         # image feature extraction
         visual_feats = self.extract_feat(batch_inputs)
@@ -664,6 +658,14 @@ class GroundingDINO(DINO):
                 text_dict['embedded'] = self.text_feat_map(
                     text_dict['embedded'])
 
+            if self.visual_enabled:
+                mappings = []
+                for caption in text_prompts:
+                    tokenized, _, spans, _ = self.get_tokens_and_prompts(caption, True)
+                    mappings.append(self._visual_class_map(tokenized, spans, caption))
+                text_dict = self._visual_text(text_dict, mappings)
+                token_positive_maps = [{c + 1: [c] for c in range(self.bbox_head.num_classes)}
+                                       for _ in batch_data_samples]
             is_rec_tasks = []
             for i, data_samples in enumerate(batch_data_samples):
                 if token_positive_maps[i] is not None:

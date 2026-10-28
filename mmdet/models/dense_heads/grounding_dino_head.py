@@ -16,6 +16,7 @@ from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
+from ..utils.support_visual import fuse_token_logits
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
 
@@ -179,6 +180,9 @@ class GroundingDINOHead(DINOHead):
             pred_instances=pred_instances,
             gt_instances=gt_instances,
             img_meta=img_meta)
+        if getattr(self, '_visual_collect_matching', False):
+            self._visual_stats.matches(self._visual_match_image, assign_result)
+            self._visual_match_image += 1
         gt_bboxes = gt_instances.bboxes
 
         pos_inds = torch.nonzero(
@@ -216,6 +220,8 @@ class GroundingDINOHead(DINOHead):
         references: List[Tensor],
         memory_text: Tensor,
         text_token_mask: Tensor,
+        visual_layout=None,
+        dn_count=0,
     ) -> Tuple[Tensor]:
         """Forward function.
 
@@ -258,6 +264,12 @@ class GroundingDINOHead(DINOHead):
             outputs_class = self.cls_branches[layer_id](hidden_state,
                                                         memory_text,
                                                         text_token_mask)
+            if visual_layout is not None:
+                stats = (getattr(self, '_visual_stats', None)
+                         if layer_id + 1 == hidden_states.shape[0] else None)
+                outputs_class = fuse_token_logits(
+                    outputs_class, visual_layout, self.max_text_len,
+                    stats=stats, dn_count=dn_count)
             tmp_reg_preds = self.reg_branches[layer_id](hidden_state)
             if reference.shape[-1] == 4:
                 # When `layer` is 0 and `as_two_stage` of the detector
@@ -285,7 +297,8 @@ class GroundingDINOHead(DINOHead):
                 memory_text: Tensor,
                 text_token_mask: Tensor,
                 batch_data_samples: SampleList,
-                rescale: bool = True) -> InstanceList:
+                rescale: bool = True,
+                visual_layout=None) -> InstanceList:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -324,7 +337,10 @@ class GroundingDINOHead(DINOHead):
             for data_samples in batch_data_samples
         ]
 
-        outs = self(hidden_states, references, memory_text, text_token_mask)
+        outs = self(hidden_states, references, memory_text, text_token_mask,
+                    visual_layout=visual_layout)
+        if visual_layout is not None and getattr(self, '_visual_stats', None) is not None:
+            self._visual_validation_matches(outs, batch_data_samples)
 
         predictions = self.predict_by_feat(
             *outs,
@@ -451,7 +467,8 @@ class GroundingDINOHead(DINOHead):
     def loss(self, hidden_states: Tensor, references: List[Tensor],
              memory_text: Tensor, text_token_mask: Tensor,
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
-             batch_data_samples: SampleList, dn_meta: Dict[str, int]) -> dict:
+             batch_data_samples: SampleList, dn_meta: Dict[str, int],
+             visual_layout=None) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -492,12 +509,50 @@ class GroundingDINOHead(DINOHead):
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
 
-        outs = self(hidden_states, references, memory_text, text_token_mask)
-        self.text_masks = text_token_mask
+        outs = self(hidden_states, references, memory_text, text_token_mask,
+                    visual_layout=visual_layout,
+                    dn_count=dn_meta['num_denoising_queries'] if dn_meta else 0)
+        self.text_masks = (text_token_mask if visual_layout is None else
+                           torch.ones(len(batch_data_samples), self.num_classes,
+                                      device=text_token_mask.device, dtype=torch.bool))
+        self._visual_loss_call = 0
+        self._visual_final_loss_call = hidden_states.shape[0] - 1
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)
-        losses = self.loss_by_feat(*loss_inputs)
+        try:
+            losses = self.loss_by_feat(*loss_inputs)
+        finally:
+            self._visual_collect_matching = False
+            if getattr(self, '_visual_stats', None) is not None:
+                self._visual_stats.pending = None
         return losses
+
+    @torch.no_grad()
+    def _visual_validation_matches(self, outs, samples):
+        """Read-only matching on final queries; evaluation GT is original xyxy.
+
+        The 18 CDFSOD eval pipelines load annotations AFTER Resize. Reconstruct
+        query boxes in original pixels and use original dimensions in costs.
+        """
+        logits, boxes = outs[0][-1].detach(), outs[1][-1].detach()
+        for b, sample in enumerate(samples):
+            stats = self._visual_stats
+            if stats.valid is not None and not stats.valid[b]:
+                continue
+            gt = copy.deepcopy(sample.gt_instances)
+            gt.positive_maps = torch.nn.functional.one_hot(
+                gt.labels, num_classes=self.max_text_len).float()
+            gt.text_token_mask = torch.ones(len(gt), self.num_classes,
+                                            device=logits.device, dtype=torch.bool)
+            h, w = sample.metainfo['ori_shape'][:2]
+            meta = dict(sample.metainfo, img_shape=(h, w))
+            pred = InstanceData(scores=logits[b],
+                                bboxes=bbox_cxcywh_to_xyxy(boxes[b]) *
+                                boxes.new_tensor([w, h, w, h]))
+            assigned = self.assigner.assign(pred_instances=pred, gt_instances=gt,
+                                             img_meta=meta)
+            stats.matches(b, assigned)
+        self._visual_stats.pending = None
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
                             batch_gt_instances: InstanceList,
@@ -524,11 +579,17 @@ class GroundingDINOHead(DINOHead):
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        self._visual_collect_matching = (
+            getattr(self, '_visual_stats', None) is not None and
+            self._visual_loss_call == self._visual_final_loss_call)
+        self._visual_match_image = 0
+        self._visual_loss_call = getattr(self, '_visual_loss_call', 0) + 1
         with torch.no_grad():
             cls_reg_targets = self.get_targets(cls_scores_list,
                                                bbox_preds_list,
                                                batch_gt_instances,
                                                batch_img_metas)
+        self._visual_collect_matching = False
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         labels = torch.stack(labels_list, 0)

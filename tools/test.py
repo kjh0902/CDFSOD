@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
+import faulthandler
 import os
 import os.path as osp
 import warnings
@@ -18,6 +19,8 @@ from mmdet.engine.hooks.utils import trigger_visualization_hook
 from mmdet.evaluation import DumpDetResults
 from mmdet.registry import RUNNERS
 from mmdet.utils import setup_cache_size_limit_of_dynamo
+from mmdet.utils.distributed_runtime import distributed_runtime
+from mmdet.utils.randomness_compat import runner_randomness_config, apply_warn_only
 
 
 # TODO: support fuse_conv_bn and format_only
@@ -130,25 +133,33 @@ def main():
         cfg.model = ConfigDict(**cfg.tta_model, module=cfg.model)
         cfg.test_dataloader.dataset.pipeline = cfg.tta_pipeline
 
-    # build the runner from config
-    if 'runner_type' not in cfg:
-        # build the default runner
-        runner = Runner.from_cfg(cfg)
-    else:
-        # build customized runner from the registry
-        # if 'runner_type' is set in the cfg
-        runner = RUNNERS.build(cfg)
+    # Match training: release process groups before interpreter teardown.
+    with distributed_runtime():
+        runner_cls = Runner if 'runner_type' not in cfg else RUNNERS.get(cfg.runner_type)
+        cfg, warn_only_setting = runner_randomness_config(cfg, runner_cls)
+        # build the runner from config
+        if 'runner_type' not in cfg:
+            # build the default runner
+            runner = Runner.from_cfg(cfg)
+        else:
+            # build customized runner from the registry
+            # if 'runner_type' is set in the cfg
+            runner = RUNNERS.build(cfg)
 
-    # add `DumpResults` dummy metric
-    if args.out is not None:
-        assert args.out.endswith(('.pkl', '.pickle')), \
-            'The dump file must be a pkl file.'
-        runner.test_evaluator.metrics.append(
-            DumpDetResults(out_file_path=args.out))
+        # add `DumpResults` dummy metric
+        if args.out is not None:
+            assert args.out.endswith(('.pkl', '.pickle')), \
+                'The dump file must be a pkl file.'
+            runner.test_evaluator.metrics.append(
+                DumpDetResults(out_file_path=args.out))
 
-    # start testing
-    runner.test()
+        apply_warn_only(warn_only_setting)
+
+        # Includes metric output, prediction dumps and after_run hooks.
+        runner.test()
+        runner.logger.info('Runner.test() completed; starting shutdown.')
 
 
 if __name__ == '__main__':
+    faulthandler.enable(all_threads=True)
     main()
