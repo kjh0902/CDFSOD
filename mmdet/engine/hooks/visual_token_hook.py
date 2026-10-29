@@ -27,7 +27,6 @@ class VisualTokenHook(Hook):
     def _attach(self, runner, stats):
         model = self._model(runner)
         model._visual_stats = stats
-        model.bbox_head._visual_stats = stats
 
     def _new_stats(self, runner):
         model = self._model(runner)
@@ -105,7 +104,8 @@ class VisualTokenHook(Hook):
             if dist.get_rank() != 0:
                 return
         names = self._model(runner).support_visual_cfg['class_names']
-        row = dict(dataset=self.dataset, shot=self.shot, phase=phase,
+        row = dict(schema_version=2, architecture='support_memory',
+                   dataset=self.dataset, shot=self.shot, phase=phase,
                    epoch=runner.epoch + 1, iteration=runner.iter,
                    **stats.report(names))
         line = json.dumps(row, ensure_ascii=False, allow_nan=False)

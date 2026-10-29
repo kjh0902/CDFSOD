@@ -15,8 +15,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
-from ..utils.support_visual import (SupportVisualMixin, fuse_token_logits,
-                                   insert_visual_tokens)
+from ..utils.support_visual import SupportVisualMixin, support_attention_mask
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -62,7 +61,7 @@ class GroundingDINO(SupportVisualMixin, DINO):
                  **kwargs) -> None:
 
         self.support_visual_cfg = support_visual_cfg
-        self._support_prototypes = None
+        self._support_memory = None
         self._visual_stats = None
         self.language_model_cfg = language_model
         self._special_tokens = '. '
@@ -342,14 +341,18 @@ class GroundingDINO(SupportVisualMixin, DINO):
             memory_text=text_dict['embedded'],
             text_attention_mask=~text_token_mask,
             position_ids=text_dict['position_ids'],
-            text_self_attention_masks=text_dict['masks'])
+            text_self_attention_masks=text_dict['masks'],
+            support_memory=text_dict.get('support_memory'),
+            support_attention_mask=text_dict.get('support_attention_mask'))
+        if self._visual_stats is not None and 'support_class_maps' in text_dict:
+            self._visual_stats.text_features(
+                memory_text, text_dict['support_class_maps'], 'enhanced_text_norm')
         encoder_outputs_dict = dict(
             memory=memory,
             memory_mask=feat_mask,
             spatial_shapes=spatial_shapes,
             memory_text=memory_text,
-            text_token_mask=text_token_mask,
-            visual_layout=text_dict.get('visual_layout'))
+            text_token_mask=text_token_mask)
         return encoder_outputs_dict
 
     def pre_decoder(
@@ -360,7 +363,6 @@ class GroundingDINO(SupportVisualMixin, DINO):
         memory_text: Tensor,
         text_token_mask: Tensor,
         batch_data_samples: OptSampleList = None,
-        visual_layout=None,
     ) -> Tuple[Dict]:
         bs, _, c = memory.shape
 
@@ -379,21 +381,12 @@ class GroundingDINO(SupportVisualMixin, DINO):
         # multi-class classification, while DeformDETR, where the input
         # is `enc_outputs_class[..., 0]` selects according to scores of
         # binary classification.
-        selection_logits = enc_outputs_class
-        if visual_layout is not None:
-            mask = torch.zeros_like(enc_outputs_class[:, 0], dtype=torch.bool)
-            mask[:, :visual_layout['selection'].shape[1]] = visual_layout['selection']
-            selection_logits = enc_outputs_class.masked_fill(~mask[:, None], float('-inf'))
-        maxima, winners = selection_logits.max(-1)
-        topk_indices = torch.topk(maxima, k=self.num_queries, dim=1)[1]
-        if visual_layout is not None and self._visual_stats is not None:
-            self._visual_stats.selection(winners.gather(1, topk_indices), visual_layout)
+        topk_indices = torch.topk(
+            enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
 
         topk_score = torch.gather(
             enc_outputs_class, 1,
             topk_indices.unsqueeze(-1).repeat(1, 1, cls_out_features))
-        if visual_layout is not None:
-            topk_score = fuse_token_logits(topk_score, visual_layout, cls_out_features)
         topk_coords_unact = torch.gather(
             enc_outputs_coord_unact, 1,
             topk_indices.unsqueeze(-1).repeat(1, 1, 4))
@@ -431,11 +424,9 @@ class GroundingDINO(SupportVisualMixin, DINO):
         # append text_feats to head_inputs_dict
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
-        if visual_layout is not None:
-            head_inputs_dict['visual_layout'] = visual_layout
         return decoder_inputs_dict, head_inputs_dict
 
-    def _visual_class_map(self, tokenized, spans, caption):
+    def _support_class_map(self, tokenized, spans, caption):
         classes = self.bbox_head.num_classes
         if isinstance(spans, dict):
             if set(spans) != set(range(classes)):
@@ -448,8 +439,8 @@ class GroundingDINO(SupportVisualMixin, DINO):
         if names != expected:
             raise ValueError('Prompt class order/names do not match the Support set.')
         limit = min(self.language_model.max_tokens, self.bbox_head.max_text_len)
-        if tokenized['attention_mask'].sum(-1).max().item() + classes > limit:
-            raise ValueError('Complete class prompt plus visual tokens exceeds token limit.')
+        if tokenized['attention_mask'].sum(-1).max().item() > limit:
+            raise ValueError('Complete class prompt exceeds token limit.')
         mapping, _ = self.get_positive_map(tokenized, spans)
         period = self.language_model.tokenizer.convert_tokens_to_ids('.')
         special = set(self.language_model.tokenizer.all_special_ids + [period])
@@ -459,14 +450,14 @@ class GroundingDINO(SupportVisualMixin, DINO):
                 raise ValueError('Each class name must be followed immediately by a period.')
         return mapping
 
-    def _visual_text(self, text_dict, mappings):
-        prototypes = self.support_prototypes()
+    def _support_text(self, text_dict, mappings):
+        memory = self.support_memory()
+        allowed = support_attention_mask(text_dict, memory, mappings)
         if self._visual_stats is not None:
-            self._visual_stats.features(text_dict, prototypes, mappings)
-        text_dict, layout = insert_visual_tokens(
-            text_dict, prototypes, mappings, self.bbox_head.max_text_len)
-        text_dict['visual_layout'] = layout
-        return text_dict
+            self._visual_stats.support_features(memory, len(mappings))
+            self._visual_stats.text_features(text_dict['embedded'], mappings, 'text_norm')
+        return dict(text_dict, support_memory=memory['tokens'].detach(),
+                    support_attention_mask=allowed, support_class_maps=mappings)
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
@@ -494,7 +485,7 @@ class GroundingDINO(SupportVisualMixin, DINO):
                     if self.language_model.pad_to_max else 'longest',
                     return_tensors='pt')
                 if class_token_maps is not None:
-                    class_token_maps.append(self._visual_class_map(tokenized, token_positive, text_prompt))
+                    class_token_maps.append(self._support_class_map(tokenized, token_positive, text_prompt))
                 new_tokens_positive = [
                     token_positive[label.item()] for label in gt_label
                 ]
@@ -513,7 +504,7 @@ class GroundingDINO(SupportVisualMixin, DINO):
                         text_prompts[0], True)
                 new_text_prompts = [caption_string] * len(batch_inputs)
                 if class_token_maps is not None:
-                    mapping = self._visual_class_map(tokenized, tokens_positive, caption_string)
+                    mapping = self._support_class_map(tokenized, tokens_positive, caption_string)
                     class_token_maps.extend([mapping] * len(batch_inputs))
                 for gt_label in gt_labels:
                     new_tokens_positive = [
@@ -528,7 +519,7 @@ class GroundingDINO(SupportVisualMixin, DINO):
                         self.get_tokens_and_prompts(
                             text_prompt, True)
                     if class_token_maps is not None:
-                        class_token_maps.append(self._visual_class_map(
+                        class_token_maps.append(self._support_class_map(
                             tokenized, tokens_positive, caption_string))
                     new_tokens_positive = [
                         tokens_positive[label] for label in gt_label
@@ -543,16 +534,11 @@ class GroundingDINO(SupportVisualMixin, DINO):
             text_dict['embedded'] = self.text_feat_map(text_dict['embedded'])
 
         if class_token_maps is not None:
-            text_dict = self._visual_text(text_dict, class_token_maps)
+            text_dict = self._support_text(text_dict, class_token_maps)
         for i, data_samples in enumerate(batch_data_samples):
             positive_map = positive_maps[i].to(
                 batch_inputs.device).bool().float()
             text_token_mask = text_dict['text_token_mask'][i]
-            if class_token_maps is not None:
-                positive_map = torch.nn.functional.one_hot(
-                    gt_labels[i], num_classes=self.bbox_head.max_text_len).float()
-                text_token_mask = torch.ones(self.bbox_head.num_classes,
-                    device=batch_inputs.device, dtype=torch.bool)
             data_samples.gt_instances.positive_maps = positive_map
             data_samples.gt_instances.text_token_mask = \
                 text_token_mask.unsqueeze(0).repeat(
@@ -662,10 +648,8 @@ class GroundingDINO(SupportVisualMixin, DINO):
                 mappings = []
                 for caption in text_prompts:
                     tokenized, _, spans, _ = self.get_tokens_and_prompts(caption, True)
-                    mappings.append(self._visual_class_map(tokenized, spans, caption))
-                text_dict = self._visual_text(text_dict, mappings)
-                token_positive_maps = [{c + 1: [c] for c in range(self.bbox_head.num_classes)}
-                                       for _ in batch_data_samples]
+                    mappings.append(self._support_class_map(tokenized, spans, caption))
+                text_dict = self._support_text(text_dict, mappings)
             is_rec_tasks = []
             for i, data_samples in enumerate(batch_data_samples):
                 if token_positive_maps[i] is not None:

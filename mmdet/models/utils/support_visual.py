@@ -1,8 +1,7 @@
-"""Support prototypes and token layout; no trainable parameters or extra loss."""
+"""Object-wise support memory; no trainable parameters or extra loss."""
 import copy
 
 import torch
-from torch.nn import functional as F
 from torchvision.ops import roi_align
 
 
@@ -14,7 +13,7 @@ def pool_instances(feature, samples):
     for i, sample in enumerate(samples):
         boxes = sample.gt_instances.bboxes.to(feature.device, torch.float32)
         target = sample.gt_instances.labels.to(feature.device)
-        if (not torch.isfinite(boxes).all() or
+        if (len(boxes) != len(target) or not torch.isfinite(boxes).all() or
                 (boxes[:, 2:] <= boxes[:, :2]).any()):
             raise ValueError('Support GT boxes must be finite, nonempty xyxy boxes.')
         rois.append(torch.cat([boxes.new_full((len(boxes), 1), i), boxes], 1))
@@ -27,104 +26,40 @@ def pool_instances(feature, samples):
     return features, labels
 
 
-def insert_visual_tokens(text, prototypes, mappings, max_length):
-    """Insert one token before each class delimiter and transfer all masks."""
-    batch, old_length, channels = text['embedded'].shape
-    classes = len(prototypes)
-    if prototypes.shape != (classes, channels) or len(mappings) != batch:
-        raise ValueError('Support prototype and text dimensions do not match.')
-    lengths = text['text_token_mask'].sum(-1).tolist()
-    length = max(lengths) + classes
-    if length > max_length:
-        raise ValueError('All-class prompt plus visual tokens exceeds max_text_len.')
-    embedded, masks, positions, valid = [], [], [], []
-    name_maps, visual_indices = [], []
-    selection = torch.zeros(batch, length, dtype=torch.bool,
-                            device=prototypes.device)
+def support_attention_mask(text, memory, mappings):
+    """Extend the existing text allow-mask with class-local memory columns.
+
+    No support padding is introduced: V is the actual number of GT objects.
+    Text padding keeps its original diagonal, avoiding fully masked query rows.
+    Valid text queries cannot attend text padding or another class's memory.
+    """
+    batch, length, channels = text['embedded'].shape
+    tokens, labels, counts = (memory[k] for k in ('tokens', 'class_ids', 'counts'))
+    classes = len(counts)
+    if (tokens.ndim != 2 or tokens.shape[1] != channels or
+            labels.shape != (len(tokens),) or len(mappings) != batch or
+            labels.dtype != torch.long or (counts <= 0).any() or
+            ((labels < 0) | (labels >= classes)).any()):
+        raise ValueError('Support memory dimensions, classes or counts are invalid.')
+    if not torch.equal(torch.bincount(labels, minlength=classes), counts):
+        raise ValueError('Support memory counts do not match object labels.')
+    allowed = []
     for b, mapping in enumerate(mappings):
         if set(mapping) != set(range(1, classes + 1)):
-            raise ValueError('Visual tokens require every class in canonical order.')
+            raise ValueError('Support memory requires every class in canonical order.')
         names = [list(mapping[c + 1]) for c in range(classes)]
         if any(not ids or ids != list(range(ids[0], ids[-1] + 1)) for ids in names):
             raise ValueError('Each class needs a nonempty contiguous name span.')
         ends = [ids[-1] + 1 for ids in names]
-        if ends != sorted(set(ends)) or ends[-1] >= lengths[b] - 1:
-            raise ValueError('Class names must precede their period and [SEP].')
-        # old_index also supplies the class delimiter's existing attention block
-        # to the inserted token. Original special-token connectivity is retained.
-        old_index, proto_index = [], []
-        by_end = {end: c for c, end in enumerate(ends)}
-        for i in range(int(lengths[b])):
-            if i in by_end:
-                old_index.append(i)
-                proto_index.append(by_end[i])
-            old_index.append(i)
-            proto_index.append(-1)
-        n = len(old_index)
-        index = torch.tensor(old_index, device=prototypes.device)
-        pindex = torch.tensor(proto_index, device=prototypes.device)
-        values = text['embedded'][b, index]
-        values = torch.where((pindex >= 0)[:, None],
-                             prototypes[pindex.clamp_min(0)].to(values.dtype), values)
-        embedded.append(F.pad(values, (0, 0, 0, length - n)))
-        attention = torch.eye(length, dtype=torch.bool, device=index.device)
-        attention[:n, :n] = text['masks'][b][index[:, None], index[None, :]]
-        masks.append(attention)
-        position = torch.zeros(length, dtype=torch.long, device=index.device)
-        position[:n] = text['position_ids'][b, index]
-        shifted_names, vis = {}, []
-        for c, ids in enumerate(names):
-            shifted = [i + c for i in ids]
-            v = ends[c] + c
-            shifted_names[c + 1] = shifted
-            vis.append(v)
-            position[v] = text['position_ids'][b, ends[c]]
-            position[v + 1] += 1
-            selection[b, shifted] = True
-            selection[b, v] = True
-        positions.append(position)
-        valid.append(torch.arange(length, device=index.device) < n)
-        name_maps.append(shifted_names)
-        visual_indices.append(vis)
-    result = dict(text)
-    result.update(embedded=torch.stack(embedded), masks=torch.stack(masks),
-                  position_ids=torch.stack(positions),
-                  text_token_mask=torch.stack(valid))
-    # hidden is a BERT-only artifact, not an input to FE or the detection head.
-    result.pop('hidden', None)
-    layout = dict(names=name_maps, visual=visual_indices, selection=selection)
-    return result, layout
-
-
-def fuse_token_logits(logits, layout, width, stats=None, dn_count=0):
-    """Return logits whose sigmoid is max(mean(sigmoid(text)), sigmoid(visual)).
-
-    Compute log(mean(p) / mean(1-p)) directly, without a sigmoid/logit round
-    trip or probability clipping. Strict > assigns exact ties to text.
-    """
-    rows, text_rows, visual_rows = [], [], []
-    with torch.autocast(device_type=logits.device.type, enabled=False):
-        for b, mapping in enumerate(layout['names']):
-            classes, texts, visuals = [], [], []
-            for c, ids in sorted(mapping.items()):
-                z = logits[b, :, ids].float()
-                text = (torch.logsumexp(F.logsigmoid(z), -1) -
-                        torch.logsumexp(F.logsigmoid(-z), -1))
-                visual = logits[b, :, layout['visual'][b][c - 1]].float()
-                classes.append(torch.where(visual > text, visual, text))
-                if stats is not None:
-                    texts.append(text.detach()[dn_count:])
-                    visuals.append(visual.detach()[dn_count:])
-            fused = torch.stack(classes, -1)
-            rows.append(F.pad(fused, (0, width - len(classes)), value=float('-inf')))
-            if stats is not None:
-                text_rows.append(torch.stack(texts, -1))
-                visual_rows.append(torch.stack(visuals, -1))
-    result = torch.stack(rows)
-    if stats is not None:
-        stats.scores(torch.stack(text_rows), torch.stack(visual_rows),
-                     result.detach()[:, dn_count:, :len(layout['names'][0])])
-    return result
+        if (ends != sorted(set(ends)) or names[0][0] < 1 or
+                ends[-1] >= length or
+                not text['text_token_mask'][b, ends].all()):
+            raise ValueError('Class names must precede valid class delimiters.')
+        # Inherit the delimiter's existing block, including its period query.
+        columns = torch.tensor(ends, device=labels.device)[labels]
+        visual = text['masks'][b, :, columns] & text['text_token_mask'][b, :, None]
+        allowed.append(torch.cat([text['masks'][b], visual], dim=-1))
+    return torch.stack(allowed)
 
 
 class SupportVisualMixin:
@@ -135,7 +70,7 @@ class SupportVisualMixin:
         return self.support_visual_cfg is not None
 
     def clear_support_cache(self):
-        self._support_prototypes = None
+        self._support_memory = None
 
     def train(self, mode=True):
         self.clear_support_cache()
@@ -157,9 +92,7 @@ class SupportVisualMixin:
             expected = tuple(cfg['class_names'])
             if tuple(dataset.metainfo['classes']) != expected:
                 raise ValueError('Support class metadata does not match the query classes.')
-            # CocoDataset.load_data_list() deletes its temporary COCO API.
-            # Read category metadata using the dataset's resolved annotation path
-            # and file backend, and preserve its persistent category/label order.
+            # CocoDataset deletes its temporary COCO API during initialization.
             annotation = load(dataset.ann_file, backend_args=dataset.backend_args)
             categories = {category['id']: category['name']
                           for category in annotation['categories']}
@@ -172,35 +105,42 @@ class SupportVisualMixin:
         return self._support_loader
 
     @torch.no_grad()
-    def build_support_prototypes(self):
+    def build_support_memory(self):
         loader = self._get_support_loader()
         classes = self.bbox_head.num_classes
         device = next(self.backbone.parameters()).device
-        sums = torch.zeros(classes, 256, device=device, dtype=torch.float32)
-        counts = torch.zeros(classes, device=device, dtype=torch.long)
+        values_by_class = [[] for _ in range(classes)]
         modes = [(module, module.training) for module in self.backbone.modules()]
         try:
             self.backbone.eval()
             for batch in loader:
                 batch = self.data_preprocessor(batch, training=False)
-                # Use the raw norm1 return, never extract_feat() / ChannelMapper.
+                # Raw norm1 return, never extract_feat() / ChannelMapper.
                 feature = self.backbone(batch['inputs'])[0]
                 values, labels = pool_instances(feature, batch['data_samples'])
-                if ((labels < 0) | (labels >= classes)).any():
-                    raise ValueError('Support labels must be in 0..C-1.')
-                sums.index_add_(0, labels, values)
-                counts.index_add_(0, labels, torch.ones_like(labels))
+                if labels.dtype != torch.long or ((labels < 0) | (labels >= classes)).any():
+                    raise ValueError('Support labels must be integer labels in 0..C-1.')
+                for c in range(classes):
+                    selected = values[labels == c]
+                    if len(selected):
+                        values_by_class[c].append(selected)
         finally:
             for module, mode in modes:
                 module.training = mode
+        counts = torch.tensor([sum(len(v) for v in rows) for rows in values_by_class],
+                              device=device, dtype=torch.long)
         if (counts == 0).any():
             missing = (counts == 0).nonzero().flatten().tolist()
-            raise ValueError(f'Support set is missing GT instances for classes {missing}.')
-        return sums / counts[:, None]
+            names = self.support_visual_cfg['class_names']
+            raise ValueError('Support set is missing GT instances for classes ' +
+                             str([(c, names[c]) for c in missing]))
+        tokens = torch.cat([torch.cat(rows) for rows in values_by_class])
+        class_ids = torch.arange(classes, device=device).repeat_interleave(counts)
+        return dict(tokens=tokens, class_ids=class_ids, counts=counts)
 
-    def support_prototypes(self):
+    def support_memory(self):
         if self.training:
-            return self.build_support_prototypes()
-        if getattr(self, '_support_prototypes', None) is None:
-            self._support_prototypes = self.build_support_prototypes()
-        return self._support_prototypes
+            return self.build_support_memory()
+        if getattr(self, '_support_memory', None) is None:
+            self._support_memory = self.build_support_memory()
+        return self._support_memory

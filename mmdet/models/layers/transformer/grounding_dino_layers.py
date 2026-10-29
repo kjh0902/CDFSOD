@@ -179,7 +179,9 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 text_attention_mask: Tensor = None,
                 pos_text: Tensor = None,
                 text_self_attention_masks: Tensor = None,
-                position_ids: Tensor = None):
+                position_ids: Tensor = None,
+                support_memory: Tensor = None,
+                support_attention_mask: Tensor = None):
         """Forward function of Transformer encoder.
 
         Args:
@@ -204,6 +206,9 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 Defaults to None.
             text_self_attention_masks (Tensor, optional): Text self attention
                 mask. Defaults to None.
+            support_memory (Tensor, optional): Fixed object tokens (V, dim).
+            support_attention_mask (Tensor, optional): Allowed Text-to-Text/Support
+                connections (bs, len_text, len_text + V).
             position_ids (Tensor, optional): Text position ids.
                 Defaults to None.
         """
@@ -219,12 +224,21 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                                  device=memory_text.device).float().unsqueeze(
                                      0).unsqueeze(-1).repeat(bs, 1, 1))
                 pos_text = get_text_sine_pos_embed(
-                    pos_text, num_pos_feats=256, exchange_xy=False)
+                    pos_text, num_pos_feats=self.embed_dims, exchange_xy=False)
             if position_ids is not None:
                 pos_text = get_text_sine_pos_embed(
                     position_ids[..., None],
-                    num_pos_feats=256,
+                    num_pos_feats=self.embed_dims,
                     exchange_xy=False)
+
+        if support_memory is not None:
+            if support_attention_mask is None:
+                raise ValueError('Support memory requires a class attention mask.')
+            # Fixed object memory is never a query and never enters fusion.
+            support = support_memory.detach().to(memory_text)
+            support = support.unsqueeze(0).expand(memory_text.shape[0], -1, -1)
+        else:
+            support = None
 
         # main process
         for layer_id, layer in enumerate(self.layers):
@@ -238,12 +252,22 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
             if self.text_layers:
                 text_num_heads = self.text_layers[
                     layer_id].self_attn_cfg.num_heads
+                if support is None:
+                    # Preserve the original self-attention path when disabled.
+                    attention = text_self_attention_masks.repeat(text_num_heads, 1, 1)
+                    extra = {}
+                else:
+                    attention = support_attention_mask.repeat_interleave(text_num_heads, dim=0)
+                    kv = torch.cat([memory_text, support], dim=1)
+                    key_pos = (torch.cat([pos_text, torch.zeros_like(support)], dim=1)
+                               if pos_text is not None else None)
+                    extra = dict(key=kv, value=kv, key_pos=key_pos)
                 memory_text = self.text_layers[layer_id](
                     query=memory_text,
-                    query_pos=(pos_text if pos_text is not None else None),
-                    attn_mask=~text_self_attention_masks.repeat(
-                        text_num_heads, 1, 1),  # note we use ~ for mask here
+                    query_pos=pos_text,
+                    attn_mask=~attention,
                     key_padding_mask=None,
+                    **extra,
                 )
             output = layer(
                 query=output,

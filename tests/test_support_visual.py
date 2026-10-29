@@ -1,21 +1,25 @@
 import copy
-import json
 import unittest
-from types import SimpleNamespace as NS
-from unittest.mock import patch
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
-from visual_test_support import visual, stats_module, sample, text_fixture
+from visual_test_support import (visual, sample, text_fixture, tokenizer_masks,
+                                 execute, node, source)
+from support_transformer_fixture import Encoder, TextLayer, run
+
+
+def memory_fixture(counts=(3, 2), channels=256, requires_grad=False):
+    counts = torch.tensor(counts, dtype=torch.long)
+    return dict(tokens=torch.randn(int(counts.sum()), channels, requires_grad=requires_grad),
+                class_ids=torch.arange(len(counts)).repeat_interleave(counts), counts=counts)
 
 
 class SupportModel(visual.SupportVisualMixin, nn.Module):
     def __init__(self):
         super().__init__()
         self.support_visual_cfg = dict(class_names=('a', 'b'))
-        self.bbox_head = NS(num_classes=2)
+        self.bbox_head = type('Head', (), dict(num_classes=2))()
         self.backbone = Backbone()
         self.data_preprocessor = lambda batch, training: batch
         self._support_loader = [
@@ -34,11 +38,10 @@ class Backbone(nn.Module):
 
     def forward(self, x):
         self.calls += 1
-        out = self.dropout(x[:, :1, ::8, ::8] * self.weight)
-        return [out.expand(-1, 256, -1, -1)]
+        return [(self.dropout(x[:, :1, ::8, ::8] * self.weight)).expand(-1, 256, -1, -1)]
 
 
-class PrototypeTests(unittest.TestCase):
+class MemoryTests(unittest.TestCase):
     def test_real_roi_stride_coordinates_and_gap(self):
         y, x = torch.meshgrid(torch.arange(8.), torch.arange(8.), indexing='ij')
         features = (x + 10 * y)[None, None].expand(1, 256, -1, -1)
@@ -46,143 +49,227 @@ class PrototypeTests(unittest.TestCase):
         torch.testing.assert_close(pooled, torch.full((1, 256), 32.5))
         self.assertEqual(labels.tolist(), [1])
 
-    def test_instance_mean_full_support_and_no_grad(self):
+    def test_all_objects_preserved_class_concatenation_no_grad_and_rng(self):
         model = SupportModel().train()
-        model.backbone.dropout.eval()  # Preserve heterogeneous submodule modes.
+        model.backbone.dropout.eval()
         states = [m.training for m in model.backbone.modules()]
         rng = torch.get_rng_state().clone()
-        output = model.support_prototypes()
-        torch.testing.assert_close(output[:, 0], torch.tensor([4., 5.]))
-        self.assertFalse(output.requires_grad)
-        self.assertEqual(model.backbone.calls, 2)
+        output = model.support_memory()
+        torch.testing.assert_close(output['tokens'][:, 0], torch.tensor([2., 2., 8., 2., 8.]))
+        self.assertEqual(output['counts'].tolist(), [3, 2])
+        self.assertEqual(output['class_ids'].tolist(), [0, 0, 0, 1, 1])
+        self.assertFalse(output['tokens'].requires_grad)
         self.assertEqual(states, [m.training for m in model.backbone.modules()])
         self.assertTrue(torch.equal(rng, torch.get_rng_state()))
-        query = model.backbone(torch.ones(1, 3, 64, 64))[0].sum()
-        query.backward()
+        model.backbone(torch.ones(1, 3, 64, 64))[0].sum().backward()
         self.assertIsNotNone(model.backbone.weight.grad)
 
-    def test_every_iteration_recomputes_eval_caches_and_load_invalidates(self):
+    def test_actual_counts_for_1_5_10_shot_not_fixed_per_class(self):
+        for shot in (1, 5, 10):
+            model = SupportModel()
+            model._support_loader = model._support_loader * shot
+            result = model.support_memory()
+            self.assertEqual(result['tokens'].shape, (5 * shot, 256))
+            self.assertEqual(result['counts'].tolist(), [3 * shot, 2 * shot])
+
+    def test_recompute_cache_modes_weights_and_state_dict(self):
         model = SupportModel().train()
-        first = model.support_prototypes()
+        first = model.support_memory()
         with torch.no_grad():
             model.backbone.weight.fill_(2.)
-        torch.testing.assert_close(model.support_prototypes(), first * 2)
+        torch.testing.assert_close(model.support_memory()['tokens'], first['tokens'] * 2)
         self.assertEqual(model.backbone.calls, 4)
         model.eval()
-        first = model.support_prototypes()
-        self.assertIs(first, model.support_prototypes())
+        first = model.support_memory()
+        self.assertIs(first, model.support_memory())
         self.assertEqual(model.backbone.calls, 6)
         state = copy.deepcopy(model.state_dict())
-        self.assertFalse(any('prototype' in key or 'stats' in key for key in state))
+        self.assertFalse(any('support' in key or 'stats' in key for key in state))
         model.load_state_dict(state)
-        model.support_prototypes()
+        self.assertIsNone(model._support_memory)
+        model.support_memory()
         self.assertEqual(model.backbone.calls, 8)
+        model.train()
+        self.assertIsNone(model._support_memory)
 
-    def test_missing_class_and_mode_restoration_on_exception(self):
-        model = SupportModel().train()
-        model._support_loader = model._support_loader[:1]
-        model._support_loader[0]['data_samples'][0].gt_instances.labels[:] = 0
-        with self.assertRaisesRegex(ValueError, 'missing'):
-            model.support_prototypes()
-        self.assertTrue(model.backbone.training)
-        model._support_loader[0]['data_samples'][0].gt_instances.bboxes[0, 2] = 0
-        with self.assertRaisesRegex(ValueError, 'boxes'):
-            model.support_prototypes()
-        self.assertTrue(model.backbone.training)
+    def test_missing_class_invalid_label_boxes_and_mode_restoration(self):
+        for failure in ('missing', 'labels', 'boxes'):
+            model = SupportModel().train()
+            model._support_loader = model._support_loader[:1]
+            instances = model._support_loader[0]['data_samples'][0].gt_instances
+            if failure == 'missing':
+                instances.labels[:] = 0
+            elif failure == 'labels':
+                instances.labels[0] = 2
+            else:
+                instances.bboxes[0, 2] = 0
+            with self.assertRaisesRegex(ValueError, failure):
+                model.support_memory()
+            self.assertTrue(model.backbone.training)
 
-    def test_empty_gt_does_not_bias_class_average(self):
+    def test_empty_images_add_no_tokens(self):
         model = SupportModel()
         model._support_loader.insert(0, dict(inputs=torch.ones(1, 3, 64, 64),
                                              data_samples=[sample([], [])]))
-        torch.testing.assert_close(model.support_prototypes()[:, 0], torch.tensor([4., 5.]))
+        result = model.support_memory()
+        self.assertEqual(result['counts'].tolist(), [3, 2])
+        torch.testing.assert_close(result['tokens'][:, 0], torch.tensor([2., 2., 8., 2., 8.]))
 
 
-class TokenFusionTests(unittest.TestCase):
-    def test_positions_masks_mapping_specials_and_query_gradient(self):
-        text, maps = text_fixture()
-        prototypes = torch.randn(2, 256)
-        new, layout = visual.insert_visual_tokens(text, prototypes, maps, 32)
-        self.assertEqual(layout['names'], [{1: [1, 2], 2: [5]}])
-        self.assertEqual(layout['visual'], [[3, 6]])
-        self.assertEqual(new['position_ids'].tolist(), [[0, 0, 1, 2, 3, 0, 1, 2, 0]])
-        torch.testing.assert_close(new['embedded'][0, 3], prototypes[0])
-        torch.testing.assert_close(new['embedded'][0, 6], prototypes[1])
-        self.assertTrue(new['masks'][0, 1:5, 1:5].all())
-        self.assertTrue(new['masks'][0, 5:8, 5:8].all())
-        self.assertFalse(new['masks'][0, 1:5, 5:8].any())
-        self.assertEqual(layout['selection'].nonzero()[:, 1].tolist(), [1, 2, 3, 5, 6])
-        new['embedded'].sum().backward()
-        self.assertIsNotNone(text['embedded'].grad)
-        self.assertFalse(prototypes.requires_grad)
+class AttentionTests(unittest.TestCase):
+    def test_text_mapping_positions_and_specials_unchanged(self):
+        text, maps = text_fixture(channels=8)
+        original = copy.deepcopy({k: v.detach().clone() for k, v in text.items()})
+        memory = memory_fixture(channels=8)
+        allowed = visual.support_attention_mask(text, memory, maps)
+        self.assertEqual(allowed.shape, (1, 9, 14))
+        self.assertTrue(torch.equal(allowed[:, :, :9], text['masks']))
+        self.assertTrue(allowed[0, 1:4, 9:12].all())
+        self.assertTrue(allowed[0, 4:6, 12:].all())
+        self.assertFalse(allowed[0, 1:4, 12:].any())
+        self.assertFalse(allowed[0, [0, 6, 7, 8], 9:].any())
+        for key in text:
+            torch.testing.assert_close(text[key], original[key])
+        self.assertEqual(maps, [{1: [1, 2], 2: [4]}])
 
-    def test_unequal_lengths_and_padding_remain_masked(self):
-        text, maps = text_fixture(2)
-        text['text_token_mask'][1, 6:] = False
-        maps[1] = {1: [1], 2: [3]}
-        new, layout = visual.insert_visual_tokens(text, torch.randn(2, 256), maps, 32)
-        self.assertEqual(new['text_token_mask'][1].sum().item(), 8)
-        self.assertFalse(new['text_token_mask'][1, -1])
-        self.assertFalse(layout['selection'][1, -1])
-
-    def test_invalid_mapping_and_overflow_fail_instead_of_truncation(self):
-        text, maps = text_fixture()
-        for bad in ([{1: [1]}], [{1: [], 2: [4]}], [{1: [1, 3], 2: [4]}]):
+    def test_invalid_layout_and_counts_fail(self):
+        text, _ = text_fixture(channels=8)
+        for maps in ([{1: [1]}], [{1: [], 2: [4]}], [{1: [1, 3], 2: [4]}]):
             with self.assertRaises(ValueError):
-                visual.insert_visual_tokens(text, torch.randn(2, 256), bad, 32)
-        with self.assertRaisesRegex(ValueError, 'exceeds'):
-            visual.insert_visual_tokens(text, torch.randn(2, 256), maps, 8)
+                visual.support_attention_mask(text, memory_fixture(channels=8), maps)
+        memory = memory_fixture(channels=8)
+        memory['counts'][0] += 1
+        with self.assertRaisesRegex(ValueError, 'counts'):
+            visual.support_attention_mask(text, memory, [{1: [1, 2], 2: [4]}])
 
-    def test_exact_score_formula_differs_from_mean_logit_and_max_token(self):
-        logits = torch.tensor([[[100., -4., 2., -1., 80., .1, .2, -90.]]], requires_grad=True)
-        layout = dict(names=[{1: [1, 2], 2: [5]}], visual=[[3, 6]])
-        fused = visual.fuse_token_logits(logits, layout, 8)
-        expected = torch.stack([torch.maximum(logits[0, :, [1, 2]].sigmoid().mean(-1),
-                                              logits[0, :, 3].sigmoid()),
-                                torch.maximum(logits[0, :, 5].sigmoid(), logits[0, :, 6].sigmoid())], -1)
-        torch.testing.assert_close(fused[0, :, :2].sigmoid(), expected)
-        self.assertFalse(torch.allclose(expected[:, 0], logits[0, :, [1, 2]].mean(-1).sigmoid()))
-        self.assertTrue(torch.isneginf(fused[..., 2:]).all())
-        F.binary_cross_entropy_with_logits(fused[..., :2], torch.ones_like(fused[..., :2])).backward()
-        self.assertTrue(torch.isfinite(logits.grad).all())
-        self.assertEqual(logits.grad[0, 0, 0].item(), 0.)
+    def test_class_isolation_and_special_padding_outputs(self):
+        torch.manual_seed(5)
+        text, maps = text_fixture(channels=8)
+        memory = memory_fixture(channels=8)
+        encoder = Encoder(layers=1, fusion=False).eval()
+        allowed = visual.support_attention_mask(text, memory, maps)
+        image = torch.randn(1, 4, 8)
+        a = run(encoder, text, memory['tokens'], allowed, image)[1]
+        other = memory['tokens'].clone()
+        other[:3] = torch.randn_like(other[:3]) * 20
+        b = run(encoder, text, other, allowed, image)[1]
+        self.assertGreater((a[:, 1:4] - b[:, 1:4]).abs().max().item(), 1e-4)
+        torch.testing.assert_close(a[:, [0, 4, 5, 6, 7, 8]], b[:, [0, 4, 5, 6, 7, 8]],
+                                   rtol=0, atol=0)
+        changed_text = dict(text, embedded=text['embedded'].detach().clone())
+        changed_text['embedded'][:, 7:] = 10000
+        c = run(encoder, changed_text, memory['tokens'], allowed, image)[1]
+        torch.testing.assert_close(a[:, :7], c[:, :7], rtol=0, atol=0)
 
-    def test_extreme_logits_amp_and_tie_go_to_text(self):
-        layout = dict(names=[{1: [0, 1]}], visual=[[2]])
-        for values in ([-100., -80., -95.], [80., 100., 85.], [0., 0., 0.]):
-            logits = torch.tensor([[values]], requires_grad=True)
-            with torch.autocast('cpu', dtype=torch.bfloat16):
-                fused = visual.fuse_token_logits(logits, layout, 1)
-            self.assertTrue(torch.isfinite(fused).all())
-            fused.sum().backward()
-            self.assertTrue(torch.isfinite(logits.grad).all())
-            if values == [0., 0., 0.]:
-                self.assertEqual(logits.grad[0, 0, 2].item(), 0.)
-                torch.testing.assert_close(logits.grad[0, 0, :2], torch.tensor([.5, .5]))
+    def test_unequal_batch_lengths_and_head_mask_order(self):
+        torch.manual_seed(7)
+        text, maps = text_fixture(2, channels=8)
+        ids = torch.tensor([[101, 10, 11, 119, 12, 119, 102, 0, 0],
+                            [101, 10, 119, 12, 119, 102, 0, 0, 0]])
+        text['masks'], text['position_ids'] = tokenizer_masks(ids)
+        text['text_token_mask'] = ids != 0
+        maps[1] = {1: [1], 2: [3]}
+        memory = memory_fixture(channels=8)
+        allowed = visual.support_attention_mask(text, memory, maps)
+        encoder = Encoder(layers=1, heads=2, fusion=False).eval()
+        image = torch.randn(2, 4, 8)
+        batch = run(encoder, text, memory['tokens'], allowed, image)[1]
+        for i in range(2):
+            single = {key: value[i:i + 1] for key, value in text.items()}
+            output = run(encoder, single, memory['tokens'], allowed[i:i + 1], image[i:i + 1])[1]
+            torch.testing.assert_close(batch[i:i + 1], output, rtol=1e-5, atol=1e-6)
+        self.assertTrue(torch.isfinite(batch).all())
+        self.assertTrue(torch.equal(encoder.text_layers[0].self_attn.calls[0]['mask'],
+                                   ~allowed.repeat_interleave(2, dim=0)))
 
-    def test_logging_preserves_fusion_gradients_rng_and_optimizer_updates(self):
-        torch.manual_seed(18)
-        layout = dict(names=[{1: [0, 1], 2: [3]}], visual=[[2, 4]])
-        initial = torch.randn(1, 6, 5)
-        outputs = []
-        for enabled in (False, True):
-            parameter = nn.Parameter(initial.clone())
-            optimizer = torch.optim.AdamW([parameter], lr=.01)
-            stats = stats_module.VisualTokenStats(2, 'cpu') if enabled else None
-            rng = torch.get_rng_state().clone()
-            result = visual.fuse_token_logits(parameter, layout, 5, stats, dn_count=2)
-            loss = F.binary_cross_entropy_with_logits(result[..., :2], torch.ones_like(result[..., :2]))
-            loss.backward()
-            grad = parameter.grad.clone()
-            optimizer.step()
-            outputs.append((result.detach(), loss.detach(), grad, parameter.detach().clone()))
-            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
-            if enabled:
-                self.assertEqual(stats.pending[0].shape, (1, 4, 2))
-                stats.finish_batch()
-                self.assertIsNone(stats.pending)
-                self.assertEqual(stats.sums.shape, (9, 2))
-                json.dumps(stats.report(('a', 'b')), allow_nan=False)
-        for a, b in zip(*outputs):
+    def test_memory_immutable_gradients_and_text_only_fusion(self):
+        torch.manual_seed(8)
+        text, maps = text_fixture(2, channels=8)
+        memory = memory_fixture(channels=8, requires_grad=True)
+        original = memory['tokens'].detach().clone()
+        encoder = Encoder().train()
+        fusion_lengths = []
+        handles = [layer.register_forward_pre_hook(
+            lambda module, args, kwargs: fusion_lengths.append(kwargs['lang_feature'].shape[1]),
+            with_kwargs=True) for layer in encoder.fusion_layers]
+        allowed = visual.support_attention_mask(text, memory, maps)
+        image, output = run(encoder, text, memory['tokens'], allowed)
+        (output.square().mean() + image.square().mean() + output[..., 0].mean()).backward()
+        self.assertIsNone(memory['tokens'].grad)
+        self.assertTrue(torch.isfinite(text['embedded'].grad).all())
+        self.assertGreater(encoder.text_layers[0].self_attn.attn.in_proj_weight.grad.abs().sum().item(), 0)
+        torch.testing.assert_close(memory['tokens'], original, rtol=0, atol=0)
+        self.assertEqual(fusion_lengths, [9, 9])
+        for layer in encoder.text_layers:
+            call = layer.self_attn.calls[0]
+            self.assertEqual(call['query'].shape, (2, 9, 8))
+            torch.testing.assert_close(call['key'][:, 9:], original[None].expand(2, -1, -1))
+            torch.testing.assert_close(call['value'][:, 9:], call['key'][:, 9:])
+            self.assertTrue((call['key_pos'][:, 9:] == 0).all())
+        for handle in handles:
+            handle.remove()
+
+    def test_memory_permutation_has_no_positional_effect(self):
+        text, maps = text_fixture(channels=8)
+        memory = memory_fixture(channels=8)
+        encoder = Encoder().eval()
+        image = torch.randn(1, 4, 8)
+        allowed = visual.support_attention_mask(text, memory, maps)
+        a = run(encoder, text, memory['tokens'], allowed, image)
+        order = torch.tensor([4, 2, 0, 3, 1])
+        permuted = dict(memory, tokens=memory['tokens'][order], class_ids=memory['class_ids'][order])
+        b = run(encoder, text, permuted['tokens'],
+                visual.support_attention_mask(text, permuted, maps), image)
+        for x, y in zip(a, b):
+            torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-6)
+
+    def test_disabled_text_layer_reuses_original_weights_structure_and_forward(self):
+        env = dict(torch=torch)
+        cls = node(source('mmdet/models/layers/transformer/detr_layers.py', baseline=True),
+                   'DetrTransformerEncoderLayer')
+        execute([next(n for n in cls.body if getattr(n, 'name', None) == 'forward')], env)
+        base = TextLayer()
+        current = copy.deepcopy(base)
+        before = set(current.state_dict())
+        query = torch.randn(2, 5, 8)
+        position = torch.randn_like(query)
+        mask = torch.eye(5, dtype=torch.bool).logical_not().repeat(4, 1, 1)
+        a = env['forward'](base, query, position, None, attn_mask=mask)
+        b = current(query, position, None, attn_mask=mask)
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        a[..., 0].sum().backward()
+        b[..., 0].sum().backward()
+        self.assertEqual(before, set(current.state_dict()))
+        for p, q in zip(base.parameters(), current.parameters()):
+            torch.testing.assert_close(p.grad, q.grad, rtol=0, atol=0)
+
+    def test_disabled_encoder_matches_original_forward_with_unequal_batch_masks(self):
+        import subprocess
+        from visual_test_support import ROOT
+        from support_transformer_fixture import env
+        original = subprocess.check_output(
+            ['git', 'show', '72bced2:mmdet/models/layers/transformer/grounding_dino_layers.py'],
+            cwd=ROOT, encoding='utf8')
+        cls = node(original, 'GroundingDinoTransformerEncoder')
+        baseline = next(n for n in cls.body if getattr(n, 'name', None) == 'forward')
+        namespace = dict(env)
+        execute([baseline], namespace)
+        encoder = Encoder(dim=256, heads=4, layers=1).eval()
+        old = copy.deepcopy(encoder)
+        old.forward = namespace['forward'].__get__(old)
+        text, _ = text_fixture(2)
+        ids = torch.tensor([[101, 10, 11, 119, 12, 119, 102, 0, 0],
+                            [101, 10, 119, 12, 119, 102, 0, 0, 0]])
+        text['masks'], text['position_ids'] = tokenizer_masks(ids)
+        text['text_token_mask'] = ids != 0
+        image = torch.randn(2, 4, 256)
+        kwargs = dict(query=image, query_pos=torch.zeros_like(image),
+                      key_padding_mask=torch.zeros(2, 4, dtype=torch.bool),
+                      spatial_shapes=torch.tensor([[2, 2]]), level_start_index=torch.tensor([0]),
+                      valid_ratios=torch.ones(2, 1, 2), memory_text=text['embedded'],
+                      text_attention_mask=~text['text_token_mask'],
+                      position_ids=text['position_ids'], text_self_attention_masks=text['masks'])
+        for a, b in zip(old(**kwargs), encoder(**kwargs)):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 

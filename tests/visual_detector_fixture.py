@@ -20,6 +20,7 @@ import warnings
 import torch
 from torch import nn
 from visual_test_support import ROOT, sample, visual, tokenizer_masks
+from support_transformer_fixture import Encoder as MemoryEncoder
 
 BASE = '8926970ebff1a549088b0a4c87c272e1a70fe0dd'
 DETECTOR = 'mmdet/models/detectors/grounding_dino.py'
@@ -47,8 +48,7 @@ def execute(nodes, env):
 
 
 ENV = dict(torch=torch, nn=nn, math=math, re=re, warnings=warnings, copy=copy,
-           fuse_token_logits=visual.fuse_token_logits,
-           insert_visual_tokens=visual.insert_visual_tokens,
+           support_attention_mask=visual.support_attention_mask,
            SupportVisualMixin=visual.SupportVisualMixin)
 utils = source('mmdet/models/layers/transformer/utils.py')
 execute([node(utils, 'inverse_sigmoid'), node(utils, 'coordinate_to_encoding')], ENV)
@@ -182,8 +182,7 @@ class Head(nn.Module):
         self.inputs = inputs
         scores, boxes = self.forward(inputs['hidden_states'], inputs['references'],
                                      inputs['memory_text'], inputs['text_token_mask'],
-                                     visual_layout=inputs.get('visual_layout'),
-                                     dn_count=inputs['dn_meta']['num_denoising_queries'])
+                                     )
         self.outputs = (scores, boxes)
         return dict(loss_cls=scores[torch.isfinite(scores)].square().mean(),
                     loss_bbox=boxes.square().mean(),
@@ -210,7 +209,7 @@ class DN(nn.Module):
                 dict(num_denoising_queries=1, num_denoising_groups=1))
 
 
-def build(baseline=False, weight=0):
+def build(baseline=False, weight=0, real_encoder=False):
     cls, env = detector_class(baseline)
     model = cls.__new__(cls)
     nn.Module.__init__(model)
@@ -220,7 +219,7 @@ def build(baseline=False, weight=0):
     model._special_tokens = '. '
     model.use_autocast = False
     model.text_feat_map = nn.Linear(8, 8)
-    model.encoder = Encoder()
+    model.encoder = MemoryEncoder() if real_encoder else Encoder()
     model.decoder = Decoder()
     model.bbox_head = Head()
     model.num_queries = 3

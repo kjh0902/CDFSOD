@@ -52,38 +52,32 @@ class RandomnessTests(unittest.TestCase):
 
 
 class StatisticsTests(unittest.TestCase):
-    def test_explicit_win_denominators_gt_class_background_and_ties(self):
-        stats = stats_module.VisualTokenStats(2, 'cpu')
-        # q0 predicts class 0, visual wins there; q1 predicts class 1, exact tie.
-        # q0 is assigned GT class 1, where TEXT wins instead.
-        text = torch.tensor([[[0., 4.], [-1., 2.]]])
-        visual = torch.tensor([[[5., 3.], [-2., 2.]]])
-        stats.scores(text, visual, torch.maximum(text, visual))
-        stats.matches(0, NS(gt_inds=torch.tensor([1, 0]), labels=torch.tensor([1, -1])))
-        report = stats.report(('a', 'b'))
-        self.assertEqual(report['overall']['win_all'], dict(value=.5, count=2))
-        self.assertEqual(report['overall']['win_gt'], dict(value=0., count=1))
-        self.assertEqual(report['overall']['win_background'], dict(value=0., count=1))
-        self.assertEqual(report['classes']['a']['win_gt'], dict(value=None, count=0))
-        expected = (visual.sigmoid() - text.sigmoid()).mean().item()
-        self.assertAlmostEqual(report['overall']['score_difference']['value'], expected)
-        stats.finish_batch()
-        self.assertIsNone(stats.pending)
-        self.assertTrue(all(t.grad_fn is None for t in (stats.sums, stats.counts)))
-
-    def test_padding_samples_excluded_from_every_metric(self):
+    def test_memory_counts_norms_and_ddp_padding_samples(self):
+        from test_support_visual import memory_fixture
+        memory = memory_fixture(channels=256)
+        memory['tokens'].fill_(1.)
         stats = stats_module.VisualTokenStats(2, 'cpu')
         stats.valid = [True, False]
         text, maps = text_fixture(2)
-        stats.features(text, torch.ones(2, 256), maps)
-        stats.scores(torch.zeros(2, 3, 2), torch.ones(2, 3, 2), torch.ones(2, 3, 2))
-        stats.matches(0, NS(gt_inds=torch.zeros(3, dtype=torch.long),
-                            labels=torch.full((3,), -1, dtype=torch.long)))
-        stats.matches(1, None)
-        result = stats.report(('a', 'b'))['overall']
-        self.assertEqual(result['win_all']['count'], 3)
-        self.assertEqual(result['text_score']['count'], 6)
-        self.assertEqual(result['text_norm']['count'], 3)
+        stats.support_features(memory, 2)
+        stats.text_features(text['embedded'], maps, 'text_norm')
+        stats.text_features(text['embedded'] * 2, maps, 'enhanced_text_norm')
+        result = stats.report(('a', 'b'))
+        self.assertEqual(result['overall']['support_token_count'], 5)
+        self.assertEqual(result['classes']['a']['support_token_count'], 3)
+        self.assertEqual(result['overall']['support_token_norm'], dict(value=16., count=5))
+        self.assertEqual(result['overall']['text_norm']['count'], 3)
+        self.assertAlmostEqual(result['overall']['enhanced_text_norm']['value'],
+                               2 * result['overall']['text_norm']['value'])
+        # Simulate DDP reduction of scalar accumulators. Memory counts stay local.
+        stats.sums.mul_(2)
+        stats.counts.mul_(2)
+        self.assertEqual(stats.report(('a', 'b'))['overall']['support_token_count'], 5)
+        stats.finish_batch()
+        self.assertIsNone(stats.valid)
+        self.assertTrue(all(value.grad_fn is None for value in
+                            (stats.sums, stats.counts, stats.support_counts)))
+        json.dumps(stats.report(('a', 'b')), allow_nan=False)
 
     def test_epoch_tail_only_and_validation_streaming_without_tensors(self):
         env = dict(torch=torch, dist=torch.distributed, Path=Path, json=json,
@@ -121,16 +115,28 @@ class StatisticsTests(unittest.TestCase):
             rows = [json.loads(line) for line in (Path(tmp) / 'visual_token_stats.jsonl').read_text().splitlines()]
             self.assertEqual([row['phase'] for row in rows], ['train', 'val'])
             self.assertTrue(all(row['dataset'] == 'toy' and row['shot'] == 5 for row in rows))
+            self.assertTrue(all(row['schema_version'] == 2 and row['architecture'] == 'support_memory' for row in rows))
             self.assertLess((Path(tmp) / 'visual_token_stats.jsonl').stat().st_size, 6000)
 
 
 class ConfigTests(unittest.TestCase):
     def test_serial_layers_and_progressive_hooks_unchanged_from_start(self):
         for rel in ('mmdet/engine/hooks/stage_lr_hook.py',
-                    'mmdet/models/layers/transformer/grounding_dino_layers.py',
                     'mmdet/models/layers/transformer/dino_layers.py'):
             original = subprocess.check_output(['git', 'show', '449e69a:' + rel], cwd=ROOT, encoding='utf8')
             self.assertEqual(source(rel), original)
+
+    def test_decoder_layers_and_all_18_configs_unchanged_from_base(self):
+        rel = 'mmdet/models/layers/transformer/grounding_dino_layers.py'
+        original = subprocess.check_output(['git', 'show', '72bced2:' + rel], cwd=ROOT, encoding='utf8')
+        for name in ('GroundingDinoTransformerDecoderLayer', 'GroundingDinoTransformerDecoder'):
+            self.assertEqual(ast.dump(node(source(rel), name)), ast.dump(node(original, name)))
+        paths = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', '72bced2',
+                                         'configs_cdfsod'], cwd=ROOT, encoding='utf8').splitlines()
+        for path in paths:
+            if path.endswith('.py'):
+                content = subprocess.check_output(['git', 'show', '72bced2:' + path], cwd=ROOT, encoding='utf8')
+                self.assertEqual(source(path), content)
 
     @unittest.skipUnless(importlib.util.find_spec('mmengine'), 'MMEngine not installed')
     def test_all_18_configs_parse_and_preserve_query_training_settings(self):

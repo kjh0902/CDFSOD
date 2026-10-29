@@ -89,14 +89,14 @@ def data(classes=2, empty=False):
     samples = [sample([[4, 5, 20, 22]], [classes - 1]), sample([], [])]
     if empty:
         samples = [sample([], []), sample([], [])]
-    for s in samples:
-        labels = s.gt_instances.labels
-        s.gt_instances.positive_maps = F.one_hot(labels, num_classes=16).float()
-        s.gt_instances.text_token_mask = torch.ones(len(labels), classes, dtype=torch.bool)
     names = {1: [1, 2]}
-    visual_indices = [3]
     if classes == 2:
-        names[2] = [5]
-        visual_indices.append(6)
-    layout = dict(names=[names] * 2, visual=[visual_indices] * 2)
-    return samples, layout
+        names[2] = [4]
+    for item in samples:
+        labels = item.gt_instances.labels
+        positive = torch.zeros(len(labels), 16)
+        for i, label in enumerate(labels.tolist()):
+            positive[i, names[label + 1]] = 1.
+        item.gt_instances.positive_maps = positive
+        item.gt_instances.text_token_mask = torch.ones(len(labels), 9, dtype=torch.bool)
+    return samples, names

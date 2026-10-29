@@ -1,14 +1,16 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 브랜치는 `acl-serial-visual-text-contrastive`의 `449e69a`를 기반으로 Region-Text
-보조 손실을 제거하고, HED 없는 **serial ACL + Support Visual Token**을 구현한다.
-전체 Shot Support의 GT RoIAlign → GAP → 클래스 평균 Prototype을 매 Training
-Iteration마다 생성하고, BERT/text_feat_map 이후 각 클래스 이름과 period 사이에 삽입한다.
-학습·추론 모두 이름 Token sigmoid 평균과 Visual Score의 Max Fusion을 사용한다.
-기존 Progressive Fine-Tuning, Query 증강 및 Detection Loss 설정은 유지한다.
+이 브랜치는 `acl-vistoken`의 `72bced2`를 기반으로 **serial ACL + Support Visual
+Memory**를 구현한다. 전체 Shot Support의 유효 GT마다 Swin-B → RoIAlign(7×7) →
+GAP로 256차원 Token을 생성하고, 클래스별 모든 객체 Token을 보존한다.
 
-Epoch 마지막 Training Batch와 전체 Validation의 네 지표만 기록한다.
-Prototype·Fusion·로깅 정의, 실행 방법, 검증 범위와 종료 처리의 한계는
+각 Encoder Text Attention에서만 Text를 Query로, Text와 해당 클래스의 고정
+Support Memory를 Key/Value로 사용한다. Bidirectional Image-Text Fusion과
+Detection은 기존 길이의 Text Feature를 사용하며, 기존 ACL의 Token 기반 분류와
+Loss를 따른다. 새 학습 parameter나 보조 Loss는 없다.
+
+학습 Epoch 마지막 Batch와 전체 Validation/Test에서 Support 객체 수와
+Support/Text Feature Norm을 기록한다. 구조, Mask, 캐시, 통계 정의와 검증 방법은
 [실험 설명](EXPERIMENT_VISUAL_TOKEN.md)을 참고한다.
 
 ## 지원 환경
@@ -30,7 +32,7 @@ RTX 5090 코드가 포함된 공식 PyTorch `cu128` wheel과 CUDA 12.8로 빌드
 ## 1. 설치
 
 ```bash
-git clone https://github.com/kjh0902/CDFSOD.git
+git clone --branch acl-vistoken-support-memory https://github.com/kjh0902/CDFSOD.git
 cd CDFSOD
 
 conda env create -f environment.yml

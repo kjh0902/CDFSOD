@@ -92,11 +92,11 @@ class SupportDatasetLifecycleTests(unittest.TestCase):
                     inputs=torch.full((1, 3, 64, 64), 2.), data_samples=[sample(
                         [item['bbox'] for item in instances],
                         [item['bbox_label'] for item in instances])])
-                first = model.support_prototypes()
-                second = model.support_prototypes()
-                torch.testing.assert_close(first, torch.full((2, 256), 2.))
-                torch.testing.assert_close(second, first)
-                self.assertFalse(first.requires_grad)
+                first = model.support_memory()
+                second = model.support_memory()
+                torch.testing.assert_close(first['tokens'], torch.full((2, 256), 2.))
+                torch.testing.assert_close(second['tokens'], first['tokens'])
+                self.assertFalse(first['tokens'].requires_grad)
                 self.assertEqual(model.backbone.calls, 2)
                 self.assertTrue(torch.equal(rng, torch.get_rng_state()))
                 registry.DATASETS.build.assert_called_once()
@@ -112,6 +112,27 @@ class SupportDatasetLifecycleTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'category order'):
                     model._get_support_loader()
             self.assertIsNone(getattr(model, '_support_loader', None))
+
+    def test_valid_objects_ignore_crowd_invalid_and_empty_images(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = self.config(folder)
+            path = Path(folder) / 'support.json'
+            annotation = json.loads(path.read_text())
+            annotation['images'].append(dict(id=12, file_name='empty.jpg', width=64, height=64))
+            base = dict(image_id=11, category_id=17, bbox=[8, 8, 32, 32], area=1024, iscrowd=0)
+            annotation['annotations'].extend([
+                dict(base, id=3),  # A second genuine object of class 0.
+                dict(base, id=4, ignore=True),
+                dict(base, id=5, bbox=[8, 8, 0, 32], area=0),
+                dict(base, id=6, iscrowd=1)])
+            path.write_text(json.dumps(annotation))
+            dataset = self.dataset_class()(**{k: v for k, v in cfg.items() if k != 'type'})
+            self.assertEqual(len(dataset), 2)
+            parsed = dataset.get_data_info(0)['instances']
+            self.assertEqual(len(parsed), 4)  # 3 GT + one ignored crowd, before PackDetInputs.
+            gt = [item for item in parsed if not item['ignore_flag']]
+            self.assertEqual([item['bbox_label'] for item in gt], [0, 1, 0])
+            self.assertEqual(dataset.get_data_info(1)['instances'], [])
 
 
 if __name__ == '__main__':

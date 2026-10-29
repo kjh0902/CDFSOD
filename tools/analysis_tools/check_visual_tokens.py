@@ -50,7 +50,7 @@ def main():
     load_checkpoint(model, args.checkpoint or cfg.load_from, map_location='cpu')
     classes = cfg.model.support_visual_cfg.class_names
     stats = VisualTokenStats(len(classes), device)
-    model._visual_stats = model.bbox_head._visual_stats = stats
+    model._visual_stats = stats
     model.train()
     train_data = model.data_preprocessor(batch(classes, device), training=True)
     losses = model.loss(**dict(batch_inputs=train_data['inputs'],
@@ -62,26 +62,27 @@ def main():
                for parameter in model.backbone.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters()
                if parameter.grad is not None)
-    assert stats.pending is None
     print('Real detection losses/backward OK:', sorted(losses))
     print('Training statistics:', stats.report(classes))
 
     model.zero_grad(set_to_none=True)
     model.eval()
     stats = VisualTokenStats(len(classes), device)
-    model._visual_stats = model.bbox_head._visual_stats = stats
+    model._visual_stats = stats
     with torch.no_grad():
         test_data = model.data_preprocessor(batch(classes, device), training=False)
         results = model.predict(test_data['inputs'], test_data['data_samples'])
-        assert stats.pending is None
-        prototypes = model.support_prototypes()
-        assert prototypes.shape == (len(classes), 256) and not prototypes.requires_grad
-        assert torch.isfinite(prototypes).all()
+        memory = model.support_memory()
+        assert memory['tokens'].shape == (int(memory['counts'].sum()), 256)
+        assert len(memory['counts']) == len(classes) and (memory['counts'] > 0).all()
+        assert not memory['tokens'].requires_grad
+        assert torch.equal(memory['class_ids'].bincount(minlength=len(classes)), memory['counts'])
+        assert torch.isfinite(memory['tokens']).all()
         assert torch.isfinite(results[0].pred_instances.scores).all()
         # Loading weights, even identical weights, invalidates the eval cache.
         model.load_state_dict(copy.deepcopy(model.state_dict()))
-        assert model._support_prototypes is None
-    print('Real inference, prototype dimensions and cache invalidation OK.')
+        assert model._support_memory is None
+    print('Real inference, object-memory dimensions and cache invalidation OK.')
     print('Validation statistics:', stats.report(classes))
 
 
