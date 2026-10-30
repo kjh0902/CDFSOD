@@ -124,7 +124,8 @@ def main():
         cfg.load_from = args.resume
 
     # Keep cleanup inside main(), while the runner and Python runtime are alive.
-    with distributed_runtime():
+    runner = None
+    with distributed_runtime(lambda: runner):
         runner_cls = Runner if 'runner_type' not in cfg else RUNNERS.get(cfg.runner_type)
         cfg, warn_only_setting = runner_randomness_config(cfg, runner_cls)
         # build the runner from config

@@ -134,7 +134,8 @@ def main():
         cfg.test_dataloader.dataset.pipeline = cfg.tta_pipeline
 
     # Match training: release process groups before interpreter teardown.
-    with distributed_runtime():
+    runner = None
+    with distributed_runtime(lambda: runner):
         runner_cls = Runner if 'runner_type' not in cfg else RUNNERS.get(cfg.runner_type)
         cfg, warn_only_setting = runner_randomness_config(cfg, runner_cls)
         # build the runner from config
