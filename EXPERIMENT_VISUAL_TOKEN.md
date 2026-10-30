@@ -5,6 +5,36 @@
 Decoder, DN, Query 증강, Detection Loss, Optimizer/Scheduler, 18개 Dataset/Shot
 설정 및 분산 프로세스 종료 처리를 유지한다.
 
+## ACL 2-Stage 학습 정책
+
+활성 Hook `BBoxHeadFirstHook6`에 ACL 원본의 LR=0 Freeze를 복원한다. 기존
+Optimizer/ReduceOnPlateau 설정과 Stage 전환 조건은 유지한다. `requires_grad`나
+모듈의 train/eval Mode를 바꾸지 않아 고정된 FE를 통한 Support Gradient가 흐른다.
+
+| Parameter Group | Stage 1 | Stage 2 전환 시 |
+|---|---|---|
+| 기존 FE 및 ACL 원본 Other | LR=0, Weight 갱신 없음 | 당시 Head LR로 Unfreeze |
+| encoder.support_layers (Cross-Attention 및 Gamma) | 설정된 LR로 학습 | 당시 Head LR로 계속 학습 |
+| Backbone / BERT | 기존 설정·Scheduler LR로 학습 | Scheduler LR 유지 |
+| Head 관련 (Decoder, Detection Head, Neck, text_feat_map, DN) | 기존 설정·Scheduler LR로 학습 | Scheduler LR 유지 |
+
+MMEngine의 기존 paramwise_cfg가 생성하는 파라미터별 Optimizer Group을 사용하고,
+Support를 FE/Other와 분리하여 `acl_group=support`로 식별한다. 그룹을 추가·재정렬하지
+않아 기존 Optimizer Checkpoint의 매핑을 유지한다. 서로 다른 정책의 파라미터를
+하나의 그룹으로 섞은 사용자 Optimizer는 명시적인 오류로 중단한다. ACL 원본의
+Other에는 FE 외에 query_embedding, memory_trans_fc/norm, level_embed 등도 포함된다.
+
+전환 조건은 첫 BERT Group의 현재 LR이 최초 LR의 1/2 이하인 경우다. 매 Epoch 시작에
+확인하며 한 번만 전환한다. Plateau patience는 기존 config의 Stage 1=3, Stage 2=8을
+따른다. 기본 LR 1e-4 설정에서는 Stage 1 FE=0, Support/Head=1e-4,
+Backbone/BERT=2e-5이며, 첫 0.5 감소 후 Stage 2 FE/Support/Head=5e-5,
+Backbone/BERT=1e-5가 된다. 이후에는 기존 Scheduler가 모든 그룹을 조정한다.
+
+Resume에서는 Optimizer에 저장된 initial_lr와 현재 BERT LR로 Stage를 복원하고,
+Backbone/BERT/Head의 복원된 LR을 초기화하지 않는다. Stage 2를 재동결하지 않으며
+Support도 계속 학습한다. Epoch 끝 LR 로그는 FE/Other와 Support를 별도로 표시한다.
+사용하지 않는 대체 Hook `StageWiseFreezeHook`의 동작은 유지한다.
+
 ## Support Local Memory와 재추출 시점
 
 Support는 해당 Shot 학습 annotation과 이미지에서만 추출한다. 기존 COCO
@@ -151,8 +181,18 @@ Support 재추출 비용도 포함한다.
 CUDA 전체 모델, 실제 Support 데이터 기반 학습·추론, GPU peak/처리량과 mAP는
 로컬에서 실행하지 않았다. Gloo 프로세스 종료 검증은 CUDA/NCCL 검증을 대체하지 않는다.
 
-재추출 방식 변경 후 로컬 전체 회귀 테스트: **64개 통과, 실패 0개, 건너뜀 0개**.
+Support 재추출 정책은 그대로 유지한다.
 매 Iteration의 현재 Weight 반영, Validation 시작 시 재추출 및 평가 동안 재사용,
 Best Checkpoint·Resume 반영, no_grad·혼합 submodule Mode 복원과 추출 실패 처리를
-검증했다. Cross-Attention·Gamma·클래스 Mapping·진단 통계 및 학습·평가 설정은
-기존 구현을 유지한다. CUDA 전체 모델 검증은 이 CPU 환경에서 수행하지 않았다.
+검증했다. Cross-Attention 구조·Gamma·클래스 Mapping·진단 통계 및 학습·평가
+설정 파일은 기존 구현을 유지하며, 활성 ACL Hook의 Stage 1 FE Freeze만 복원한다. CUDA 전체 모델 검증은 이 CPU 환경에서 수행하지 않았다.
+
+Stage 정책 테스트는 실제 MMEngine OptimWrapper/파라미터별 Group,
+ReduceOnPlateau Scheduler와 AdamW를 사용한다. LR=0의 FE Weight 불변과 Gradient
+유지, Support/Gamma·나머지 학습 모듈의 실제 갱신, 원본 ACL LR 정책과의 동등성,
+절반 LR 전환·patience, Stage별 Resume 및 실제 Detection Loss에서 고정 FE를
+통과하는 Support Gradient를 검사한다.
+
+ACL Stage 정책 복원 후 최종 전체 회귀 테스트: **71개 통과, 실패 0개, 건너뜀 0개**.
+Stage 1 FE Weight 불변·Support/Gamma 갱신, Stage 2 FE 갱신, 원본 ACL 전환·LR 정책,
+Stage별 Resume 및 기존 18개 설정/Support 재추출/Diagnostics 보존을 확인했다.

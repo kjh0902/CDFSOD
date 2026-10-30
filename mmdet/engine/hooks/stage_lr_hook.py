@@ -9,9 +9,12 @@ from mmengine.registry import HOOKS
 class BBoxHeadFirstHook6(Hook):
     """Hook for implementing two-stage training.
 
-    Stage 1: All components train at their configured learning rates.
-    Stage 2: Other components (including the Feature Enhancer) follow
-             the current head LR; remaining groups keep their scheduler LR.
+    Stage 1: Freeze the original Feature Enhancer/ACL other groups by LR=0.
+             Support cross-attention (including gamma), backbone, BERT and
+             head-related groups keep their configured/scheduler learning rates.
+    Stage 2: Original FE/other and support groups follow the current head LR.
+             Backbone, BERT and head-related groups keep their scheduler LR.
+             The original ACL trigger is BERT LR <= half its initial LR.
 
     Args:
         adjust_scheduler_patience (bool): Whether to adjust scheduler patience 
@@ -42,6 +45,7 @@ class BBoxHeadFirstHook6(Hook):
         self._lang_model_groups = []
         self._backbone_groups = []
         self._other_groups = []
+        self._support_groups = []
 
     def before_train(self, runner) -> None:
         """Identify parameter groups and set Stage 1 learning rates before training starts."""
@@ -52,17 +56,20 @@ class BBoxHeadFirstHook6(Hook):
         # 1. Identify parameter groups corresponding to different components in the model
         self._identify_param_groups(runner, model)
 
-        # 2. Save original learning rates for all groups
+        # Scheduler initial_lr survives optimizer resume, unlike current LR.
         optimizer = runner.optim_wrapper.optimizer
-        for i, param_group in enumerate(optimizer.param_groups):
-            self._original_lrs[i] = param_group['lr']
-        
-        # 3. Set learning rates for Stage 1
-        self._set_stage1_lr(runner)
-        
-        # 4. If patience adjustment is enabled, set initial Stage 1 patience
-        if self.adjust_scheduler_patience:
-            self._adjust_scheduler_patience(runner, self.patience_frozen)
+        self._original_lrs = {i: group.get('initial_lr', group['lr'])
+                              for i, group in enumerate(optimizer.param_groups)}
+        self._stage2_started = False
+        if self._should_start_stage2(runner):
+            # Resume after the ACL trigger without refreezing the FE or resetting
+            # backbone/BERT/head/support scheduler progress.
+            self._set_stage2_lr(runner)
+            self._stage2_started = True
+        else:
+            self._set_stage1_lr(runner)
+            if self.adjust_scheduler_patience:
+                self._adjust_scheduler_patience(runner, self.patience_frozen)
 
     def before_train_epoch(self, runner) -> None:
         """Enter Stage 2 when language model LR drops to half its original LR."""
@@ -83,30 +90,45 @@ class BBoxHeadFirstHook6(Hook):
         param_id_to_name = {id(p): n for n, p in model.named_parameters()}
         optimizer = runner.optim_wrapper.optimizer
 
+        groups = {'backbone': [], 'language_model': [], 'head': [],
+                  'other': [], 'support': []}
+
+        def category(name):
+            if name.startswith('encoder.support_layers.'):
+                return 'support'
+            if name.startswith('backbone'):
+                return 'backbone'
+            if name.startswith('language_model'):
+                return 'language_model'
+            if name.startswith(('bbox_head', 'text_feat_map', 'neck', 'decoder',
+                                'dn_query_generator')):
+                return 'head'
+            return 'other'
+
         for i, param_group in enumerate(optimizer.param_groups):
             if not param_group['params']:
                 continue
-            
-            # Determine the type of the entire group by the name of the first parameter in the group
-            first_param_id = id(param_group['params'][0])
-            param_name = param_id_to_name.get(first_param_id, '')
+            # MMEngine paramwise_cfg creates one optimizer group per parameter.
+            # Never silently freeze Support if a custom constructor mixes groups.
+            names = [param_id_to_name.get(id(p)) for p in param_group['params']]
+            if any(name is None for name in names):
+                raise ValueError('ACL optimizer contains a parameter outside the model.')
+            kinds = {category(name) for name in names}
+            if len(kinds) != 1:
+                raise ValueError('ACL requires separate optimizer groups for FE, Support, '
+                                 'backbone, BERT and head; use paramwise_cfg.')
+            kind = kinds.pop()
+            param_group['acl_group'] = kind
+            groups[kind].append(i)
 
-            if param_name.startswith('backbone'):
-                self._backbone_groups.append(i)
-            elif param_name.startswith('language_model'):
-                self._lang_model_groups.append(i)
-            elif (param_name.startswith('bbox_head') or
-                  param_name.startswith('text_feat_map') or
-                  param_name.startswith('neck') or
-                  param_name.startswith('decoder') or
-                  param_name.startswith('dn_query_generator')):
-                self._head_groups.append(i)
-            else:
-                self._other_groups.append(i)
-        
-        runner.logger.info(f'Identified param groups: Backbone={self._backbone_groups}, '
-                        f'LanguageModel={self._lang_model_groups}, Head={self._head_groups}, '
-                        f'Other={self._other_groups}')
+        self._backbone_groups = groups['backbone']
+        self._lang_model_groups = groups['language_model']
+        self._head_groups = groups['head']
+        self._other_groups = groups['other']
+        self._support_groups = groups['support']
+        runner.logger.info(f'Identified ACL param groups: Backbone={self._backbone_groups}, '
+                           f'LanguageModel={self._lang_model_groups}, Head={self._head_groups}, '
+                           f'FE/Other={self._other_groups}, Support={self._support_groups}')
 
     def _should_start_stage2(self, runner) -> bool:
         """Determine if Stage 2 should start: check if language model's lr has dropped to half of original lr."""
@@ -119,10 +141,10 @@ class BBoxHeadFirstHook6(Hook):
         original_lr = self._original_lrs.get(group_idx, 0.0)
         
         # Start Stage 2 when current_lr <= original_lr * 0.5
-        return current_lr <= original_lr * 0.5
+        return original_lr > 0 and current_lr <= original_lr * 0.5
 
     def _set_stage2_lr(self, runner):
-        """Stage 2: Update group learning rates while all components remain trainable."""
+        """ACL Stage 2: unfreeze FE/other at head LR; keep Support learning."""
         runner.logger.info('Setting LRs for Stage 2...')
         optimizer = runner.optim_wrapper.optimizer
 
@@ -146,9 +168,9 @@ class BBoxHeadFirstHook6(Hook):
             runner.logger.warning('Bbox head group not found for Stage 2 LR setting!')
 
         # Other components follow bbox head's learning rate
-        for group_idx in self._other_groups:
+        for group_idx in self._other_groups + self._support_groups:
             optimizer.param_groups[group_idx]['lr'] = current_head_lr
-        runner.logger.info(f'  - Other groups LR set to match BboxHead: {current_head_lr:.8f}')
+        runner.logger.info(f'  - FE/Other and Support groups LR set to match BboxHead: {current_head_lr:.8f}')
 
         # 3. If patience adjustment is enabled, set Stage 2 patience
         if self.adjust_scheduler_patience:
@@ -189,12 +211,14 @@ class BBoxHeadFirstHook6(Hook):
 
 
     def _set_stage1_lr(self, runner):
-        """Stage 1: Train every group at its configured learning rate."""
-        runner.logger.info('Setting LRs for Stage 1...')
+        """Original ACL LR freeze, with Support excluded from the frozen group."""
         optimizer = runner.optim_wrapper.optimizer
-        for group_idx, base_lr in self._original_lrs.items():
-            optimizer.param_groups[group_idx]['lr'] = base_lr
-        runner.logger.info('Stage 1: all parameter groups retain their configured LR.')
+        # Preserve configured rates on fresh starts and restored scheduler rates
+        # on resume for all trainable groups. requires_grad stays unchanged.
+        for group_idx in self._other_groups:
+            optimizer.param_groups[group_idx]['lr'] = 0.0
+        runner.logger.info('Stage 1: FE/Other LR=0; Support, Backbone, BERT and '
+                           'Head groups keep configured/restored learning rates.')
 
     def after_train_epoch(self, runner) -> None:
         """Print current learning rate status once after each epoch."""
@@ -205,7 +229,8 @@ class BBoxHeadFirstHook6(Hook):
             'Head': self._head_groups,
             'Language Model': self._lang_model_groups,
             'Backbone': self._backbone_groups,
-            'Other': self._other_groups
+            'FE/Other': self._other_groups,
+            'Support': self._support_groups
         }
 
         for name, indices in group_map.items():
@@ -230,7 +255,7 @@ class StageWiseFreezeHook(Hook):
         stage1_epochs (int): Number of epochs for Stage 1 training.
 
     Note:
-        This hook follows the same parameter grouping logic as BBoxHeadFirstHook6:
+        This alternative hook retains the legacy parameter grouping:
         - backbone: parameters starting with 'backbone'
         - language_model: parameters starting with 'language_model'
         - head: parameters starting with 'bbox_head', 'text_feat_map', 'neck',
@@ -238,7 +263,9 @@ class StageWiseFreezeHook(Hook):
         - other: all other parameters
 
         The legacy class name is retained for config compatibility.
-        Neither this hook nor BBoxHeadFirstHook6 freezes modules.
+        This alternative hook keeps all modules trainable. The active
+        BBoxHeadFirstHook6 separately implements the restored ACL LR freeze
+        with an explicit trainable Support group.
     """
 
     def __init__(self, stage1_epochs: int = 50):

@@ -11,6 +11,9 @@ Resume은 재개된 Weight를 사용하며, Support 디스크 캐시는 사용�
 → Text-only Self-Attention/FFN → Image Deformable Self-Attention/FFN 순서다.
 새 Attention과 Channel-wise Gamma(`1e-4` 초기값)를 학습하며, 기존 순차 ACL
 Decoder와 Detection Loss는 유지한다. HED는 기준 브랜치와 같이 사용하지 않는다.
+ACL 2-Stage 정책에 따라 Stage 1에서는 기존 FE의 LR을 0으로 두고 새 Support
+Cross-Attention과 Gamma는 학습한다. BERT LR이 최초의 절반 이하가 되면 Stage 2로
+전환하여 FE를 현재 Head LR로 Unfreeze하며 Support도 계속 학습한다.
 
 기존 Feature Norm 로그에 FE Layer별 Attention Entropy, Residual Contribution,
 Gamma 통계만 추가한다. 구조, 재추출 시점, 통계 정의와 검증 방법은

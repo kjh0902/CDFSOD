@@ -125,11 +125,18 @@ class StatisticsTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_serial_layers_and_progressive_hooks_unchanged_from_start(self):
-        for rel in ('mmdet/engine/hooks/stage_lr_hook.py',
-                    'mmdet/models/layers/transformer/dino_layers.py'):
+    def test_serial_layers_and_unused_stagewise_hook_unchanged_from_start(self):
+        for rel in ('mmdet/models/layers/transformer/dino_layers.py',):
             original = subprocess.check_output(['git', 'show', '449e69a:' + rel], cwd=ROOT, encoding='utf8')
             self.assertEqual(source(rel), original)
+        rel = 'mmdet/engine/hooks/stage_lr_hook.py'
+        original = subprocess.check_output(['git', 'show', '449e69a:' + rel], cwd=ROOT, encoding='utf8')
+        current_class = node(source(rel), 'StageWiseFreezeHook')
+        original_class = node(original, 'StageWiseFreezeHook')
+        # Only the description of the now-different active ACL hook changes.
+        current_class.body = current_class.body[1:]
+        original_class.body = original_class.body[1:]
+        self.assertEqual(ast.dump(current_class), ast.dump(original_class))
 
     def test_decoder_layers_and_all_18_configs_unchanged_from_base(self):
         rel = 'mmdet/models/layers/transformer/grounding_dino_layers.py'
