@@ -165,115 +165,113 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(all(t.grad_fn is None for t in (stats.layer_sums, stats.layer_counts, stats.gamma)))
 
 
-class CacheTests(unittest.TestCase):
-    def metadata(self):
-        return dict(version=1, class_names=['a', 'b'], source_checkpoint='initial.pth',
-                    source_checkpoint_sha256='abc', annotation_sha256='def',
-                    preprocessor={}, extraction={}, dataset={})
-
-    def test_disk_reuse_across_weights_modes_and_reload(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'support_local_memory.pt'
-            model = SupportModel()
-            memory = model.prepare_support_cache(path, self.metadata())
-            saved = memory['tokens'].clone()
-            self.assertEqual(model.backbone.calls, 2)
-            model.backbone.weight.data.fill_(9.)
-            model.eval().train()
-            torch.testing.assert_close(model.support_memory()['tokens'], saved, rtol=0, atol=0)
-            other = SupportModel()
-            other.backbone.weight.data.fill_(12.)
-            restored = other.prepare_support_cache(path, self.metadata(), require_existing=True)
-            self.assertEqual(other.backbone.calls, 0)
-            torch.testing.assert_close(restored['tokens'], saved, rtol=0, atol=0)
-            other.load_state_dict(other.state_dict())
-            other.prepare_support_cache(path, self.metadata(), require_existing=True)
-            self.assertEqual(other.backbone.calls, 0)
-            self.assertFalse(other.support_memory()['tokens'].requires_grad)
-            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
-
-    def test_missing_mismatch_and_invalid_cache(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'support_local_memory.pt'
-            model = SupportModel()
-            with self.assertRaisesRegex(FileNotFoundError, 'original Support cache'):
-                model.prepare_support_cache(path, self.metadata(), require_existing=True)
-            model.prepare_support_cache(path, self.metadata())
-            for key in ('class_names', 'source_checkpoint_sha256', 'annotation_sha256', 'preprocessor'):
-                altered = self.metadata()
-                altered[key] = ['different']
-                with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'metadata mismatch'):
-                    model.prepare_support_cache(path, altered)
-            artifact = torch.load(path, weights_only=True)
-            artifact['memory']['tokens'][0, 0] = float('nan')
-            torch.save(artifact, path)
-            with self.assertRaisesRegex(ValueError, 'Invalid local descriptor cache'):
-                model.prepare_support_cache(path, self.metadata())
-
-    @unittest.skipUnless(importlib.util.find_spec('mmengine'), 'MMEngine required')
-    def test_metadata_hashes_annotation_weights_and_preprocessing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'support.json').write_text('{}', encoding='utf-8')
-            (root / 'initial.pth').write_bytes(b'initial weights')
-            model = SupportModel()
-            model.support_visual_cfg['dataset'] = dict(data_root=tmp, ann_file='support.json',
-                                                       pipeline=[dict(type='FixScaleResize')])
-            model.data_preprocessor = NS(mean=torch.ones(3), std=torch.ones(3),
-                _channel_conversion=True, pad_size_divisor=1, pad_value=0)
-            initial = model.support_cache_metadata(root / 'initial.pth')
-            # Resume/Test can validate the source identity without the initial weight file.
-            restored = model.support_cache_metadata(None, initial)
-            self.assertEqual(initial, restored)
-            model.data_preprocessor.mean[0] = 2
-            self.assertNotEqual(initial, model.support_cache_metadata(None, initial))
-            model.data_preprocessor.mean[0] = 1
-            (root / 'support.json').write_text('{"modified": true}', encoding='utf-8')
-            self.assertNotEqual(initial, model.support_cache_metadata(None, initial))
-            (root / 'support.json').write_text('{}', encoding='utf-8')
-            (root / 'initial.pth').write_bytes(b'other weights')
-            self.assertNotEqual(initial, model.support_cache_metadata(root / 'initial.pth'))
-
-    def test_hook_training_resume_test_and_logging_disabled_use_same_cache(self):
+class SupportRefreshTests(unittest.TestCase):
+    def hook(self, enabled=False):
         namespace = dict(torch=torch, dist=torch.distributed, Path=Path, json=json,
                          Hook=object, is_model_wrapper=lambda m: False,
                          VisualTokenStats=stats_module.VisualTokenStats)
         cls = node(source('mmdet/engine/hooks/visual_token_hook.py'), 'VisualTokenHook')
         cls.decorator_list = []
         execute([cls], namespace)
-        Hook = namespace['VisualTokenHook']
-        with tempfile.TemporaryDirectory() as tmp:
-            def runner():
-                model = SupportModel()
-                model.support_cache_metadata = Mock(return_value=self.metadata())
-                return NS(model=model, cfg=dict(load_from='initial.pth'), work_dir=tmp,
-                          _resume=False)
-            first = runner()
-            hook = Hook('toy', 1, enabled=False)
-            hook.before_train(first)
-            saved = first.model.support_memory()['tokens'].clone()
-            checkpoint = {}
-            hook.before_save_checkpoint(first, checkpoint)
-            self.assertEqual(checkpoint['meta']['support_local_memory'], self.metadata())
-            for phase in ('resume', 'test'):
-                other = runner()
-                other.cfg['load_from'] = 'finetuned.pth'
-                other._resume = phase == 'resume'
-                hook = Hook('toy', 1, enabled=False)
-                hook.after_load_checkpoint(other, checkpoint)
-                if phase == 'resume':
-                    hook.before_train(other)
-                else:
-                    hook.before_test_epoch(other)
-                self.assertEqual(other.model.backbone.calls, 0)
-                torch.testing.assert_close(other.model.support_memory()['tokens'], saved, rtol=0, atol=0)
-                other.model.eval().train()
-                self.assertEqual(other.model.backbone.calls, 0)
-            Path(tmp, 'support_local_memory.pt').unlink()
-            other = runner()
-            hook = Hook('toy', 1, enabled=False)
-            with self.assertRaisesRegex(RuntimeError, 'original Support cache'):
-                hook.before_test_epoch(other)
+        return namespace['VisualTokenHook']('toy', 1, enabled=enabled)
+
+    def test_every_iteration_extracts_entire_set_with_current_weights_without_grad(self):
+        model = SupportModel().train()
+        # Preserve a deliberately mixed mode, including on extraction failure.
+        model.backbone.dropout.eval()
+        modes = [m.training for m in model.backbone.modules()]
+        observed = []
+        handle = model.backbone.register_forward_pre_hook(lambda module, args:
+            observed.append((torch.is_grad_enabled(), [m.training for m in module.modules()])))
+        expected = torch.tensor([2., 2., 8., 2., 8.]).repeat_interleave(49)
+        rng = torch.get_rng_state().clone()
+        optimizer = torch.optim.SGD(model.backbone.parameters(), lr=.1)
+        previous = None
+        for iteration in range(3):
+            weight = model.backbone.weight.detach().clone()
+            before = model.backbone.calls
+            memory = model.support_memory()
+            self.assertEqual(model.backbone.calls - before, len(model._support_loader))
+            torch.testing.assert_close(memory['tokens'][:, 0], expected * weight)
+            self.assertEqual(memory['tokens'].shape, (245, 256))
+            self.assertEqual(memory['counts'].tolist(), [147, 98])
+            self.assertFalse(memory['tokens'].requires_grad)
+            self.assertIsNone(memory['tokens'].grad_fn)
+            self.assertIsNone(model.backbone.weight.grad)
+            self.assertEqual(modes, [m.training for m in model.backbone.modules()])
+            if previous is not None:
+                self.assertFalse(torch.equal(previous, memory['tokens']))
+            previous = memory['tokens'].clone()
+            # Query backbone stays trainable; the next support extraction sees its update.
+            query = model.backbone(torch.ones(1, 3, 64, 64))[0]
+            query.mean().backward()
+            self.assertGreater(model.backbone.weight.grad.abs().item(), 0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        handle.remove()
+        extraction_calls = [entry for i, entry in enumerate(observed) if i % 3 != 2]
+        self.assertEqual(len(extraction_calls), 6)
+        self.assertTrue(all(not grad and not any(states) for grad, states in extraction_calls))
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
+    def test_validation_epoch_eager_refresh_then_reuse_with_logging_disabled(self):
+        model = SupportModel().train()
+        runner = NS(model=model)
+        hook = self.hook()  # descriptor lifecycle must not depend on logging
+        for weight in (1., 2.):
+            model.train()
+            model.backbone.weight.data.fill_(weight)
+            before = model.backbone.calls
+            hook.before_val_epoch(runner)  # MMEngine invokes this before model.eval()
+            self.assertEqual(model.backbone.calls - before, 2)
+            self.assertTrue(model.training)
+            fresh = model._support_memory
+            model.eval()
+            for _ in range(3):
+                self.assertIs(model.support_memory(), fresh)
+            self.assertEqual(model.backbone.calls - before, 2)
+            torch.testing.assert_close(fresh['tokens'][0], torch.full((256,), 2. * weight))
+            self.assertFalse(fresh['tokens'].requires_grad)
+
+    def test_best_checkpoint_test_and_resume_use_loaded_backbone(self):
+        model = SupportModel().eval()
+        stale = model.support_memory()['tokens'].clone()
+        best = copy.deepcopy(model.state_dict())
+        best['backbone.weight'].fill_(3.)
+        model.load_state_dict(best)
+        self.assertIsNone(model._support_memory)
+        before = model.backbone.calls
+        self.hook().before_test_epoch(NS(model=model))
+        self.assertEqual(model.backbone.calls - before, 2)
+        model.eval()
+        memory = model.support_memory()
+        torch.testing.assert_close(memory['tokens'], stale * 3.)
+        self.assertIs(model.support_memory(), memory)
+        self.assertEqual(model.backbone.calls - before, 2)
+        # Resume starts with a different loaded weight and refreshes every iteration.
+        resumed = copy.deepcopy(best)
+        resumed['backbone.weight'].fill_(4.)
+        model.load_state_dict(resumed)
+        model.train()
+        self.assertIsNone(model._support_memory)
+        before = model.backbone.calls
+        for weight in (4., 5.):
+            model.backbone.weight.data.fill_(weight)
+            torch.testing.assert_close(model.support_memory()['tokens'], stale * weight)
+            self.assertIsNone(getattr(model, '_support_memory', None))
+        self.assertEqual(model.backbone.calls - before, 4)
+
+    def test_failed_refresh_discards_stale_memory_and_restores_modes(self):
+        model = SupportModel().eval()
+        model.support_memory()
+        model.backbone.train()  # retain a stale snapshot and deliberately mixed modes
+        model.backbone.dropout.eval()
+        modes = [m.training for m in model.backbone.modules()]
+        with patch.object(model.backbone, 'forward', side_effect=RuntimeError('extraction failed')):
+            with self.assertRaisesRegex(RuntimeError, 'extraction failed'):
+                self.hook().before_val_epoch(NS(model=model))
+        self.assertIsNone(model._support_memory)
+        self.assertEqual(modes, [m.training for m in model.backbone.modules()])
 
     def test_ddp_writer_reduces_only_sums_counts_and_skips_other_ranks(self):
         namespace = dict(torch=torch, dist=torch.distributed, Path=Path, json=json,

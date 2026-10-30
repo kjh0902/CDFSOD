@@ -3,7 +3,9 @@
 이 브랜치는 `acl-vistoken-support-memory`의 `b8849b3`를 기반으로
 **serial ACL + Support Local Descriptor Cross-Attention**을 구현한다.
 전체 Shot Support의 유효 GT마다 Swin-B → RoIAlign(7×7)로 49개의 256차원
-Local Descriptor를 만들고, 최초 추출 결과를 학습·검증·테스트에서 고정 재사용한다.
+Local Descriptor를 만든다. Training은 매 Iteration 현재 Backbone으로 재추출하고,
+Validation/Test는 평가 시작 시 재추출하여 해당 평가 동안 재사용한다.
+Resume은 재개된 Weight를 사용하며, Support 디스크 캐시는 사용하지 않는다.
 
 모든 FE Layer는 Image–Text Fusion → 클래스별 Support-to-Text Cross-Attention
 → Text-only Self-Attention/FFN → Image Deformable Self-Attention/FFN 순서다.
@@ -11,7 +13,7 @@ Local Descriptor를 만들고, 최초 추출 결과를 학습·검증·테스트
 Decoder와 Detection Loss는 유지한다. HED는 기준 브랜치와 같이 사용하지 않는다.
 
 기존 Feature Norm 로그에 FE Layer별 Attention Entropy, Residual Contribution,
-Gamma 통계만 추가한다. 구조, 캐시 보존, 통계 정의와 검증 방법은
+Gamma 통계만 추가한다. 구조, 재추출 시점, 통계 정의와 검증 방법은
 [실험 설명](EXPERIMENT_VISUAL_TOKEN.md)을 참고한다.
 
 ## 지원 환경

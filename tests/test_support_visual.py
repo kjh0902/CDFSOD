@@ -77,20 +77,27 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(result['tokens'].shape, (5 * shot * 49, 256))
             self.assertEqual(result['counts'].tolist(), [3 * shot * 49, 2 * shot * 49])
 
-    def test_fixed_cache_modes_weights_and_state_dict(self):
+    def test_iteration_refresh_eval_reuse_and_weight_reload(self):
         model = SupportModel().train()
         first = model.support_memory()
         with torch.no_grad():
             model.backbone.weight.fill_(2.)
-        self.assertIs(first, model.support_memory())
+        second = model.support_memory()
+        self.assertIsNot(first, second)
+        torch.testing.assert_close(second['tokens'], first['tokens'] * 2)
+        self.assertEqual(model.backbone.calls, 4)
+        self.assertIsNone(getattr(model, '_support_memory', None))
         model.eval()
-        self.assertIs(first, model.support_memory())
-        model.train()
-        self.assertIs(first, model.support_memory())
-        self.assertEqual(model.backbone.calls, 2)
+        evaluated = model.support_memory()
+        self.assertIs(evaluated, model.support_memory())
+        self.assertEqual(model.backbone.calls, 6)
         state = copy.deepcopy(model.state_dict())
         self.assertFalse(any('support' in key or 'stats' in key for key in state))
         model.load_state_dict(state)
+        self.assertIsNone(model._support_memory)
+        model.support_memory()
+        self.assertEqual(model.backbone.calls, 8)
+        model.train()
         self.assertIsNone(model._support_memory)
 
     def test_missing_class_invalid_label_boxes_and_mode_restoration(self):

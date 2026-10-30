@@ -88,7 +88,7 @@ class StatisticsTests(unittest.TestCase):
         execute([cls], env)
         model = torch.nn.Linear(1, 1)
         model.visual_enabled = True
-        model.clear_support_cache = Mock()
+        model.refresh_support_memory = Mock()
         model.bbox_head = NS(num_classes=2)
         model.support_visual_cfg = dict(class_names=('a', 'b'))
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,9 +103,8 @@ class StatisticsTests(unittest.TestCase):
             self.assertIsNotNone(hook.stats)
             hook.after_train_iter(runner, 2)
             self.assertIsNone(model._visual_stats)
-            hook._prepare_cache = Mock()
             hook.before_val_epoch(runner)
-            model.clear_support_cache.assert_not_called()
+            model.refresh_support_memory.assert_called_once()
             hook.before_val_iter(runner, 0, dict(data_samples=[0, 1]))
             self.assertEqual(hook.stats.valid, [True, True])
             self.assertTrue(hook.stats.capture_support)

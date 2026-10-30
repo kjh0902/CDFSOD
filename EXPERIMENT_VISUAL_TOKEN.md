@@ -5,7 +5,7 @@
 Decoder, DN, Query 증강, Detection Loss, Optimizer/Scheduler, 18개 Dataset/Shot
 설정 및 분산 프로세스 종료 처리를 유지한다.
 
-## 고정 Support Local Memory
+## Support Local Memory와 재추출 시점
 
 Support는 해당 Shot 학습 annotation과 이미지에서만 추출한다. 기존 COCO
 invalid/ignore/crowd 처리를 유지하고 평가 GT는 사용하지 않는다.
@@ -27,29 +27,28 @@ Selection, Aggregation, Shot별 자르기·반복은 없다.
 객체 수가 이미지 수/Shot과 다를 수 있다. 각 클래스에 유효 GT가 하나 이상 있어야
 하며, 잘못된 Label·Box·클래스 순서는 오류로 처리한다.
 
-`VisualTokenHook.before_train`은 Pretrained Weight 로딩 후, 최초 Optimizer Step과
-Query Forward 전에 한 번 추출한다. `no_grad`, Backbone 임시 eval과 submodule mode
-복원, 독립 DataLoader RNG를 유지한다. Query Backbone은 기존대로 학습한다.
-학습/eval 전환과 Backbone 갱신은 Memory를 변경하지 않는다.
+Training에서는 `support_memory()`가 매 Iteration/모델 Loss Forward마다 현재
+Backbone Weight로 **전체 Support**를 다시 추출한다. 학습 중 descriptor를 캐시하지
+않는다. 추출한 Memory는 그 Forward의 모든 FE Layer에서 동일하게 사용하며,
+Stop-gradient를 유지한다. `no_grad`, Backbone 임시 eval, 모든 submodule의 원래
+mode 복원 및 독립 DataLoader RNG는 그대로다. Query Backbone은 정상적으로 학습한다.
 
-기본 캐시는 `<work_dir>/support_local_memory.pt`이다. `support_visual_cfg.memory_path`
-설정으로 위치를 바꿀 수 있다. 원본 추출 가중치·Support annotation의 SHA256,
-클래스 순서, Support dataset/pipeline, 정규화·padding·RoIAlign 정보를 저장한다.
-로컬 가중치는 chunk 단위로 해싱한다. 파일은 임시 파일에서 원자적으로 교체한다.
-DDP에서는 rank 0만 추출·저장하고 각 rank가 같은 파일을 읽는다. 따라서 캐시는
-모든 rank에서 접근 가능한 위치에 있어야 한다.
+Validation은 `VisualTokenHook.before_val_epoch`, Test는 `before_test_epoch`에서
+현재 로드된 Weight로 한 번 재추출하고 해당 평가의 모든 Batch가 재사용한다.
+각 rank가 전체 Support를 독립적으로 추출한다. 로깅을 꺼도 재추출은 수행한다.
+MMEngine은 이 Hook 이후에 model.eval()을 호출하므로 eval 전환은 방금 생성한
+평가 Memory를 유지한다. 다시 train()으로 전환하거나 Weight를 로드하면 평가
+Memory를 무효화한다. 다음 Validation Epoch에서는 반드시 새로 추출한다.
 
-Checkpoint의 `meta.support_local_memory`에 추출 provenance를 저장한다. Resume과
-별도 Test는 원래 캐시를 요구하며 누락·메타데이터 불일치·잘못된 Tensor는 오류다.
-새 Checkpoint의 provenance가 있으면 최초 Pretrained 파일이 없어도 캐시를 검증할
-수 있다. **실험 Checkpoint를 옮길 때 캐시도 함께 보존해야 한다.**
-이미지 파일 자체의 내용 hash는 저장하지 않으므로 캐시를 만든 뒤 Support 이미지를
-수정하지 않는다. 다른 실험에는 새 work_dir 또는 별도의 memory_path를 사용한다.
+Best Checkpoint를 로드한 뒤 Test 평가 시작 Hook이 해당 Backbone으로 재추출한다.
+Resume도 재개된 Weight를 로드한 뒤 첫 Training Forward부터 매번 재추출한다.
+Memory는 state_dict의 parameter/buffer나 Checkpoint metadata에 저장하지 않으며,
+디스크 파일의 저장·로딩·hash 검증·provenance 관리는 사용하지 않는다. 이전 실험의
+Support 디스크 캐시가 남아 있어도 읽지 않는다.
 
-Memory는 state_dict의 학습 parameter/buffer에 넣지 않는다. 모델 Weight를 다시
-로드하면 메모리 내 캐시는 해제되며, Runner Hook이 디스크 캐시를 다시 읽는다.
-Runner 없이 직접 모델을 사용하는 경우 첫 Forward 전에
-`support_cache_metadata`와 `prepare_support_cache`를 호출한다. 테스트 도구가 예시다.
+Runner 없이 직접 predict하는 경우 eval() 후 `refresh_support_memory()`로 평가
+시작을 명시할 수 있다. 준비된 평가 Memory가 없으면 최초 predict에서 한 번
+추출한다. `clear_support_cache()`로 메모리 내 평가 결과를 해제할 수 있다.
 
 ## Feature Enhancer
 
@@ -60,7 +59,7 @@ Runner 없이 직접 모델을 사용하는 경우 첫 Forward 전에
 3. 원래 Text-only Self-Attention + FFN
 4. 기존 Image Deformable Self-Attention + FFN
 
-Q는 Fusion 직후 Text, K/V는 해당 클래스의 고정 Local Descriptor다.
+Q는 Fusion 직후 Text, K/V는 해당 클래스의 Local Descriptor다. 각 Forward 안에서는 변경하지 않는다.
 클래스 이름 Token과 그 period만 같은 클래스 Memory를 볼 수 있고 CLS/SEP/Padding은
 Support residual을 받지 않는다. 여러 Batch의 같은 클래스 Query를 묶어 Attention을
 계산한다. Query끼리 Attention하지 않으므로 Dense Class-wise Mask와 수학적으로
@@ -86,7 +85,7 @@ Shape를 유지하며, 기존 Pretrained 로딩에서 새 parameter만 누락될
 
 `visual_token_stats.jsonl`과 기존 text_norm, support_token_norm,
 enhanced_text_norm을 유지한다. support_token_count는 이제 Local Descriptor 수다.
-기존 Norm은 학습 Epoch 마지막 Batch 및 평가 전체 dataset을 집계한다. 고정 Support
+기존 Norm은 학습 Epoch 마지막 Batch 및 평가 전체 dataset을 집계한다. 같은 평가 동안의 Support
 Norm은 한 번 계산한 O(classes) 합계만 재사용한다.
 
 새 `support_cross_attention[layer_id]` 항목은 다음과 같다. Layer ID는 0부터 시작한다.
@@ -115,7 +114,7 @@ Support 수는 rank 0 snapshot을 쓴다. Attention/Feature Tensor를 파일로 
 
 ## 실행 및 검증
 
-기존 실행 명령을 사용한다. 학습과 뒤이은 Test는 같은 work_dir의 캐시를 공유한다.
+기존 실행 명령을 사용한다. 별도 Support 디스크 캐시 없이 실행한다.
 
 ```bash
 bash run_cdfsod.sh --dataset NEU-DET --shot 1
@@ -127,32 +126,33 @@ CPU 검증은 실제 torchvision RoIAlign, PyTorch Attention, repository Encoder
 Hungarian 비용·assignment를 사용한다. BERT/Backbone 및 Image Deformable Attention은
 소형 fixture로 대체한다. 전체 18개 config와 기존 Decoder·Loss·학습 Hook의 보존을
 검사한다. 신규 테스트는 Dense Mask와 분할 Attention의 출력/Gradient 동등성,
-Gamma=0, 새 parameter의 Detection Loss Gradient와 Optimizer 갱신, 캐시 재사용·
-Resume/Test, Entropy 기준값, 통계 샘플링·DDP 합산과 로그 크기를 포함한다.
+Gamma=0, 새 parameter의 Detection Loss Gradient와 Optimizer 갱신, Iteration별 재추출·평가 중 재사용·
+Resume/Test 재추출, Entropy 기준값, 통계 샘플링·DDP 합산과 로그 크기를 포함한다.
 
 실제 CUDA 전체 모델은 MMCV CUDA ops, BERT, Pretrained Weight와 실제 Support
 데이터가 있는 환경에서 다음 명령으로 FP32/AMP를 각각 검사한다.
 
 ```bash
 PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python tools/analysis_tools/check_visual_tokens.py \
-  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
-  --memory-path exp_cdfsod_results/NEU-DET/1shot/support_local_memory.pt --profile
+  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py --profile
 # 같은 명령에 --amp를 추가하여 AMP도 확인한다.
 ```
 
-학습된 Checkpoint 검사에는 `--checkpoint <path>`를 추가하며 기존 캐시가 필수다.
-이 도구는 합성 Query의 실제 Detection Loss/Backward와 predict, Memory 재사용,
+학습된 Checkpoint 검사에는 `--checkpoint <path>`를 추가한다.
+이 도구는 합성 Query의 실제 Detection Loss/Backward와 predict, 평가 Memory 재사용과 Checkpoint 재추출,
 projection/Gamma Gradient를 검사한다. `--profile`은 동일 모델에서 Support on/off의
 Forward+Backward 시간과 CUDA peak allocated/increment MiB를 보고한다. Warmup 1회 후
 기본 3회를 측정하며 Optimizer Step이나 Weight 저장은 하지 않는다. 프로파일의 off도
-같은 모델과 캐시를 유지하므로 peak increment로 활성화 비용을 함께 확인한다.
+같은 모델을 사용하며, Support on의 시간과 메모리에는 매 Training Forward의 전체
+Support 재추출 비용도 포함한다.
 
 로컬 검증 환경은 Windows / Python 3.13 / PyTorch 2.7.1+cpu / torchvision 0.22.1+cpu,
 테스트 전용 MMEngine 0.10.7 / mmcv-lite 2.2.0 / pycocotools 2.0.11이다.
 CUDA 전체 모델, 실제 Support 데이터 기반 학습·추론, GPU peak/처리량과 mAP는
 로컬에서 실행하지 않았다. Gloo 프로세스 종료 검증은 CUDA/NCCL 검증을 대체하지 않는다.
 
-최종 로컬 결과: **64개 테스트 통과, 실패 0개, 건너뜀 0개**.
-실행은 `python -B -m unittest discover -s tests -v`이며, CPU FP32·bfloat16
-Attention/Backward와 Gloo 및 DataLoader worker 종료 테스트를 포함한다.
-테스트 전용 의존성은 별도 폴더를 사용했으며 학습 환경 의존성은 변경하지 않았다.
+재추출 방식 변경 후 로컬 전체 회귀 테스트: **64개 통과, 실패 0개, 건너뜀 0개**.
+매 Iteration의 현재 Weight 반영, Validation 시작 시 재추출 및 평가 동안 재사용,
+Best Checkpoint·Resume 반영, no_grad·혼합 submodule Mode 복원과 추출 실패 처리를
+검증했다. Cross-Attention·Gamma·클래스 Mapping·진단 통계 및 학습·평가 설정은
+기존 구현을 유지한다. CUDA 전체 모델 검증은 이 CPU 환경에서 수행하지 않았다.

@@ -97,7 +97,7 @@ class SupportDatasetLifecycleTests(unittest.TestCase):
                 torch.testing.assert_close(first['tokens'], torch.full((98, 256), 2.))
                 torch.testing.assert_close(second['tokens'], first['tokens'])
                 self.assertFalse(first['tokens'].requires_grad)
-                self.assertEqual(model.backbone.calls, 1)
+                self.assertEqual(model.backbone.calls, 2)
                 self.assertTrue(torch.equal(rng, torch.get_rng_state()))
                 registry.DATASETS.build.assert_called_once()
                 read.assert_called_once()

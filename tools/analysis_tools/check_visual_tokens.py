@@ -78,8 +78,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config')
     parser.add_argument('--checkpoint', default=None)
-    parser.add_argument('--memory-path', required=True,
-                        help='Experiment support_local_memory.pt; kept with checkpoints.')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--profile', action='store_true')
@@ -94,12 +92,7 @@ def main():
     device = torch.device(args.device)
     model = MODELS.build(cfg.model).to(device)
     model.init_weights()
-    checkpoint = load_checkpoint(model, args.checkpoint or cfg.load_from, map_location='cpu')
-    source_identity = checkpoint.get('meta', {}).get('support_local_memory')
-    metadata = model.support_cache_metadata(cfg.load_from, source_identity)
-    model.prepare_support_cache(args.memory_path, metadata,
-                                require_existing=args.checkpoint is not None)
-    original_memory = model.support_memory()
+    load_checkpoint(model, args.checkpoint or cfg.load_from, map_location='cpu')
     classes = cfg.model.support_visual_cfg.class_names
     stats = VisualTokenStats(len(classes), device, len(model.encoder.support_layers))
     model._visual_stats = stats
@@ -127,16 +120,18 @@ def main():
     if device.type == 'cuda':
         print('Training peak allocated MiB:', torch.cuda.max_memory_allocated(device) / 2**20)
 
+    assert model._support_memory is None  # training never retains descriptors
     del losses, train_data
     model.zero_grad(set_to_none=True)
     model.eval()
+    evaluation_memory = model.refresh_support_memory()
     stats = VisualTokenStats(len(classes), device, len(model.encoder.support_layers))
     model._visual_stats = stats
     with torch.no_grad(), torch.autocast(device.type, dtype=torch.float16, enabled=args.amp):
         test_data = model.data_preprocessor(batch(classes, device), training=False)
         results = model.predict(test_data['inputs'], test_data['data_samples'])
         memory = model.support_memory()
-        assert memory is original_memory
+        assert memory is evaluation_memory
         assert memory['tokens'].shape == (int(memory['counts'].sum()), 256)
         assert len(memory['counts']) == len(classes) and (memory['counts'] > 0).all()
         assert (memory['counts'] % 49 == 0).all()
@@ -146,12 +141,14 @@ def main():
         assert torch.isfinite(results[0].pred_instances.scores).all()
         model.load_state_dict(model.state_dict())
         assert model._support_memory is None
-        model.prepare_support_cache(args.memory_path, metadata, require_existing=True)
-        torch.testing.assert_close(model.support_memory()['tokens'], original_memory['tokens'],
+        with torch.autocast(device.type, enabled=False):
+            reloaded_memory = model.refresh_support_memory()
+        assert reloaded_memory is not evaluation_memory
+        torch.testing.assert_close(reloaded_memory['tokens'], evaluation_memory['tokens'],
                                    rtol=0, atol=0)
-    print('Real inference, fixed local memory and disk reuse OK.')
+    print('Real inference, evaluation reuse and checkpoint refresh OK.')
     print('Validation statistics:', stats.report(classes))
-    del results, test_data, memory, original_memory
+    del results, test_data, memory, evaluation_memory, reloaded_memory
     if args.profile:
         profile(model, classes, device, args.profile_steps, args.amp)
 

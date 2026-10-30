@@ -1,9 +1,5 @@
-"""Fixed, full-support local descriptor extraction and cache validation."""
+"""Current-backbone full-support local descriptors with evaluation-only reuse."""
 import copy
-import hashlib
-import json
-import os
-from pathlib import Path
 
 import torch
 from torchvision.ops import roi_align
@@ -75,6 +71,19 @@ class SupportVisualMixin:
     def clear_support_cache(self):
         self._support_memory = None
 
+    def train(self, mode=True):
+        # MMEngine calls eval() AFTER before_val/test_epoch. Preserve the
+        # descriptors just extracted by that hook; training never reuses them.
+        if mode:
+            self.clear_support_cache()
+        return super().train(mode)
+
+    def refresh_support_memory(self):
+        """Extract once at evaluation start, using the currently loaded weights."""
+        self.clear_support_cache()
+        self._support_memory = self.build_support_memory()
+        return self._support_memory
+
     def _load_from_state_dict(self, *args, **kwargs):
         self.clear_support_cache()
         return super()._load_from_state_dict(*args, **kwargs)
@@ -138,80 +147,11 @@ class SupportVisualMixin:
         return dict(tokens=tokens, class_ids=class_ids, counts=counts)
 
     def support_memory(self):
+        if self.training:
+            return self.build_support_memory()
         if getattr(self, '_support_memory', None) is None:
             self._support_memory = self.build_support_memory()
         device = next(self.backbone.parameters()).device
         if self._support_memory['tokens'].device != device:
             self._support_memory = {k: v.to(device) for k, v in self._support_memory.items()}
         return self._support_memory
-
-    def support_cache_metadata(self, source_checkpoint, source_identity=None):
-        from mmengine.fileio import get, join_path
-        cfg = self.support_visual_cfg
-        dataset = cfg['dataset']
-        annotation = join_path(dataset.get('data_root', ''), dataset['ann_file'])
-        backend = dataset.get('backend_args')
-        def digest(path):
-            if path is None:
-                raise ValueError('A pretrained load_from checkpoint is required to extract Support.')
-            if Path(path).is_file():
-                hasher = hashlib.sha256()
-                with Path(path).open('rb') as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                        hasher.update(chunk)
-                return hasher.hexdigest()
-            return hashlib.sha256(get(str(path), backend_args=backend)).hexdigest()
-        return dict(version=1, class_names=list(cfg['class_names']),
-                    annotation_sha256=digest(annotation),
-                    source_checkpoint_sha256=(source_identity['source_checkpoint_sha256']
-                        if source_identity else digest(source_checkpoint)),
-                    source_checkpoint=(source_identity['source_checkpoint']
-                        if source_identity else str(source_checkpoint)),
-                    dataset=json.loads(json.dumps(dataset, sort_keys=True)),
-                    preprocessor=dict(
-                        mean=self.data_preprocessor.mean.detach().cpu().flatten().tolist(),
-                        std=self.data_preprocessor.std.detach().cpu().flatten().tolist(),
-                        bgr_to_rgb=self.data_preprocessor._channel_conversion,
-                        pad_size_divisor=self.data_preprocessor.pad_size_divisor,
-                        pad_value=self.data_preprocessor.pad_value),
-                    extraction=dict(backbone='Swin-B.norm1', stride=8, channels=256,
-                                    roi_size=7, aligned=True, sampling_ratio=2,
-                                    layout='object-row-column', dtype='float32'))
-
-    def prepare_support_cache(self, path, metadata, require_existing=False):
-        """Called after checkpoint loading, before any optimizer/query forward."""
-        path = Path(path)
-        if path.is_file():
-            saved = torch.load(path, map_location='cpu', weights_only=True)
-            # A relocated source checkpoint is allowed if its contents match.
-            identity = lambda m: {k: v for k, v in m.items() if k != 'source_checkpoint'}
-            if identity(saved['metadata']) != identity(metadata):
-                raise ValueError(f'Support cache metadata mismatch: {path}')
-            memory = saved['memory']
-            tokens, counts, labels = (memory[k] for k in ('tokens', 'counts', 'class_ids'))
-            classes = len(metadata['class_names'])
-            if (tokens.ndim != 2 or tokens.shape[1] != 256 or
-                    tokens.dtype != torch.float32 or not torch.isfinite(tokens).all() or
-                    counts.shape != (classes,) or counts.dtype != torch.long or
-                    (counts <= 0).any() or (counts % 49 != 0).any() or
-                    labels.dtype != torch.long or not torch.equal(
-                        labels, torch.arange(classes).repeat_interleave(counts)) or
-                    len(tokens) != int(counts.sum())):
-                raise ValueError(f'Invalid local descriptor cache: {path}')
-            self._support_memory = {k: v.detach() for k, v in memory.items()}
-        elif require_existing:
-            raise FileNotFoundError(
-                f'Resume/Test requires the original Support cache: {path}. '
-                'Copy support_local_memory.pt alongside the experiment checkpoint.')
-        else:
-            memory = self.support_memory()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(f'.{os.getpid()}.tmp')
-            try:
-                torch.save(dict(metadata=metadata, memory={
-                    k: v.detach().cpu() for k, v in memory.items()}), temporary)
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
-        self._support_cache_metadata = metadata
-        return self.support_memory()
