@@ -34,7 +34,16 @@ class DetectorIntegrationTests(unittest.TestCase):
         losses = model.loss(image, fixture.samples())
         self.assertEqual(len(losses), 21)
         self.assertTrue(all(torch.isfinite(value).all() for value in losses.values()))
+        optimizer = torch.optim.SGD(model.parameters(), lr=.01)
+        before = {n: p.detach().clone() for n, p in model.encoder.support_layers.named_parameters()}
         sum(losses.values()).backward()
+        for parameter in model.encoder.support_layers.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(parameter.grad.abs().sum().item(), 0.)
+        optimizer.step()
+        for n, p in model.encoder.support_layers.named_parameters():
+            self.assertFalse(torch.equal(before[n], p), n)
         self.assertIsNone(memory['tokens'].grad)
         for gradient in (image.grad, model.language_model.embedding.weight.grad,
                          model.encoder.text_layers[0].self_attn.attn.in_proj_weight.grad):

@@ -48,7 +48,7 @@ def execute(nodes, env):
 
 
 ENV = dict(torch=torch, nn=nn, math=math, re=re, warnings=warnings, copy=copy,
-           support_attention_mask=visual.support_attention_mask,
+           support_text_classes=visual.support_text_classes,
            SupportVisualMixin=visual.SupportVisualMixin)
 utils = source('mmdet/models/layers/transformer/utils.py')
 execute([node(utils, 'inverse_sigmoid'), node(utils, 'coordinate_to_encoding')], ENV)

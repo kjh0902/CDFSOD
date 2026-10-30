@@ -1,168 +1,158 @@
-# ACL Support Visual Memory
+# ACL Support Local Descriptor Cross-Attention
 
-기준은 `acl-vistoken`의 `72bced2`이다. 브랜치는
-`acl-vistoken-support-memory`이며, HED 없는 기존 순차 ACL Decoder, DN,
-Query 증강, Detection Loss와 optimizer/scheduler/checkpoint 정책을 유지한다.
-기존 Text Attention의 학습 parameter와 checkpoint key를 그대로 사용하며,
-새 학습 parameter나 보조 Loss를 추가하지 않는다.
+기준은 `acl-vistoken-support-memory`의 `b8849b3`이다.
+새 브랜치는 `codex/acl-support-local-cross-attn`이다. 기준의 HED 없는 순차 ACL
+Decoder, DN, Query 증강, Detection Loss, Optimizer/Scheduler, 18개 Dataset/Shot
+설정 및 분산 프로세스 종료 처리를 유지한다.
 
-## Support 객체 Memory
+## 고정 Support Local Memory
 
-18개 finetuning config의 Support dataset은 각 Shot의 학습 annotation·이미지·
-클래스 목록을 사용한다. 평가 GT는 Memory 생성에 사용하지 않는다. 기존 COCO
-파싱의 invalid/ignore/crowd 처리를 유지하며, 일반 GT instance만 추출한다.
-Query sampler와 학습 이미지 필터는 Support에 적용하지 않는다.
+Support는 해당 Shot 학습 annotation과 이미지에서만 추출한다. 기존 COCO
+invalid/ignore/crowd 처리를 유지하고 평가 GT는 사용하지 않는다.
+LoadImage → LoadAnnotations → 고정 Resize(800,1333) → Pack 및 동일한
+정규화·padding 후, Neck 이전 Swin-B `norm1`(stride 8, 256 channels)에
+resized GT xyxy를 적용한다. RoIAlign은 7×7, aligned=True, sampling_ratio=2,
+spatial_scale=1/8이다.
 
-Support pipeline은 LoadImage → LoadAnnotations → 고정 Resize(800,1333) →
-Pack이다. 동일한 preprocessor의 정규화·padding 후 resized GT xyxy로
-정규화된 Swin-B `norm1` 반환값(stride 8, 256 channels, Neck 이전)을
-RoIAlign(7×7, aligned=True, sampling_ratio=2, spatial_scale=1/8) → GAP한다.
+GAP 대신 `(N,256,7,7) → (N,49,256)`으로 공간축을 펼친다. 객체별 row/column
+순서로 모든 descriptor를 보존한다. Global Descriptor, Projection, L2 정규화,
+Selection, Aggregation, Shot별 자르기·반복은 없다.
 
-객체마다 FP32 Token 한 개를 보존한다. 클래스별 평균, 이미지별 평균, projection,
-L2 정규화, Shot별 자르기·반복은 없다. `support_memory()`의 반환값은:
-
-| 필드 | 크기 | 의미 |
+| Memory 필드 | 크기 | 의미 |
 |---|---|---|
-| tokens | V × 256 | 클래스별로 연결한 모든 유효 GT 객체 Token |
-| class_ids | V | 각 Token의 0-based dataset label |
-| counts | C | 클래스별 실제 객체 수; 합계가 V |
+| tokens | S × 256 | 클래스별로 연결한 FP32 Local Descriptor |
+| class_ids | S | 0-based 클래스 ID, 클래스 순으로 정렬 |
+| counts | C | 클래스별 descriptor 수; GT 객체 수 × 49 |
 
-같은 Shot이라도 여러 객체가 있는 이미지에서는 클래스별 Token 수가 Shot과
-다를 수 있다. 클래스 메타데이터, COCO category→label 순서와 label 범위를
-검증한다. 특정 클래스의 유효 GT가 0개이면 클래스 index와 이름을 포함한 오류로
-중단한다. 빈 이미지는 Token을 추가하지 않는다.
+객체 수가 이미지 수/Shot과 다를 수 있다. 각 클래스에 유효 GT가 하나 이상 있어야
+하며, 잘못된 Label·Box·클래스 순서는 오류로 처리한다.
 
-매 학습 iteration마다 각 rank가 전체 Support를 batch size 1, worker 0,
-고정 순서로 다시 추출한다. 전용 DataLoader Generator는 Query RNG를 소모하지
-않는다. `no_grad`와 Backbone 임시 eval을 사용하고 모든 submodule의 원래 mode를
-복구한다. Query Backbone은 정상적으로 학습한다.
+`VisualTokenHook.before_train`은 Pretrained Weight 로딩 후, 최초 Optimizer Step과
+Query Forward 전에 한 번 추출한다. `no_grad`, Backbone 임시 eval과 submodule mode
+복원, 독립 DataLoader RNG를 유지한다. Query Backbone은 기존대로 학습한다.
+학습/eval 전환과 Backbone 갱신은 Memory를 변경하지 않는다.
 
-Validation/Test에서는 현재 가중치로 첫 predict 시 한 번 생성해 캐시한다.
-평가 시작, train/eval 전환과 가중치 재로딩 시 캐시를 무효화한다.
-Memory와 통계는 state_dict에 포함하지 않는다.
-`support_visual_cfg=None`은 기존 ACL 경로를 사용한다.
+기본 캐시는 `<work_dir>/support_local_memory.pt`이다. `support_visual_cfg.memory_path`
+설정으로 위치를 바꿀 수 있다. 원본 추출 가중치·Support annotation의 SHA256,
+클래스 순서, Support dataset/pipeline, 정규화·padding·RoIAlign 정보를 저장한다.
+로컬 가중치는 chunk 단위로 해싱한다. 파일은 임시 파일에서 원자적으로 교체한다.
+DDP에서는 rank 0만 추출·저장하고 각 rank가 같은 파일을 읽는다. 따라서 캐시는
+모든 rank에서 접근 가능한 위치에 있어야 한다.
 
-## Text Attention과 Mask
+Checkpoint의 `meta.support_local_memory`에 추출 provenance를 저장한다. Resume과
+별도 Test는 원래 캐시를 요구하며 누락·메타데이터 불일치·잘못된 Tensor는 오류다.
+새 Checkpoint의 provenance가 있으면 최초 Pretrained 파일이 없어도 캐시를 검증할
+수 있다. **실험 Checkpoint를 옮길 때 캐시도 함께 보존해야 한다.**
+이미지 파일 자체의 내용 hash는 저장하지 않으므로 캐시를 만든 뒤 Support 이미지를
+수정하지 않는다. 다른 실험에는 새 work_dir 또는 별도의 memory_path를 사용한다.
 
-BERT → text_feat_map으로 생성한 Text 시퀀스를 그대로 유지한다. 이름 Token
-Mapping, Text 위치 ID와 Text 길이를 이동시키지 않는다. Visual Memory는
-별도 Tensor이므로 `max_text_len`을 소비하지 않는다. Text 자체의 길이 한도는
-기존대로 검증한다. 기존 완전한 canonical 전체 클래스 prompt 검증을 유지하며,
-Support 활성화 상태의 chunked/부분 클래스/비정형 recognition prompt는 지원하지 않는다.
+Memory는 state_dict의 학습 parameter/buffer에 넣지 않는다. 모델 Weight를 다시
+로드하면 메모리 내 캐시는 해제되며, Runner Hook이 디스크 캐시를 다시 읽는다.
+Runner 없이 직접 모델을 사용하는 경우 첫 Forward 전에
+`support_cache_metadata`와 `prepare_support_cache`를 호출한다. 테스트 도구가 예시다.
 
-각 GroundingDINO Encoder Layer에서 기존 순서대로 Image-Text Fusion →
-Text Attention → Image Attention을 수행한다. Text Attention만 다음과 같다.
+## Feature Enhancer
 
-```text
-Q = current Text
-K = Concat(current Text, fixed Support Memory)
-V = Concat(current Text, fixed Support Memory)
-output length = original Text length
-```
+각 Layer는 다음 순서로 실행된다.
 
-Q와 Text Key에는 기존 Text 위치 인코딩을 사용한다. Visual Key의 위치
-인코딩은 0이며 Shot·객체 순서 인코딩을 추가하지 않는다. 기존
-MultiheadAttention, FFN, Norm과 잔차는 Text 행에만 적용한다.
-Support는 모든 Layer에서 동일한 원본 Token이며 Query로 사용하거나 갱신하지 않는다.
+1. 기존 Bidirectional Image–Text Fusion
+2. Support-to-Text Cross-Attention 및 `T + gamma * delta`
+3. 원래 Text-only Self-Attention + FFN
+4. 기존 Image Deformable Self-Attention + FFN
 
-허용 Mask는 B × T × (T+V)이다. 앞의 T × T는 기존 Text Mask를 그대로
-복사한다. 각 Visual 열은 해당 클래스 마침표 열의 기존 허용 연결을 상속하고,
-padding Query에서는 차단한다. 따라서 클래스 이름과 period는 해당 클래스
-Memory를 볼 수 있고, 다른 클래스·CLS/SEP·padding에는 새로운 연결이 없다.
-Text padding의 기존 self 연결은 유지해 완전히 차단된 Query 행으로 인한 NaN을
-피한다. 유효 Query는 Text padding Key를 보지 않는다. Support 자체에는 padding이 없다.
+Q는 Fusion 직후 Text, K/V는 해당 클래스의 고정 Local Descriptor다.
+클래스 이름 Token과 그 period만 같은 클래스 Memory를 볼 수 있고 CLS/SEP/Padding은
+Support residual을 받지 않는다. 여러 Batch의 같은 클래스 Query를 묶어 Attention을
+계산한다. Query끼리 Attention하지 않으므로 Dense Class-wise Mask와 수학적으로
+동일하다. 모든 클래스 descriptor를 사용하면서 전체 B×Head×T×S Mask를 피한다.
 
-Attention 호출 시 Batch별 Mask를 head 수만큼 repeat_interleave해
-B×heads 순서로 확장한다. 서로 다른 Batch prompt 길이에서도 head가 다른
-이미지의 Mask를 사용하지 않는다.
+Attention은 기존 Text Attention과 동일한 차원/Head 수, Dropout=0으로 구성한다.
+Q/K/V/출력 projection은 일반 초기화이고, Channel-wise Gamma는 `1e-4`로 초기화한다.
+기존 DINO Xavier 초기화는 2차원 이상 Weight만 변경하므로 Gamma 초기값을 보존한다.
+추가 LayerNorm, 위치 인코딩, Target–Support Attention은 없다. 일반 Forward는
+`need_weights=False`로 SDPA 경로를 사용하고 Support는 detach한다.
 
-## Fusion, Detection과 checkpoint
+Text Self-Attention의 K/V 결합과 공통 DETR Layer의 explicit K/V 확장은 제거했다.
+Support 활성 경로의 Text Mask는 Batch×Head 순서로 repeat_interleave한다. Support
+비활성 경로는 원래 repeat 동작까지 그대로 보존한다. 클래스가 다른 Support 변경의
+직접 영향은 Cross-Attention에서 차단한다. 이후 정상 Image–Text Fusion을 통한
+간접 영향은 모델의 원래 동작이다.
 
-Bidirectional Image-Text Fusion에는 기존 Text만 전달한다. 앞 Layer에서
-Support로 보강된 Text가 다음 Layer의 정상 Fusion에 참여하는 간접 효과는 유지한다.
-Visual Memory를 Image의 양방향 Attention에 직접 전달하지 않는다.
+새 parameter는 `encoder.support_layers.*` 아래에만 추가한다. 기존 Weight의 Key와
+Shape를 유지하며, 기존 Pretrained 로딩에서 새 parameter만 누락될 수 있다.
+`support_visual_cfg=None`이면 새 모듈을 만들지 않고 기존 Forward/Backward를 따른다.
 
-Encoder Query Selection, Decoder Text Cross-Attention과 Contrastive Head는
-기존 길이의 Text Feature만 받는다. Visual/Text Max Fusion, Visual Score와
-클래스 one-hot으로 바꾸던 전용 경로를 제거했다.
+## 경량 통계: schema_version 3
 
-Detection Head는 `449e69a`의 기존 serial ACL 구현과 동일하다. Encoder Top-K는
-기존 유효 Text Token Logit의 max를 사용한다. 모든 Decoder Layer, DN,
-선택된 Encoder Query의 Focal/L1/GIoU와 Hungarian Matching은 원래
-Token positive map과 Text mask를 사용한다. 추론은 기존 이름 Token의 sigmoid
-점수 평균으로 클래스 점수를 구한다.
+`visual_token_stats.jsonl`과 기존 text_norm, support_token_norm,
+enhanced_text_norm을 유지한다. support_token_count는 이제 Local Descriptor 수다.
+기존 Norm은 학습 Epoch 마지막 Batch 및 평가 전체 dataset을 집계한다. 고정 Support
+Norm은 한 번 계산한 O(classes) 합계만 재사용한다.
 
-기존 Attention·FFN·Norm parameter 이름과 shape가 동일하므로 기존 checkpoint를
-읽을 수 있다. 이전 Visual 삽입/Max Fusion 모델 checkpoint도 parameter 구조는
-호환되지만, 추론 동작은 이 브랜치의 Memory 구조로 바뀐다.
+새 `support_cross_attention[layer_id]` 항목은 다음과 같다. Layer ID는 0부터 시작한다.
 
-## 통계: schema_version 2
-
-기존 `VisualTokenHook`과 `visual_token_stats.jsonl` 파일명을 유지한다.
-각 행은 `schema_version=2`, `architecture=support_memory`와
-Dataset/Shot/phase/Epoch/Iteration을 포함한다.
-
-| 항목 | 정의 |
+| 통계 | 정의 |
 |---|---|
-| support_token_count | 전체/클래스별 실제 Support 객체 수. 이미지·Batch·rank 수로 곱하지 않음 |
-| text_norm | text_feat_map 이후, FE 이전 이름 Token의 평균 L2 Norm |
-| support_token_norm | 원본 Support 객체 Token의 평균 L2 Norm |
-| enhanced_text_norm | 마지막 Encoder 이후 이름 Text Token의 평균 L2 Norm |
+| normalized_attention_entropy | Head별 `-sum(p log p)/log(S_class)`의 평균. S_class=1이면 0 |
+| residual_contribution | 집계된 유효 Token 전체의 `sqrt(sum((gamma*delta)^2))/max(sqrt(sum(T^2)),1e-12)` |
+| gamma | Channel별 Gamma의 mean_absolute, max_absolute, 모집단 std |
 
-Norm은 `{value,count}`로 기록하며 count는 실제 집계 Token 관측 수다.
-Support Norm은 각 유효 Query 이미지에 대해 객체별로 집계한다.
-같은 평가 동안 Memory는 고정이므로 결과는 객체별 평균 Norm과 동일하다.
-분모가 0이면 value는 null이다.
+Entropy/Contribution은 value와 count를 기록한다. 관측이 없으면 value는 null이다.
+Entropy count는 Head×샘플 Token 수이고 Contribution count는 유효 Token 수다.
 
-Visual 승률, Visual Score, Score 차이와 Visual Query Selection 통계는
-제거했다. 통계를 위한 추가 Hungarian Matching과 모델 Forward도 없다.
-학습은 Epoch 마지막 Batch, Validation/Test는 전체 dataset을 집계한다.
-DDP는 Norm의 합계·분모만 합산하며 Support 객체 수는 rank별 전체 Set의
-snapshot을 그대로 사용한다. unshuffled DefaultSampler의 평가 padding
-중복은 모든 Norm 집계에서 제외한다. 로깅 on/off는 Loss·gradient·RNG에
-영향을 주지 않는다.
+새 통계는 학습 Epoch 마지막 Batch, 평가 Batch index 0/50/100/...에서 수집한다.
+Entropy는 각 Layer·클래스·선택된 Batch에서 유효 Query를 Batch/Token 순으로 최대
+8개만 택하고, 해당 클래스의 **모든** descriptor를 본다. FP32 no_grad에서 Key를
+1,024개씩 나눠 online log-sum-exp와 weighted moment로 정확한 Entropy를 구한다.
+Contribution은 선택된 Batch의 모든 유효 클래스 Token을 집계한다. Gamma는
+Forward 시점의 Layer별 snapshot이다.
 
-## 실행과 검증
+통계는 Class-wise Mask로 유효한 Query와 Key만 사용하고, unshuffled DefaultSampler의
+DDP Padding 이미지 중복을 제외한다. DDP는 합계·분모만 합산하고 Gamma 및 전체
+Support 수는 rank 0 snapshot을 쓴다. Attention/Feature Tensor를 파일로 저장하지
+않으며, 영구 통계 상태는 O(classes+layers)이다. 기존처럼 Epoch/phase당 JSON 한
+줄만 기록한다. 로깅 on/off의 Loss·Gradient·Optimizer·RNG 동등성을 검사한다.
 
-기존 실행 방법과 18개 dataset/shot 설정을 그대로 사용한다.
+## 실행 및 검증
+
+기존 실행 명령을 사용한다. 학습과 뒤이은 Test는 같은 work_dir의 캐시를 공유한다.
 
 ```bash
 bash run_cdfsod.sh --dataset NEU-DET --shot 1
 python -B -m unittest discover -s tests -v
 ```
 
-CPU 테스트는 실제 torchvision RoIAlign, repository의 Encoder/Text Layer/Fusion
-forward, PyTorch Attention, Detection Head Loss·Hungarian 비용과 scipy
-assignment를 사용한다. 이미지의 deformable attention과 BERT/Backbone은
-소형 fixture로 대체한다. MMCV 또는 mmcv-lite와 MMEngine이 있으면 실제
-MMCV Attention/FFN/Norm으로 256차원 FP32·CPU autocast forward/backward와
-checkpoint parameter 호환성도 검사한다.
+CPU 검증은 실제 torchvision RoIAlign, PyTorch Attention, repository Encoder/Fusion,
+실제 MMCV Attention/FFN/Norm, MMEngine/pycocotools COCO lifecycle, Detection Loss와
+Hungarian 비용·assignment를 사용한다. BERT/Backbone 및 Image Deformable Attention은
+소형 fixture로 대체한다. 전체 18개 config와 기존 Decoder·Loss·학습 Hook의 보존을
+검사한다. 신규 테스트는 Dense Mask와 분할 Attention의 출력/Gradient 동등성,
+Gamma=0, 새 parameter의 Detection Loss Gradient와 Optimizer 갱신, 캐시 재사용·
+Resume/Test, Entropy 기준값, 통계 샘플링·DDP 합산과 로그 크기를 포함한다.
 
-실제 MMEngine/pycocotools로 COCO 초기화 후 임시 coco 속성이 삭제되는 lifecycle,
-비연속 category ID 및 class order를 검사하고 18개 config를 파싱한다.
-원래 config·순차 Decoder·학습 Hook이 변경되지 않았는지도 확인한다.
-
-로컬 최종 결과는 **43개 테스트 통과, 실패 0개, 건너뜀 0개**이다.
-MMEngine 0.10.7, mmcv-lite 2.2.0, pycocotools 2.0.11을 별도 테스트 전용
-폴더에서 사용했으며, 기본 학습 의존성과 환경 설정은 변경하지 않았다.
-18개 config 파싱, 실제 Detection Loss를 통한 Memory→Text Attention
-backward, parameter key/shape 호환성 및 로깅 on/off 동등성 검사를 포함한다.
-
-전체 CUDA 모델 검사는 MMCV CUDA ops, BERT, pretrained checkpoint 및 해당
-Shot의 실제 Support 이미지·annotation이 준비된 환경에서만 실행한다.
+실제 CUDA 전체 모델은 MMCV CUDA ops, BERT, Pretrained Weight와 실제 Support
+데이터가 있는 환경에서 다음 명령으로 FP32/AMP를 각각 검사한다.
 
 ```bash
 PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 python tools/analysis_tools/check_visual_tokens.py \
-  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py
+  configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_NEU-DET_1shot.py \
+  --memory-path exp_cdfsod_results/NEU-DET/1shot/support_local_memory.pt --profile
+# 같은 명령에 --amp를 추가하여 AMP도 확인한다.
 ```
 
-위 도구는 synthetic Query 한 Batch의 실제 Detection Loss/backward와 predict를
-수행하며 optimizer step이나 checkpoint 저장은 하지 않는다. 전체 학습 실험은
-검증 대상에 포함하지 않는다.
+학습된 Checkpoint 검사에는 `--checkpoint <path>`를 추가하며 기존 캐시가 필수다.
+이 도구는 합성 Query의 실제 Detection Loss/Backward와 predict, Memory 재사용,
+projection/Gamma Gradient를 검사한다. `--profile`은 동일 모델에서 Support on/off의
+Forward+Backward 시간과 CUDA peak allocated/increment MiB를 보고한다. Warmup 1회 후
+기본 3회를 측정하며 Optimizer Step이나 Weight 저장은 하지 않는다. 프로파일의 off도
+같은 모델과 캐시를 유지하므로 peak increment로 활성화 비용을 함께 확인한다.
 
-검증 환경은 Windows / Python 3.13 / PyTorch 2.7.1+cpu /
-torchvision 0.22.1+cpu이다. 실제 CUDA 전체 모델, 실제 Support 이미지 기반
-학습·추론, mAP·처리량·NCCL 종료는 미검증이다. 매 iteration 전체 Support를
-재계산하는 비용과 T×(T+V) Text Attention 비용은 실제 객체 수에 비례해 증가한다.
+로컬 검증 환경은 Windows / Python 3.13 / PyTorch 2.7.1+cpu / torchvision 0.22.1+cpu,
+테스트 전용 MMEngine 0.10.7 / mmcv-lite 2.2.0 / pycocotools 2.0.11이다.
+CUDA 전체 모델, 실제 Support 데이터 기반 학습·추론, GPU peak/처리량과 mAP는
+로컬에서 실행하지 않았다. Gloo 프로세스 종료 검증은 CUDA/NCCL 검증을 대체하지 않는다.
 
-기존 train/test의 distributed cleanup 및 warn_only 호환 처리는 유지한다.
+최종 로컬 결과: **64개 테스트 통과, 실패 0개, 건너뜀 0개**.
+실행은 `python -B -m unittest discover -s tests -v`이며, CPU FP32·bfloat16
+Attention/Backward와 Gloo 및 DataLoader worker 종료 테스트를 포함한다.
+테스트 전용 의존성은 별도 폴더를 사용했으며 학습 환경 의존성은 변경하지 않았다.

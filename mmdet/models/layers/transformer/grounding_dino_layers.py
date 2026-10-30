@@ -9,6 +9,7 @@ from mmcv.ops import MultiScaleDeformableAttention
 from mmengine.model import ModuleList
 from torch import Tensor
 
+from mmdet.models.utils.support_cross_attention import SupportTextCrossAttention
 from mmdet.models.utils.vlfuse_helper import SingleScaleBiAttentionBlock
 from mmdet.utils import ConfigType, OptConfigType
 from .deformable_detr_layers import (DeformableDetrTransformerDecoderLayer,
@@ -137,7 +138,8 @@ class GroundingDinoTransformerDecoderLayer(
 class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
 
     def __init__(self, text_layer_cfg: ConfigType,
-                 fusion_layer_cfg: ConfigType, **kwargs) -> None:
+                 fusion_layer_cfg: ConfigType, support_cross_attn=False, **kwargs) -> None:
+        self.support_cross_attn = support_cross_attn
         self.text_layer_cfg = text_layer_cfg
         self.fusion_layer_cfg = fusion_layer_cfg
         super().__init__(**kwargs)
@@ -157,6 +159,10 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
             for _ in range(self.num_layers)
         ])
         self.embed_dims = self.layers[0].embed_dims
+        self.support_layers = ModuleList([
+            SupportTextCrossAttention(self.embed_dims,
+                self.text_layer_cfg['self_attn_cfg']['num_heads'])
+            for _ in range(self.num_layers)] if self.support_cross_attn else [])
         if self.num_cp > 0:
             if checkpoint_wrapper is None:
                 raise NotImplementedError(
@@ -181,7 +187,9 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 text_self_attention_masks: Tensor = None,
                 position_ids: Tensor = None,
                 support_memory: Tensor = None,
-                support_attention_mask: Tensor = None):
+                text_class_ids: Tensor = None,
+                support_counts=None,
+                support_stats=None):
         """Forward function of Transformer encoder.
 
         Args:
@@ -206,9 +214,11 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 Defaults to None.
             text_self_attention_masks (Tensor, optional): Text self attention
                 mask. Defaults to None.
-            support_memory (Tensor, optional): Fixed object tokens (V, dim).
-            support_attention_mask (Tensor, optional): Allowed Text-to-Text/Support
-                connections (bs, len_text, len_text + V).
+            support_memory (Tensor, optional): Fixed local descriptors (S, dim).
+            text_class_ids (Tensor, optional): Class per text query, -1 for
+                unrelated tokens; shape (bs, len_text).
+            support_counts (tuple, optional): Descriptor count per class.
+            support_stats: Optional detached diagnostic accumulator.
             position_ids (Tensor, optional): Text position ids.
                 Defaults to None.
         """
@@ -232,11 +242,9 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                     exchange_xy=False)
 
         if support_memory is not None:
-            if support_attention_mask is None:
-                raise ValueError('Support memory requires a class attention mask.')
-            # Fixed object memory is never a query and never enters fusion.
+            if not self.support_layers or text_class_ids is None or support_counts is None:
+                raise ValueError('Support memory requires enabled layers and class assignments.')
             support = support_memory.detach().to(memory_text)
-            support = support.unsqueeze(0).expand(memory_text.shape[0], -1, -1)
         else:
             support = None
 
@@ -249,26 +257,21 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                     attention_mask_v=key_padding_mask,
                     attention_mask_l=text_attention_mask,
                 )
+            if support is not None:
+                memory_text = self.support_layers[layer_id](
+                    memory_text, support, text_class_ids, support_counts,
+                    support_stats, layer_id)
             if self.text_layers:
-                text_num_heads = self.text_layers[
-                    layer_id].self_attn_cfg.num_heads
-                if support is None:
-                    # Preserve the original self-attention path when disabled.
-                    attention = text_self_attention_masks.repeat(text_num_heads, 1, 1)
-                    extra = {}
-                else:
-                    attention = support_attention_mask.repeat_interleave(text_num_heads, dim=0)
-                    kv = torch.cat([memory_text, support], dim=1)
-                    key_pos = (torch.cat([pos_text, torch.zeros_like(support)], dim=1)
-                               if pos_text is not None else None)
-                    extra = dict(key=kv, value=kv, key_pos=key_pos)
+                text_num_heads = self.text_layers[layer_id].self_attn_cfg.num_heads
+                # Keep the disabled baseline exactly; enabled batches use the
+                # B*heads ordering expected by torch MultiheadAttention.
+                attention = (text_self_attention_masks.repeat_interleave(text_num_heads, dim=0)
+                             if support is not None else
+                             text_self_attention_masks.repeat(text_num_heads, 1, 1))
                 memory_text = self.text_layers[layer_id](
-                    query=memory_text,
-                    query_pos=pos_text,
+                    query=memory_text, query_pos=pos_text,
                     attn_mask=~attention,
-                    key_padding_mask=None,
-                    **extra,
-                )
+                    key_padding_mask=None)
             output = layer(
                 query=output,
                 query_pos=query_pos,

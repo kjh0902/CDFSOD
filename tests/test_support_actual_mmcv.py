@@ -56,9 +56,9 @@ class ActualMMCVTests(unittest.TestCase):
                 text, maps = text_fixture(2)
                 memory = memory_fixture(counts=(5, 2), requires_grad=True)
                 original = memory['tokens'].detach().clone()
-                allowed = visual.support_attention_mask(text, memory, maps)
+                allowed = visual.support_text_classes(text, memory, maps)
                 with torch.autocast('cpu', dtype=torch.bfloat16, enabled=amp):
-                    image, output = run(encoder, text, memory['tokens'], allowed)
+                    image, output = run(encoder, text, memory, allowed)
                     loss = output[..., 0].square().mean() + image.square().mean()
                 loss.backward()
                 self.assertEqual(output.shape, (2, 9, 256))

@@ -15,7 +15,7 @@ from mmdet.utils import ConfigType
 from ..layers import SinePositionalEncoding
 from ..layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
-from ..utils.support_visual import SupportVisualMixin, support_attention_mask
+from ..utils.support_visual import SupportVisualMixin, support_text_classes
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
@@ -72,7 +72,9 @@ class GroundingDINO(SupportVisualMixin, DINO):
         """Initialize layers except for backbone, neck and bbox_head."""
         self.positional_encoding = SinePositionalEncoding(
             **self.positional_encoding)
-        self.encoder = GroundingDinoTransformerEncoder(**self.encoder)
+        encoder_cfg = dict(self.encoder)
+        encoder_cfg['support_cross_attn'] = self.visual_enabled
+        self.encoder = GroundingDinoTransformerEncoder(**encoder_cfg)
         self.decoder = GroundingDinoTransformerDecoder(**self.decoder)
         self.embed_dims = self.encoder.embed_dims
         self.query_embedding = nn.Embedding(self.num_queries, self.embed_dims)
@@ -343,7 +345,9 @@ class GroundingDINO(SupportVisualMixin, DINO):
             position_ids=text_dict['position_ids'],
             text_self_attention_masks=text_dict['masks'],
             support_memory=text_dict.get('support_memory'),
-            support_attention_mask=text_dict.get('support_attention_mask'))
+            text_class_ids=text_dict.get('text_class_ids'),
+            support_counts=text_dict.get('support_counts'),
+            support_stats=self._visual_stats)
         if self._visual_stats is not None and 'support_class_maps' in text_dict:
             self._visual_stats.text_features(
                 memory_text, text_dict['support_class_maps'], 'enhanced_text_norm')
@@ -452,12 +456,13 @@ class GroundingDINO(SupportVisualMixin, DINO):
 
     def _support_text(self, text_dict, mappings):
         memory = self.support_memory()
-        allowed = support_attention_mask(text_dict, memory, mappings)
+        class_ids = support_text_classes(text_dict, memory, mappings)
         if self._visual_stats is not None:
             self._visual_stats.support_features(memory, len(mappings))
             self._visual_stats.text_features(text_dict['embedded'], mappings, 'text_norm')
         return dict(text_dict, support_memory=memory['tokens'].detach(),
-                    support_attention_mask=allowed, support_class_maps=mappings)
+                    text_class_ids=class_ids, support_counts=tuple(memory['counts'].tolist()),
+                    support_class_maps=mappings)
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:

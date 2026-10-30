@@ -211,31 +211,24 @@ class DetrTransformerEncoderLayer(BaseModule):
         self.norms = ModuleList(norms_list)
 
     def forward(self, query: Tensor, query_pos: Tensor,
-                key_padding_mask: Tensor, key: Tensor = None,
-                value: Tensor = None, key_pos: Tensor = None, **kwargs) -> Tensor:
+                key_padding_mask: Tensor, **kwargs) -> Tensor:
         """Forward function of an encoder layer.
 
         Args:
             query (Tensor): The input query, has shape (bs, num_queries, dim).
             query_pos (Tensor): The positional encoding for query, with
                 the same shape as `query`.
-            key (Tensor, optional): Explicit key memory; defaults to query.
-            value (Tensor, optional): Explicit values; defaults to key.
-            key_pos (Tensor, optional): Key positions; defaults to query_pos.
             key_padding_mask (Tensor): The `key_padding_mask` of `self_attn`
                 input. ByteTensor. has shape (bs, num_queries).
         Returns:
             Tensor: forwarded results, has shape (bs, num_queries, dim).
         """
-        key = query if key is None else key
-        value = key if value is None else value
-        key_pos = query_pos if key_pos is None else key_pos
         query = self.self_attn(
             query=query,
-            key=key,
-            value=value,
+            key=query,
+            value=query,
             query_pos=query_pos,
-            key_pos=key_pos,
+            key_pos=query_pos,
             key_padding_mask=key_padding_mask,
             **kwargs)
         query = self.norms[0](query)

@@ -1,16 +1,17 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 브랜치는 `acl-vistoken`의 `72bced2`를 기반으로 **serial ACL + Support Visual
-Memory**를 구현한다. 전체 Shot Support의 유효 GT마다 Swin-B → RoIAlign(7×7) →
-GAP로 256차원 Token을 생성하고, 클래스별 모든 객체 Token을 보존한다.
+이 브랜치는 `acl-vistoken-support-memory`의 `b8849b3`를 기반으로
+**serial ACL + Support Local Descriptor Cross-Attention**을 구현한다.
+전체 Shot Support의 유효 GT마다 Swin-B → RoIAlign(7×7)로 49개의 256차원
+Local Descriptor를 만들고, 최초 추출 결과를 학습·검증·테스트에서 고정 재사용한다.
 
-각 Encoder Text Attention에서만 Text를 Query로, Text와 해당 클래스의 고정
-Support Memory를 Key/Value로 사용한다. Bidirectional Image-Text Fusion과
-Detection은 기존 길이의 Text Feature를 사용하며, 기존 ACL의 Token 기반 분류와
-Loss를 따른다. 새 학습 parameter나 보조 Loss는 없다.
+모든 FE Layer는 Image–Text Fusion → 클래스별 Support-to-Text Cross-Attention
+→ Text-only Self-Attention/FFN → Image Deformable Self-Attention/FFN 순서다.
+새 Attention과 Channel-wise Gamma(`1e-4` 초기값)를 학습하며, 기존 순차 ACL
+Decoder와 Detection Loss는 유지한다. HED는 기준 브랜치와 같이 사용하지 않는다.
 
-학습 Epoch 마지막 Batch와 전체 Validation/Test에서 Support 객체 수와
-Support/Text Feature Norm을 기록한다. 구조, Mask, 캐시, 통계 정의와 검증 방법은
+기존 Feature Norm 로그에 FE Layer별 Attention Entropy, Residual Contribution,
+Gamma 통계만 추가한다. 구조, 캐시 보존, 통계 정의와 검증 방법은
 [실험 설명](EXPERIMENT_VISUAL_TOKEN.md)을 참고한다.
 
 ## 지원 환경
@@ -32,7 +33,7 @@ RTX 5090 코드가 포함된 공식 PyTorch `cu128` wheel과 CUDA 12.8로 빌드
 ## 1. 설치
 
 ```bash
-git clone --branch acl-vistoken-support-memory https://github.com/kjh0902/CDFSOD.git
+git clone --branch codex/acl-support-local-cross-attn https://github.com/kjh0902/CDFSOD.git
 cd CDFSOD
 
 conda env create -f environment.yml

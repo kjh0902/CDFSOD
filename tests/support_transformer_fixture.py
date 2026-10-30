@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 import torch
 from torch import nn
 from torch.nn import functional as F
-from visual_test_support import execute, node, source, ENV
+from visual_test_support import execute, node, source, ENV, load
 
 env = dict(ENV, F=F, Tensor=torch.Tensor, MAX_CLAMP_VALUE=50000)
 execute([node(source('mmdet/models/layers/transformer/utils.py'),
@@ -69,9 +69,13 @@ class ImageLayer(nn.Module):
         return self.linear(query)
 
 
+SupportAttention = load('mmdet/models/utils/support_cross_attention.py', 'support_attention').SupportTextCrossAttention
+
+
 class Encoder(nn.Module):
-    def __init__(self, dim=8, heads=2, layers=2, fusion=True):
+    def __init__(self, dim=8, heads=2, layers=2, fusion=True, support=True):
         super().__init__()
+        self.support_layers = nn.ModuleList([SupportAttention(dim, heads) for _ in range(layers)] if support else [])
         self.embed_dims = dim
         self.layers = nn.ModuleList([ImageLayer(dim) for _ in range(layers)])
         self.text_layers = nn.ModuleList([TextLayer(dim, heads) for _ in range(layers)])
@@ -90,7 +94,7 @@ execute([node(source('mmdet/models/layers/transformer/grounding_dino_layers.py')
 Encoder.forward = encoder_env['forward']
 
 
-def run(encoder, text, memory=None, allowed=None, image=None):
+def run(encoder, text, memory=None, allowed=None, image=None, stats=None):
     if image is None:
         image = torch.randn(len(text['embedded']), 4, encoder.embed_dims)
     return encoder(query=image, query_pos=torch.zeros_like(image),
@@ -102,4 +106,7 @@ def run(encoder, text, memory=None, allowed=None, image=None):
                    text_attention_mask=~text['text_token_mask'],
                    position_ids=text['position_ids'],
                    text_self_attention_masks=text['masks'],
-                   support_memory=memory, support_attention_mask=allowed)
+                   support_memory=memory['tokens'] if memory is not None else None,
+                   text_class_ids=allowed,
+                   support_counts=tuple(memory['counts'].tolist()) if memory is not None else None,
+                   support_stats=stats)
