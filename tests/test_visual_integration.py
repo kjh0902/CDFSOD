@@ -43,7 +43,9 @@ class DetectorIntegrationTests(unittest.TestCase):
             self.assertGreater(parameter.grad.abs().sum().item(), 0.)
         optimizer.step()
         for n, p in model.encoder.support_layers.named_parameters():
-            self.assertFalse(torch.equal(before[n], p), n)
+            # Key bias is unidentifiable: it shifts every key's logit equally.
+            if not n.endswith('attn.k_proj.bias'):
+                self.assertFalse(torch.equal(before[n], p), n)
         self.assertIsNone(memory['tokens'].grad)
         for gradient in (image.grad, model.language_model.embedding.weight.grad,
                          model.encoder.text_layers[0].self_attn.attn.in_proj_weight.grad):

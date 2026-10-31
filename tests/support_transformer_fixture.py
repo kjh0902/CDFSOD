@@ -75,7 +75,8 @@ SupportAttention = load('mmdet/models/utils/support_cross_attention.py', 'suppor
 class Encoder(nn.Module):
     def __init__(self, dim=8, heads=2, layers=2, fusion=True, support=True):
         super().__init__()
-        self.support_layers = nn.ModuleList([SupportAttention(dim, heads) for _ in range(layers)] if support else [])
+        self.support_layers = nn.ModuleList([SupportAttention(dim, heads, attn_dims=2 * dim)
+                                            for _ in range(layers)] if support else [])
         self.embed_dims = dim
         self.layers = nn.ModuleList([ImageLayer(dim) for _ in range(layers)])
         self.text_layers = nn.ModuleList([TextLayer(dim, heads) for _ in range(layers)])

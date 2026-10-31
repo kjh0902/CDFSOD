@@ -195,3 +195,6 @@ support_dataset.update(
              'img_shape', 'scale_factor'))])
 model['support_visual_cfg'] = dict(dataset=support_dataset, class_names=class_names)
 custom_hooks.append(dict(type='VisualTokenHook', dataset=class_name, shot=1))
+
+# Keep this architecture separate from earlier support experiments.
+work_dir = 'exp_cdfsod_results_neck_pretrained/FISH/1shot'

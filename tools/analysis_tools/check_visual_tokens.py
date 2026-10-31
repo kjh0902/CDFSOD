@@ -93,6 +93,12 @@ def main():
     model = MODELS.build(cfg.model).to(device)
     model.init_weights()
     load_checkpoint(model, args.checkpoint or cfg.load_from, map_location='cpu')
+    for i, layer in enumerate(model.encoder.support_layers):
+        assert layer.attn.embed_dim == 1024 and layer.attn.num_heads == 4
+        assert layer.attn.q_proj.in_features == 256
+        assert layer.attn.out_proj.out_features == 256
+        print(f'Support layer {i}: neck0, 256 -> 1024 -> 256, 4 heads; '
+              f'gamma mean_abs={layer.gamma.detach().abs().mean().item():.6g}')
     classes = cfg.model.support_visual_cfg.class_names
     stats = VisualTokenStats(len(classes), device, len(model.encoder.support_layers))
     model._visual_stats = stats
@@ -110,7 +116,11 @@ def main():
     for layer in model.encoder.support_layers:
         for parameter in layer.parameters():
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
-            assert parameter.grad.abs().sum() > 0
+        # A key bias adds the same logit offset to every key and can have zero
+        # gradient. Check identifiable weights/LNs/gamma rather than every bias.
+        for name in ('attn.q_proj.weight', 'attn.k_proj.weight', 'attn.v_proj.weight',
+                     'attn.out_proj.weight', 'text_norm.weight', 'support_norm.weight', 'gamma'):
+            assert dict(layer.named_parameters())[name].grad.abs().sum() > 0, name
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0
                for parameter in model.backbone.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters()

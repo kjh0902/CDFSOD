@@ -125,7 +125,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${REPO_ROOT}/configs_cdfsod/final_configs_bs4/grounding_dino_swin-b_finetune_${CONFIG_DATASET}_${SHOT}shot.py"
-WORK_DIR="${REPO_ROOT}/exp_cdfsod_results/${OUTPUT_DATASET}/${SHOT}shot"
+WORK_DIR="${REPO_ROOT}/exp_cdfsod_results_neck_pretrained/${OUTPUT_DATASET}/${SHOT}shot"
 
 if [[ ! -f "${CONFIG}" ]]; then
   echo "[ERROR] Config not found: ${CONFIG}" >&2

@@ -32,7 +32,9 @@ class VisualTokenHook(Hook):
         model = self._model(runner)
         return VisualTokenStats(model.bbox_head.num_classes,
                                 next(model.parameters()).device,
-                                len(model.encoder.support_layers) if hasattr(model, 'encoder') else 0)
+                                len(model.encoder.support_layers) if hasattr(model, 'encoder') else 0,
+                                model.encoder.support_layers[0].attn.num_heads
+                                if hasattr(model, 'encoder') and len(model.encoder.support_layers) else 4)
 
     def before_train_iter(self, runner, batch_idx, data_batch=None):
         if (self.enabled and self._model(runner).visual_enabled and
@@ -107,10 +109,11 @@ class VisualTokenHook(Hook):
             dist.all_reduce(stats.counts)
             dist.all_reduce(stats.layer_sums)
             dist.all_reduce(stats.layer_counts)
+            dist.all_reduce(stats.head_sums)
             if dist.get_rank() != 0:
                 return
         names = self._model(runner).support_visual_cfg['class_names']
-        row = dict(schema_version=3, architecture='support_local_cross_attention',
+        row = dict(schema_version=4, architecture='support_neck_pretrained_cross_attention',
                    dataset=self.dataset, shot=self.shot, phase=phase,
                    epoch=runner.epoch + 1, iteration=runner.iter,
                    **stats.report(names))

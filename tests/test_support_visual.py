@@ -21,12 +21,23 @@ class SupportModel(visual.SupportVisualMixin, nn.Module):
         self.support_visual_cfg = dict(class_names=('a', 'b'))
         self.bbox_head = type('Head', (), dict(num_classes=2))()
         self.backbone = Backbone()
+        self.neck = Neck()
         self.data_preprocessor = lambda batch, training: batch
         self._support_loader = [
             dict(inputs=torch.full((1, 3, 64, 64), 2.),
                  data_samples=[sample([[8, 8, 40, 40]] * 3, [0, 0, 1])]),
             dict(inputs=torch.full((1, 3, 64, 64), 8.),
                  data_samples=[sample([[8, 8, 40, 40]] * 2, [0, 1])])]
+
+
+class Neck(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+        self.dropout = nn.Dropout(.5)
+
+    def forward(self, features):
+        return [self.dropout(features[0] * self.weight)]
 
 
 class Backbone(nn.Module):
@@ -151,6 +162,8 @@ class AttentionTests(unittest.TestCase):
         text, maps = text_fixture(channels=8)
         memory = memory_fixture(channels=8)
         encoder = Encoder(layers=1, fusion=False).eval()
+        # Test class sensitivity independently of the deliberately tiny gate.
+        encoder.support_layers[0].gamma.data.fill_(.2)
         allowed = visual.support_text_classes(text, memory, maps)
         image = torch.randn(1, 4, 8)
         a = run(encoder, text, memory, allowed, image)[1]

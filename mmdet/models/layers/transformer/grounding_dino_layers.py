@@ -161,7 +161,8 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
         self.embed_dims = self.layers[0].embed_dims
         self.support_layers = ModuleList([
             SupportTextCrossAttention(self.embed_dims,
-                self.text_layer_cfg['self_attn_cfg']['num_heads'])
+                self.fusion_layer_cfg['num_heads'],
+                attn_dims=self.fusion_layer_cfg['embed_dim'])
             for _ in range(self.num_layers)] if self.support_cross_attn else [])
         if self.num_cp > 0:
             if checkpoint_wrapper is None:

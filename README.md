@@ -154,7 +154,7 @@ bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
 학습 checkpoint, 로그, 평가 결과는 dataset과 shot별로 분리된다.
 
 ```text
-exp_cdfsod_results/
+exp_cdfsod_results_neck_pretrained/
 ├── ArTaxOr/{1shot,5shot,10shot}/
 ├── Clipart1k/{1shot,5shot,10shot}/
 ├── DIOR/{1shot,5shot,10shot}/
@@ -167,7 +167,7 @@ exp_cdfsod_results/
 완료된 실험의 mAP를 모아 보려면:
 
 ```bash
-python analyze_results_cdfsod.py
+python analyze_results_cdfsod.py exp_cdfsod_results_neck_pretrained
 ```
 
 ## 문제 해결

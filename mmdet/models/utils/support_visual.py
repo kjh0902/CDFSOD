@@ -1,4 +1,4 @@
-"""Current-backbone full-support local descriptors with evaluation-only reuse."""
+"""Current neck-local support descriptors and pretrained FE initialization."""
 import copy
 
 import torch
@@ -6,9 +6,9 @@ from torchvision.ops import roi_align
 
 
 def pool_instances(feature, samples):
-    """Pool resized xyxy GT boxes from Swin-B norm1, before the neck."""
+    """Pool resized xyxy GT boxes from neck feature 0 (stride 8)."""
     if feature.ndim != 4 or feature.shape[1] != 256:
-        raise ValueError('Support requires Swin-B Stage 1: stride 8, 256 channels.')
+        raise ValueError('Support requires Neck Feature 0: stride 8, 256 channels.')
     rois, labels = [], []
     for i, sample in enumerate(samples):
         boxes = sample.gt_instances.bboxes.to(feature.device, torch.float32)
@@ -84,9 +84,42 @@ class SupportVisualMixin:
         self._support_memory = self.build_support_memory()
         return self._support_memory
 
-    def _load_from_state_dict(self, *args, **kwargs):
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
         self.clear_support_cache()
-        return super()._load_from_state_dict(*args, **kwargs)
+        layers = getattr(getattr(self, 'encoder', None), 'support_layers', ())
+        if self.visual_enabled and len(layers):
+            support_prefix = prefix + 'encoder.support_layers.'
+            expected = {support_prefix + key: value for key, value in
+                        self.encoder.support_layers.state_dict().items()}
+            present = {key for key in state_dict if key.startswith(support_prefix)}
+            if present:
+                if present != set(expected) or any(
+                        state_dict[key].shape != expected[key].shape for key in present):
+                    raise RuntimeError('Incompatible support checkpoint: expected the complete '
+                                       'neck/pretrained support structure. Partial and legacy '
+                                       '256-dimensional support checkpoints cannot be resumed.')
+                action = 'restored checkpoint support weights (no FE reinitialization)'
+            else:
+                # Populate before PyTorch/MMEngine recurse into children. Read the
+                # checkpoint, never the still-random live FE parameters.
+                mapped = {}
+                for i, layer in enumerate(layers):
+                    for dst, src in layer.fe_parameter_map().items():
+                        target = f'{support_prefix}{i}.{dst}'
+                        source = f'{prefix}encoder.fusion_layers.{i}.{src}'
+                        if source not in state_dict or state_dict[source].shape != expected[target].shape:
+                            raise RuntimeError(f'Cannot initialize support layer {i} from FE: '
+                                               f'missing or incompatible {source}.')
+                        mapped[target] = state_dict[source].clone()
+                state_dict.update(mapped)
+                action = 'copied pretrained FE text-update weights, both LNs and gamma'
+            from mmengine.logging import print_log
+            for i in range(len(layers)):
+                print_log(f'[support-init] layer {i}: {action}; source=FE layer {i}',
+                          logger='current')
+        return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                            missing_keys, unexpected_keys, error_msgs)
 
     def _get_support_loader(self):
         if getattr(self, '_support_loader', None) is None:
@@ -118,13 +151,15 @@ class SupportVisualMixin:
         classes = self.bbox_head.num_classes
         device = next(self.backbone.parameters()).device
         values_by_class = [[] for _ in range(classes)]
-        modes = [(module, module.training) for module in self.backbone.modules()]
+        modules = dict.fromkeys(module for root in (self.backbone, self.neck)
+                                for module in root.modules())
+        modes = [(module, module.training) for module in modules]
         try:
             self.backbone.eval()
+            self.neck.eval()
             for batch in loader:
                 batch = self.data_preprocessor(batch, training=False)
-                # Raw norm1 return, never extract_feat() / ChannelMapper.
-                feature = self.backbone(batch['inputs'])[0]
+                feature = self.neck(self.backbone(batch['inputs']))[0]
                 values, labels = pool_instances(feature, batch['data_samples'])
                 if labels.dtype != torch.long or ((labels < 0) | (labels >= classes)).any():
                     raise ValueError('Support labels must be integer labels in 0..C-1.')

@@ -29,8 +29,9 @@ class LocalAttentionTests(unittest.TestCase):
         labels = torch.tensor([0]*4 + [1]*7)
         mask = classes[:, :, None] != labels
         mask[classes < 0] = False  # safe placeholder for excluded query rows
-        delta = dense.attn(q2, support[None].expand(2, -1, -1),
-                           support[None].expand(2, -1, -1),
+        normalized_support = dense.support_norm(support.detach())[None].expand(2, -1, -1)
+        delta = dense.attn(dense.text_norm(q2), normalized_support,
+                           normalized_support,
                            attn_mask=mask.repeat_interleave(2, 0), need_weights=False)[0]
         expected = q2 + delta * dense.gamma * (classes >= 0)[..., None]
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-6)
@@ -156,12 +157,13 @@ class DiagnosticTests(unittest.TestCase):
         original = copy.deepcopy(row)
         stats.layer_sums.mul_(3)
         stats.layer_counts.mul_(3)
+        stats.head_sums.mul_(3)
         row = stats.report(('a', 'b'))['support_cross_attention']['0']
         self.assertAlmostEqual(row['normalized_attention_entropy']['value'],
                                original['normalized_attention_entropy']['value'])
         self.assertEqual(row['residual_contribution']['value'], .25)
         self.assertEqual(row['gamma'], original['gamma'])
-        self.assertLess(len(json.dumps(stats.report(('a', 'b')))), 2500)
+        self.assertLess(len(json.dumps(stats.report(('a', 'b')))), 4096)
         self.assertTrue(all(t.grad_fn is None for t in (stats.layer_sums, stats.layer_counts, stats.gamma)))
 
 
@@ -292,7 +294,7 @@ class SupportRefreshTests(unittest.TestCase):
                     patch.object(torch.distributed, 'get_rank', return_value=0), \
                     patch.object(torch.distributed, 'all_reduce', side_effect=lambda x: x.mul_(2)) as reduce:
                 hook._write(runner, 'val')
-                self.assertEqual(reduce.call_count, 4)
+                self.assertEqual(reduce.call_count, 5)
             torch.testing.assert_close(stats.gamma, gamma, rtol=0, atol=0)
             row = json.loads(Path(tmp, 'visual_token_stats.jsonl').read_text())
             self.assertAlmostEqual(row['support_cross_attention']['0']['gamma']['max_absolute'], .2)

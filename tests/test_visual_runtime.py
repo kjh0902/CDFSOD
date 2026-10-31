@@ -120,7 +120,7 @@ class StatisticsTests(unittest.TestCase):
             rows = [json.loads(line) for line in (Path(tmp) / 'visual_token_stats.jsonl').read_text().splitlines()]
             self.assertEqual([row['phase'] for row in rows], ['train', 'val'])
             self.assertTrue(all(row['dataset'] == 'toy' and row['shot'] == 5 for row in rows))
-            self.assertTrue(all(row['schema_version'] == 3 and row['architecture'] == 'support_local_cross_attention' for row in rows))
+            self.assertTrue(all(row['schema_version'] == 4 and row['architecture'] == 'support_neck_pretrained_cross_attention' for row in rows))
             self.assertLess((Path(tmp) / 'visual_token_stats.jsonl').stat().st_size, 6000)
 
 
@@ -148,7 +148,9 @@ class ConfigTests(unittest.TestCase):
         for path in paths:
             if path.endswith('.py'):
                 content = subprocess.check_output(['git', 'show', '72bced2:' + path], cwd=ROOT, encoding='utf8')
-                self.assertEqual(source(path), content)
+                current_tree, old_tree = ast.parse(source(path)), ast.parse(content)
+                current_tree.body = [n for n in current_tree.body if not (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'work_dir' for t in n.targets))]
+                self.assertEqual(ast.dump(current_tree), ast.dump(old_tree))
 
     @unittest.skipUnless(importlib.util.find_spec('mmengine'), 'MMEngine not installed')
     def test_all_18_configs_parse_and_preserve_query_training_settings(self):
@@ -169,6 +171,7 @@ class ConfigTests(unittest.TestCase):
                 with self.subTest(config=path.name):
                     cfg = Config.fromfile(str(path))
                     old = Config.fromfile(str(temp_root / path.relative_to(ROOT)))
+                    self.assertTrue(cfg.work_dir.startswith('exp_cdfsod_results_neck_pretrained/'))
                     support = cfg.model.support_visual_cfg
                     self.assertEqual(support.dataset.ann_file, cfg.train_dataloader.dataset.ann_file)
                     self.assertEqual(support.dataset.data_prefix, cfg.train_dataloader.dataset.data_prefix)
