@@ -93,6 +93,16 @@ def main():
     model = MODELS.build(cfg.model).to(device)
     model.init_weights()
     load_checkpoint(model, args.checkpoint or cfg.load_from, map_location='cpu')
+    for layer in model.encoder.support_layers:
+        assert isinstance(layer.attn, torch.nn.MultiheadAttention)
+        assert (layer.attn.embed_dim, layer.attn.num_heads, layer.attn.dropout) == (256, 4, 0.)
+        assert not hasattr(layer, 'text_norm')
+        if args.checkpoint is None:
+            torch.testing.assert_close(layer.gamma, torch.full_like(layer.gamma, 1e-2))
+            torch.testing.assert_close(layer.support_norm.weight,
+                                       torch.ones_like(layer.support_norm.weight))
+            torch.testing.assert_close(layer.support_norm.bias,
+                                       torch.zeros_like(layer.support_norm.bias))
     classes = cfg.model.support_visual_cfg.class_names
     stats = VisualTokenStats(len(classes), device, len(model.encoder.support_layers))
     model._visual_stats = stats

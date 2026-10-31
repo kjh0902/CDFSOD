@@ -104,6 +104,10 @@ class ACLStagePolicyTests(unittest.TestCase):
         self.assertTrue(support.isdisjoint(frozen))
         self.assertTrue(any(name.endswith('gamma') and id(p) in support
                             for name, p in runner.model.named_parameters()))
+        for name, parameter in runner.model.named_parameters():
+            if '.support_norm.' in name:
+                self.assertIn(id(parameter), support_groups)
+                self.assertNotIn(id(parameter), frozen)
         for group in optimizer.param_groups:
             kind = group['acl_group']
             expected = 0. if kind == 'other' else 2e-5 if kind in (

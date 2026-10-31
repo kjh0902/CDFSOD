@@ -29,8 +29,8 @@ class LocalAttentionTests(unittest.TestCase):
         labels = torch.tensor([0]*4 + [1]*7)
         mask = classes[:, :, None] != labels
         mask[classes < 0] = False  # safe placeholder for excluded query rows
-        delta = dense.attn(q2, support[None].expand(2, -1, -1),
-                           support[None].expand(2, -1, -1),
+        normalized = dense.support_norm(support.detach())[None].expand(2, -1, -1)
+        delta = dense.attn(q2, normalized, normalized,
                            attn_mask=mask.repeat_interleave(2, 0), need_weights=False)[0]
         expected = q2 + delta * dense.gamma * (classes >= 0)[..., None]
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-6)
@@ -112,7 +112,7 @@ class LocalAttentionTests(unittest.TestCase):
         for key, value in disabled.state_dict().items():
             torch.testing.assert_close(value, enabled.state_dict()[key], rtol=0, atol=0)
         for layer in enabled.support_layers:
-            torch.testing.assert_close(layer.gamma, torch.full((8,), 1e-4))
+            torch.testing.assert_close(layer.gamma, torch.full((8,), 1e-2))
 
 
 class DiagnosticTests(unittest.TestCase):
@@ -152,7 +152,8 @@ class DiagnosticTests(unittest.TestCase):
         row = stats.report(('a', 'b'))['support_cross_attention']['0']
         self.assertEqual(row['normalized_attention_entropy']['count'], 16)
         self.assertEqual(row['residual_contribution'], dict(value=.25, count=20))
-        self.assertEqual(row['gamma']['std'], 0.)
+        # FP32 reduction of a constant 0.01 vector can leave ~1e-9 roundoff.
+        self.assertAlmostEqual(row['gamma']['std'], 0., places=8)
         original = copy.deepcopy(row)
         stats.layer_sums.mul_(3)
         stats.layer_counts.mul_(3)

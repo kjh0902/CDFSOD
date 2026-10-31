@@ -84,9 +84,26 @@ class SupportVisualMixin:
         self._support_memory = self.build_support_memory()
         return self._support_memory
 
-    def _load_from_state_dict(self, *args, **kwargs):
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
         self.clear_support_cache()
-        return super()._load_from_state_dict(*args, **kwargs)
+        layers = getattr(getattr(self, 'encoder', None), 'support_layers', ())
+        if self.visual_enabled and len(layers):
+            support_prefix = prefix + 'encoder.support_layers.'
+            expected = {support_prefix + key: value
+                        for key, value in self.encoder.support_layers.state_dict().items()}
+            present = {key for key in state_dict if key.startswith(support_prefix)}
+            # A base Grounding DINO checkpoint has no support keys: normal
+            # random initialization is retained. Never silently mix old support
+            # weights/optimizer state with newly initialized LayerNorms.
+            if present and (present != set(expected) or any(
+                    state_dict[key].shape != expected[key].shape for key in present)):
+                raise RuntimeError('Incompatible support checkpoint: expected complete '
+                                   '256-dimensional attention with support_norm. Legacy '
+                                   'checkpoints without Support LN and partial support '
+                                   'checkpoints cannot be loaded or resumed.')
+        return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                            missing_keys, unexpected_keys, error_msgs)
 
     def _get_support_loader(self):
         if getattr(self, '_support_loader', None) is None:

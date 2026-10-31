@@ -1,7 +1,7 @@
 # FT-FSOD: CD-FSOD 실험 저장소
 
-이 브랜치는 `acl-vistoken-support-memory`의 `b8849b3`를 기반으로
-**serial ACL + Support Local Descriptor Cross-Attention**을 구현한다.
+이 브랜치는 기존 **serial ACL + Support Local Descriptor Cross-Attention**(`944d0d1`)에
+Support LN과 Gamma 초기값 변경을 적용한다.
 전체 Shot Support의 유효 GT마다 Swin-B → RoIAlign(7×7)로 49개의 256차원
 Local Descriptor를 만든다. Training은 매 Iteration 현재 Backbone으로 재추출하고,
 Validation/Test는 평가 시작 시 재추출하여 해당 평가 동안 재사용한다.
@@ -9,14 +9,16 @@ Resume은 재개된 Weight를 사용하며, Support 디스크 캐시는 사용�
 
 모든 FE Layer는 Image–Text Fusion → 클래스별 Support-to-Text Cross-Attention
 → Text-only Self-Attention/FFN → Image Deformable Self-Attention/FFN 순서다.
-새 Attention과 Channel-wise Gamma(`1e-4` 초기값)를 학습하며, 기존 순차 ACL
+원본 Text를 Q로 사용하고 Support 전용 LayerNorm의 출력을 K/V로 사용한다.
+256차원 랜덤 초기화 Attention, 기본 초기화 Support LN과 Channel-wise Gamma(`1e-2` 초기값)를
+학습하며, 기존 순차 ACL
 Decoder와 Detection Loss는 유지한다. HED는 기준 브랜치와 같이 사용하지 않는다.
 ACL 2-Stage 정책에 따라 Stage 1에서는 기존 FE의 LR을 0으로 두고 새 Support
-Cross-Attention과 Gamma는 학습한다. BERT LR이 최초의 절반 이하가 되면 Stage 2로
+Cross-Attention·Support LN·Gamma는 학습한다. BERT LR이 최초의 절반 이하가 되면 Stage 2로
 전환하여 FE를 현재 Head LR로 Unfreeze하며 Support도 계속 학습한다.
 
 기존 Feature Norm 로그에 FE Layer별 Attention Entropy, Residual Contribution,
-Gamma 통계만 추가한다. 구조, 재추출 시점, 통계 정의와 검증 방법은
+Gamma 통계를 유지하고, architecture 식별자는 `support_local_cross_attention_support_ln`이다. 구조, 재추출 시점, 통계 정의와 검증 방법은
 [실험 설명](EXPERIMENT_VISUAL_TOKEN.md)을 참고한다.
 
 ## 지원 환경
@@ -154,7 +156,7 @@ bash run_cdfsod.sh --dataset DIOR --shot 5 --gpu 0 --port 29501
 학습 checkpoint, 로그, 평가 결과는 dataset과 shot별로 분리된다.
 
 ```text
-exp_cdfsod_results/
+exp_cdfsod_results_support_ln_gamma1e2/
 ├── ArTaxOr/{1shot,5shot,10shot}/
 ├── Clipart1k/{1shot,5shot,10shot}/
 ├── DIOR/{1shot,5shot,10shot}/
@@ -167,7 +169,7 @@ exp_cdfsod_results/
 완료된 실험의 mAP를 모아 보려면:
 
 ```bash
-python analyze_results_cdfsod.py
+python analyze_results_cdfsod.py exp_cdfsod_results_support_ln_gamma1e2
 ```
 
 ## 문제 해결

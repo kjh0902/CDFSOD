@@ -214,3 +214,6 @@ support_dataset.update(
              'img_shape', 'scale_factor'))])
 model['support_visual_cfg'] = dict(dataset=support_dataset, class_names=class_names)
 custom_hooks.append(dict(type='VisualTokenHook', dataset=class_name, shot=5))
+
+# Separate Support LN / gamma=1e-2 results from earlier experiments.
+work_dir = 'exp_cdfsod_results_support_ln_gamma1e2/Clipart1k/5shot'

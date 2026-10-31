@@ -110,7 +110,7 @@ class VisualTokenHook(Hook):
             if dist.get_rank() != 0:
                 return
         names = self._model(runner).support_visual_cfg['class_names']
-        row = dict(schema_version=3, architecture='support_local_cross_attention',
+        row = dict(schema_version=3, architecture='support_local_cross_attention_support_ln',
                    dataset=self.dataset, shot=self.shot, phase=phase,
                    epoch=runner.epoch + 1, iteration=runner.iter,
                    **stats.report(names))
